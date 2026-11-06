@@ -78,9 +78,40 @@ fn read_env(var: &str, what: &str) -> Result<String, String> {
     Ok(v)
 }
 
+/// Reads a secret (a webhook URL or signing key) from a file the user
+/// controls: after opening, the file must be a regular file owned by this
+/// user with no group or other permissions. Symlinks are followed, but the
+/// file they lead to is what gets checked. `O_NONBLOCK` keeps a FIFO from
+/// hanging option processing before any wait deadline applies.
 fn read_secret_file(path: &str, what: &str) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let p = Path::new(path);
-    let mut f = fs::File::open(p).map_err(|e| format!("{what}: cannot open {}: {}", p.display(), e.kind()))?;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(p)
+        .map_err(|e| format!("{what}: cannot open {}: {}", p.display(), e.kind()))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("{what}: cannot inspect {}: {}", p.display(), e.kind()))?;
+    if !meta.is_file() {
+        return Err(format!("{what}: {} is not a regular file", p.display()));
+    }
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != util::geteuid() {
+        return Err(format!(
+            "{what}: {} is owned by uid {}, not by you",
+            p.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{what}: {} is readable by other users (mode {:o}); chmod 600 it",
+            p.display(),
+            meta.mode() & 0o777
+        ));
+    }
     let mut s = String::new();
     Read::by_ref(&mut f)
         .take(MAX_SECRET_FILE + 1)

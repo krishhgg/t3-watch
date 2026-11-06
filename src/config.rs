@@ -200,6 +200,13 @@ impl Config {
     /// other. The config is reloaded inside the lock. If `f` fails, nothing
     /// is written.
     pub fn transaction<T>(f: impl FnOnce(&mut Config) -> Result<T, String>) -> Result<T, String> {
+        Self::update(|cfg| f(cfg).map(|t| (t, true)))
+    }
+
+    /// Like `transaction`, but `f` also says whether it changed anything;
+    /// an unchanged config is not rewritten. Every error is about locking,
+    /// reading or writing the file unless `f` itself returns one.
+    pub fn update<T>(f: impl FnOnce(&mut Config) -> Result<(T, bool), String>) -> Result<T, String> {
         let dir = state_dir();
         util::ensure_private_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let lock_path = dir.join("config.lock");
@@ -210,8 +217,10 @@ impl Config {
             Err(e) => return Err(format!("cannot lock {}: {e}", lock_path.display())),
         }
         let mut cfg = Config::load()?;
-        let out = f(&mut cfg)?;
-        cfg.save()?;
+        let (out, changed) = f(&mut cfg)?;
+        if changed {
+            cfg.save()?;
+        }
         Ok(out)
     }
 

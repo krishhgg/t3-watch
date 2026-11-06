@@ -8,6 +8,7 @@
 //! error messages carry an OAuth error code at most, never a response body.
 
 use crate::config::{self, Config, Machine};
+use crate::mcp::Recovery;
 use crate::util;
 use serde_json::{json, Value};
 use std::fs;
@@ -253,18 +254,29 @@ pub struct Token {
     expires_at_ms: Option<u64>,
 }
 
-fn token_request(token_endpoint: &str, form: &[(&str, &str)], what: &str) -> Result<Token, String> {
-    util::secure_url(token_endpoint, "token endpoint")?;
+/// Why a token request failed, sanitized. `transient` covers the network,
+/// 408, 425, 429 and 5xx, and malformed success responses: worth retrying.
+/// Everything else (`invalid_grant`, `invalid_client`, other 4xx) is final.
+#[derive(Debug)]
+pub struct TokenError {
+    pub message: String,
+    pub transient: bool,
+}
+
+fn token_request(token_endpoint: &str, form: &[(&str, &str)], what: &str) -> Result<Token, TokenError> {
+    let fail = |message: String, transient: bool| TokenError { message, transient };
+    util::secure_url(token_endpoint, "token endpoint").map_err(|e| fail(e, false))?;
     let resp = agent()
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .send(util::form_encode(form))
-        .map_err(|e| format!("{what}: {}", util::describe_ureq_error(&e)))?;
-    let v = read_json(resp, what)?;
+        .map_err(|e| fail(format!("{what}: {}", util::describe_ureq_error(&e)), true))?;
+    let status = resp.status().as_u16();
+    let v = read_json(resp, what).map_err(|e| fail(e, matches!(status, 200..=299 | 408 | 425 | 429 | 500..=599)))?;
     let access_token = str_field(&v, "access_token")
         .filter(|t| !t.is_empty() && !util::has_control_chars(t))
-        .ok_or_else(|| format!("{what}: response has no usable access_token"))?;
+        .ok_or_else(|| fail(format!("{what}: response has no usable access_token"), true))?;
     Ok(Token {
         access_token,
         refresh_token: str_field(&v, "refresh_token").filter(|t| !t.is_empty() && !util::has_control_chars(t)),
@@ -296,9 +308,10 @@ fn exchange(
         ],
         "token exchange",
     )
+    .map_err(|e| e.message)
 }
 
-fn refresh(token_endpoint: &str, client_id: &str, refresh_token: &str, resource: &str) -> Result<Token, String> {
+fn refresh(token_endpoint: &str, client_id: &str, refresh_token: &str, resource: &str) -> Result<Token, TokenError> {
     token_request(
         token_endpoint,
         &[
@@ -314,38 +327,61 @@ fn refresh(token_endpoint: &str, client_id: &str, refresh_token: &str, resource:
 
 /// Recovers from a 401 for the machine `name` at `origin` whose token
 /// `used` was rejected. Inside the config lock: if machines.json already has
-/// a different token for that origin (another login or refresh), use it;
-/// otherwise refresh with the saved refresh token. Never returns a token
-/// issued for a different origin.
-pub fn recover_token(name: &str, origin: &str, used: &str) -> Option<String> {
-    Config::transaction(|cfg| {
+/// a different token for that origin (another login, or another process's
+/// refresh), use it; otherwise refresh with the saved refresh token. Never
+/// returns a token issued for a different origin.
+///
+/// Only a definitive answer (no credentials, no refresh token, or a refused
+/// refresh such as `invalid_grant`) is `Rejected`. The network, 429, 5xx, the
+/// config lock and the disk give `Retry`, so a short outage of the
+/// authorization server does not end a watch.
+pub fn recover_token(name: &str, origin: &str, used: &str) -> Recovery {
+    let mut fresh: Option<String> = None;
+    let result = Config::update(|cfg| {
         let key = match cfg.machines.get(name) {
             Some(m) if m.origin.eq_ignore_ascii_case(origin) => name.to_string(),
             _ => match cfg.by_origin(origin) {
                 Some((n, _)) => n.clone(),
-                None => return Ok(None),
+                None => return Ok((Recovery::Rejected(format!("no saved machine for {origin}")), false)),
             },
         };
         let m = cfg.machines.get_mut(&key).expect("key was just found");
         if !m.access_token.is_empty() && m.access_token != used {
-            return Ok(Some(m.access_token.clone()));
+            return Ok((Recovery::Token(m.access_token.clone()), false));
         }
         let (Some(rt), Some(endpoint), Some(client_id)) =
             (m.refresh_token.clone(), m.token_endpoint.clone(), m.client_id.clone())
         else {
-            return Ok(None);
+            return Ok((
+                Recovery::Rejected("the server rejected the token and there is no refresh token".into()),
+                false,
+            ));
         };
         let resource = m.resource.clone().unwrap_or_else(|| format!("{}/mcp", m.origin));
-        let t = refresh(&endpoint, &client_id, &rt, &resource)?;
-        m.access_token = t.access_token.clone();
-        if t.refresh_token.is_some() {
-            m.refresh_token = t.refresh_token;
+        match refresh(&endpoint, &client_id, &rt, &resource) {
+            Ok(t) => {
+                fresh = Some(t.access_token.clone());
+                m.access_token = t.access_token.clone();
+                if t.refresh_token.is_some() {
+                    m.refresh_token = t.refresh_token;
+                }
+                m.expires_at_ms = t.expires_at_ms;
+                Ok((Recovery::Token(t.access_token), true))
+            }
+            Err(e) if e.transient => Ok((Recovery::Retry(e.message), false)),
+            Err(e) => Ok((Recovery::Rejected(e.message), false)),
         }
-        m.expires_at_ms = t.expires_at_ms;
-        Ok(Some(t.access_token))
-    })
-    .ok()
-    .flatten()
+    });
+    match result {
+        Ok(r) => r,
+        // The refresh worked but saving it did not: keep using the new token
+        // rather than ending the watch.
+        Err(e) if fresh.is_some() => {
+            eprintln!("t3-watch: warning: refreshed token could not be saved: {e}");
+            Recovery::Token(fresh.unwrap())
+        }
+        Err(e) => Recovery::Retry(e),
+    }
 }
 
 /// A short machine name from the origin host: `prod-05055d8a66f766cb` for a
@@ -508,14 +544,22 @@ fn respond(stream: &mut TcpStream, status: &str, text: &str) {
     );
 }
 
-/// Reads one HTTP request head (bounded) and returns its method and target.
-fn read_request_line(stream: &mut TcpStream) -> Option<(String, String)> {
+/// Time left before `deadline`, capped at `cap`; `None` once it has passed.
+fn time_left(deadline: Instant, cap: Duration) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then(|| left.min(cap))
+}
+
+/// Reads one HTTP request head (at most 16 KiB) and returns its method and
+/// target. Every read is capped by the time left before `deadline`, so a
+/// client that trickles bytes cannot hold the login open past it.
+fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<(String, String)> {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        let left = time_left(deadline, Duration::from_secs(5))?;
+        let _ = stream.set_read_timeout(Some(left));
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -526,49 +570,62 @@ fn read_request_line(stream: &mut TcpStream) -> Option<(String, String)> {
     Some((parts.next()?.to_string(), parts.next()?.to_string()))
 }
 
+/// Answers a stray request without letting a slow reader stall the login.
+fn reject(stream: &mut TcpStream, deadline: Instant, status: &str, text: &str) {
+    let left = time_left(deadline, Duration::from_secs(2)).unwrap_or(Duration::from_millis(100));
+    let _ = stream.set_write_timeout(Some(left));
+    respond(stream, status, text);
+}
+
 type CallbackResult = Result<(TcpStream, String), (Option<TcpStream>, String)>;
 
-/// Waits for the browser's callback. Requests for other paths or with a
-/// different `state` (a favicon fetch, a stale tab, a port scan) get a 404 or
-/// 400 and are ignored until the deadline. A matching callback returns its
-/// connection still open, so the page can report whether saving worked.
+/// Waits for the browser's callback until an absolute deadline. Requests for
+/// other paths or with a different `state` (a favicon fetch, a stale tab, a
+/// port scan) get a 404 or 400 and are ignored. The deadline is checked
+/// before every accept and bounds every read, so neither slow nor endless
+/// connections extend it. A matching callback returns its connection still
+/// open, so the page can report whether saving worked.
 fn accept_callback(listener: &TcpListener, wait: Duration, state: &str, issuer: &str) -> CallbackResult {
     listener.set_nonblocking(true).map_err(|e| (None, e.to_string()))?;
     let deadline = Instant::now() + wait;
+    let timed_out = || {
+        Err((
+            None,
+            "timed out waiting for the browser callback; try `t3-watch auth oauth-start` on headless machines".into(),
+        ))
+    };
     loop {
+        if Instant::now() >= deadline {
+            return timed_out();
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let Some((method, target)) = read_request_line(&mut stream) else {
+                let Some((method, target)) = read_request_line(&mut stream, deadline) else {
                     continue;
                 };
                 let (path, query) = target.split_once('?').unwrap_or((&target, ""));
                 if method != "GET" || path != "/callback" {
-                    respond(&mut stream, "404 Not Found", "Not found.");
+                    reject(&mut stream, deadline, "404 Not Found", "Not found.");
                     continue;
                 }
                 let params = util::parse_query(query);
                 if util::query_get(&params, "state") != Some(state) {
-                    respond(
+                    reject(
                         &mut stream,
+                        deadline,
                         "400 Bad Request",
                         "This link does not belong to the pending t3-watch login.",
                     );
                     continue;
                 }
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 return match check_callback(&params, state, issuer) {
                     Ok(code) => Ok((stream, code)),
                     Err(e) => Err((Some(stream), e)),
                 };
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() > deadline {
-                    return Err((
-                        None,
-                        "timed out waiting for the browser callback; try `t3-watch auth oauth-start` on headless machines"
-                            .into(),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())));
             }
             Err(e) => return Err((None, format!("callback listener: {e}"))),
         }
@@ -627,6 +684,11 @@ fn prune_pending(dir: &std::path::Path) {
 
 /// Headless step 2: exchange the code from the pasted callback URL, save the
 /// credentials, and only then retire the pending login.
+///
+/// The pending login is claimed first by renaming it, which only one process
+/// can do; a concurrent `oauth-finish` for the same callback is refused
+/// before it reaches the token endpoint. If the exchange or the save fails,
+/// the claim is undone so the login can be finished again.
 pub fn finish(callback: &str) -> Result<Value, String> {
     let callback = callback.trim();
     let query = callback.split_once('?').map(|(_, q)| q).unwrap_or(callback);
@@ -636,18 +698,51 @@ pub fn finish(callback: &str) -> Result<Value, String> {
     if state.is_empty() || !state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("callback state is malformed".into());
     }
-    let path = config::state_dir().join("pending").join(format!("{state}.json"));
-    let text = fs::read_to_string(&path).map_err(|_| {
-        "no pending login matches this callback (expired or already used); run oauth-start again".to_string()
+    let dir = config::state_dir().join("pending");
+    let path = dir.join(format!("{state}.json"));
+    let claimed = dir.join(format!(
+        "{state}.json.claim-{}-{}",
+        std::process::id(),
+        util::hex(&util::random_bytes(4))
+    ));
+    fs::rename(&path, &claimed).map_err(|_| {
+        "no pending login matches this callback (expired, already used, or being finished by another process); \
+         run oauth-start again"
+            .to_string()
     })?;
-    let p: Value = serde_json::from_str(&text).map_err(|_| "pending login file is corrupt".to_string())?;
-    let s = |k: &str| str_field(&p, k).ok_or_else(|| format!("pending login is missing {k}"));
+    let result = finish_claimed(&params, state, &claimed);
+    match &result {
+        Ok(_) => {
+            let _ = fs::remove_file(&claimed);
+        }
+        Err(Finish::Retryable(_)) => {
+            let _ = fs::rename(&claimed, &path);
+        }
+        Err(Finish::Final(_)) => {
+            let _ = fs::remove_file(&claimed);
+        }
+    }
+    result.map_err(|e| match e {
+        Finish::Retryable(m) | Finish::Final(m) => m,
+    })
+}
+
+enum Finish {
+    /// The pending login is still usable (exchange or save failed).
+    Retryable(String),
+    /// The pending login is spent (expired or corrupt).
+    Final(String),
+}
+
+fn finish_claimed(params: &[(String, String)], state: &str, claimed: &std::path::Path) -> Result<Value, Finish> {
+    let text = fs::read_to_string(claimed).map_err(|_| Finish::Final("pending login file is unreadable".into()))?;
+    let p: Value = serde_json::from_str(&text).map_err(|_| Finish::Final("pending login file is corrupt".into()))?;
+    let s = |k: &str| str_field(&p, k).ok_or_else(|| Finish::Final(format!("pending login is missing {k}")));
     if p.get("createdAtMs")
         .and_then(Value::as_u64)
         .is_none_or(|t| util::now_ms().saturating_sub(t) > PENDING_TTL_MS)
     {
-        let _ = fs::remove_file(&path);
-        return Err("pending login expired; run oauth-start again".into());
+        return Err(Finish::Final("pending login expired; run oauth-start again".into()));
     }
     let d = Discovery {
         origin: s("origin")?,
@@ -658,8 +753,8 @@ pub fn finish(callback: &str) -> Result<Value, String> {
         registration_endpoint: None,
         supports_refresh: false,
     };
-    util::secure_url(&d.origin, "origin")?;
-    let code = check_callback(&params, state, &d.issuer)?;
+    util::secure_url(&d.origin, "origin").map_err(Finish::Final)?;
+    let code = check_callback(params, state, &d.issuer).map_err(Finish::Final)?;
     let client_id = s("clientId")?;
     let token = exchange(
         &d.token_endpoint,
@@ -668,11 +763,10 @@ pub fn finish(callback: &str) -> Result<Value, String> {
         &s("redirectUri")?,
         &s("codeVerifier")?,
         &d.resource,
-    )?;
+    )
+    .map_err(Finish::Retryable)?;
     let make_default = p.get("makeDefault").and_then(Value::as_bool).unwrap_or(false);
-    let out = store(&s("name")?, &d, &client_id, token, make_default)?;
-    let _ = fs::remove_file(&path);
-    Ok(out)
+    store(&s("name")?, &d, &client_id, token, make_default).map_err(Finish::Retryable)
 }
 
 #[cfg(test)]

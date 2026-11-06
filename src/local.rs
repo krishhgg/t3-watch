@@ -4,6 +4,7 @@
 //!
 //! Needs no OAuth because it runs as the same user as the T3 server.
 
+use crate::cancel::Cancel;
 use crate::mcp::CallError;
 use crate::model::ThreadState;
 use crate::util;
@@ -29,7 +30,7 @@ fn transient(message: String) -> CallError {
     CallError::Transient { message, status: None }
 }
 
-pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadState, CallError> {
+pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str, cancel: &Cancel) -> Result<ThreadState, CallError> {
     let observed_at = Instant::now();
     let mut child = Command::new(t3_bin)
         .args(["thread", "show", "--base-dir"])
@@ -49,6 +50,11 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadSta
     // A watchdog kills a hung `t3` so one stuck call cannot stall the watch.
     // It only runs while the child is unreaped, so the pid cannot be reused.
     let pid = child.id() as libc::pid_t;
+    // Cancelling the watch kills the child's group the same way.
+    if !cancel.add_pid(pid) {
+        kill_and_reap(&mut child);
+        return Err(CallError::Cancelled);
+    }
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let watchdog = util::spawn_thread("t3-watchdog", 32 * 1024, move || {
         if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(SHOW_TIMEOUT) {
@@ -59,6 +65,7 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadSta
         Ok(w) => w,
         Err(e) => {
             // Without a watchdog a hung `t3` could stall this watch forever.
+            cancel.remove_pid(pid);
             kill_and_reap(&mut child);
             return Err(transient(format!("cannot start watchdog thread: {e}")));
         }
@@ -76,6 +83,7 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadSta
         Ok(h) => h,
         Err(e) => {
             // An unread stderr pipe can fill up and block the child.
+            cancel.remove_pid(pid);
             kill_and_reap(&mut child);
             let _ = done_tx.send(());
             let _ = watchdog.join();
@@ -89,6 +97,12 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadSta
     let stderr = err_reader.join().unwrap_or_default();
     let _ = done_tx.send(());
     let _ = watchdog.join();
+    // From here the child may be reaped; it must not be killed by pid.
+    cancel.remove_pid(pid);
+    if cancel.is_cancelled() {
+        kill_and_reap(&mut child);
+        return Err(CallError::Cancelled);
+    }
     // Both pipes are closed, so the child is exiting. Reap it, with a bound.
     let reap_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
@@ -120,7 +134,7 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str) -> Result<ThreadSta
     }
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| transient(format!("t3 printed invalid JSON: {e}")))?;
-    let state = ThreadState::from_thread_json(&v, observed_at);
+    let state = ThreadState::from_thread_json(&v, thread_id, observed_at);
     if state.status.is_none() {
         return Err(transient("t3 output has no thread status".into()));
     }
@@ -161,11 +175,31 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_kills_a_running_t3_at_once() {
+        let (bin, pidfile) = slow_script("cancel");
+        let cancel = Cancel::new();
+        let c = cancel.clone();
+        let killer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            c.cancel();
+        });
+        let started = Instant::now();
+        let err = show(&bin, Path::new("/tmp"), "t", &cancel).unwrap_err();
+        killer.join().unwrap();
+        assert_eq!(err, CallError::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "t3 outlived its cancellation"
+        );
+        assert_gone(&pidfile);
+    }
+
+    #[test]
     fn watchdog_spawn_failure_kills_and_reaps_the_child() {
         let (bin, pidfile) = slow_script("wd");
         util::FAIL_SPAWNS.with(|c| c.set((0, 1)));
         let started = Instant::now();
-        let err = show(&bin, Path::new("/tmp"), "t").unwrap_err();
+        let err = show(&bin, Path::new("/tmp"), "t", &Cancel::new()).unwrap_err();
         assert!(err.message().contains("watchdog"), "{err:?}");
         assert!(matches!(err, CallError::Transient { .. }));
         assert!(started.elapsed() < Duration::from_secs(5), "child was not killed");
@@ -178,7 +212,7 @@ mod tests {
         // The watchdog spawns; the stderr reader does not.
         util::FAIL_SPAWNS.with(|c| c.set((1, 1)));
         let started = Instant::now();
-        let err = show(&bin, Path::new("/tmp"), "t").unwrap_err();
+        let err = show(&bin, Path::new("/tmp"), "t", &Cancel::new()).unwrap_err();
         assert!(err.message().contains("stderr"), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "child was not killed");
         assert_gone(&pidfile);

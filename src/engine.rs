@@ -7,10 +7,11 @@
 //! (`mode`, `expect_min_run_ordinal`) against their shared observations. So
 //! 20 clients on one thread cost one upstream long-poll, not 20.
 
+use crate::cancel::Cancel;
 use crate::config::{self, Config, Machine};
 use crate::local;
 use crate::mcp::{CallError, McpClient, TokenRecovery};
-use crate::model::{classify, run_covered, Predicate, StatusClass, ThreadState};
+use crate::model::{classify, delegated_covered, run_ordinal_of, Predicate, StatusClass, ThreadState};
 use crate::oauth;
 use crate::util::{self, lock, Jitter};
 use serde_json::{json, Map, Value};
@@ -379,8 +380,56 @@ struct Snap {
     last_transient: Option<String>,
 }
 
+/// Bounds live upstream operations (MCP cycles and `t3` runs) across the
+/// hub. A permit is held by the thread doing the operation until it has
+/// really ended, so a cancelled long-poll still counts until its connection
+/// is gone. With `T3_WATCH_MAX_WATCHES=1` there is never more than one
+/// request in flight, however many short waits come and go.
+struct OpBudget {
+    live: Mutex<usize>,
+    cv: Condvar,
+    max: usize,
+    cancelled: AtomicU64,
+}
+
+struct Permit(Arc<OpBudget>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *lock(&self.0.live) -= 1;
+        self.0.cv.notify_all();
+    }
+}
+
+impl OpBudget {
+    /// Waits for a free slot. Gives up (`None`) once `abandoned` says nobody
+    /// waits for the operation any more.
+    fn acquire(self: &Arc<Self>, abandoned: impl Fn() -> bool) -> Option<Permit> {
+        let mut live = lock(&self.live);
+        loop {
+            if *live < self.max {
+                *live += 1;
+                return Some(Permit(self.clone()));
+            }
+            live = self
+                .cv
+                .wait_timeout(live, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            if *live >= self.max {
+                drop(live);
+                if abandoned() {
+                    return None;
+                }
+                live = lock(&self.live);
+            }
+        }
+    }
+}
+
 pub struct Hub {
     watches: Mutex<HashMap<WatchKey, Arc<Watch>>>,
+    ops: Arc<OpBudget>,
     clients: Mutex<HashMap<(String, String), Arc<McpClient>>>,
     active_waits: AtomicUsize,
     next_sub: AtomicU64,
@@ -406,6 +455,12 @@ impl Hub {
     pub fn with_max_watches(label: &'static str, max_watches: usize) -> Arc<Self> {
         Arc::new(Hub {
             watches: Mutex::new(HashMap::new()),
+            ops: Arc::new(OpBudget {
+                live: Mutex::new(0),
+                cv: Condvar::new(),
+                max: max_watches,
+                cancelled: AtomicU64::new(0),
+            }),
             clients: Mutex::new(HashMap::new()),
             active_waits: AtomicUsize::new(0),
             next_sub: AtomicU64::new(1),
@@ -776,6 +831,11 @@ impl Hub {
             "uptimeMs": self.started.elapsed().as_millis() as u64,
             "activeWaits": self.active_waits.load(Ordering::SeqCst),
             "maxWatches": self.max_watches,
+            "upstreamOps": {
+                "live": *lock(&self.ops.live),
+                "max": self.ops.max,
+                "cancelled": self.ops.cancelled.load(Ordering::Relaxed),
+            },
             "watches": watches,
             "machines": machines,
         })
@@ -867,16 +927,20 @@ impl Watch {
         }
     }
 
-    /// Runs one upstream cycle on a helper thread and waits for it, but gives
-    /// up the moment the last subscriber leaves: a long-poll can take
-    /// minutes, and an abandoned watch must not linger that long. `None`
-    /// means it was abandoned; the helper finishes on its own and its result
-    /// is dropped.
-    fn cycle_abandonable(self: &Arc<Self>) -> Option<Result<Cycle, CallError>> {
+    /// Runs one upstream cycle on a helper thread and waits for it. When the
+    /// last subscriber leaves, the cycle is cancelled: its HTTP agent is shut
+    /// down (interrupting a blocked long-poll), the server gets
+    /// `notifications/cancelled`, and a local `t3` is killed. The helper's
+    /// budget permit is released only when the operation has really ended.
+    /// `None` means the cycle was abandoned.
+    fn cycle_abandonable(self: &Arc<Self>, hub: &Hub) -> Option<Result<Cycle, CallError>> {
+        let permit = hub.ops.acquire(|| lock(&self.inner).subs.is_empty())?;
+        let cancel = Cancel::new();
         let (tx, rx) = mpsc::channel();
-        let me = self.clone();
+        let (me, token) = (self.clone(), cancel.clone());
         let spawned = util::spawn_thread("t3-watch-call", 256 * 1024, move || {
-            let result = me.cycle();
+            let _permit = permit;
+            let result = me.cycle(&token);
             let _ = tx.send(result);
             // Taking the lock orders this notify after the worker's check.
             let _g = lock(&me.inner);
@@ -894,15 +958,18 @@ impl Watch {
                 return Some(result);
             }
             if g.subs.is_empty() {
+                drop(g);
+                cancel.cancel();
+                hub.ops.cancelled.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    fn cycle(&self) -> Result<Cycle, CallError> {
+    fn cycle(&self, cancel: &Cancel) -> Result<Cycle, CallError> {
         match &self.backend {
-            Backend::Mcp(client) => self.mcp_cycle(client),
+            Backend::Mcp(client) => self.mcp_cycle(client, cancel),
             Backend::Local { t3_bin, base_dir } => {
                 let bin = t3_bin
                     .clone()
@@ -912,7 +979,7 @@ impl Watch {
                         status: None,
                     })?;
                 self.upstream_calls.fetch_add(1, Ordering::Relaxed);
-                let state = local::show(&bin, base_dir, self.key.thread_id())?;
+                let state = local::show(&bin, base_dir, self.key.thread_id(), cancel)?;
                 Ok(Cycle {
                     state,
                     next: Next::Interval,
@@ -927,7 +994,7 @@ impl Watch {
         let mut quiet_polls: u32 = 0;
         let mut rewaits: u32 = 0;
         while self.keep_running(hub) {
-            let Some(result) = self.cycle_abandonable() else {
+            let Some(result) = self.cycle_abandonable(hub) else {
                 continue;
             };
             let delay = match result {
@@ -954,6 +1021,8 @@ impl Watch {
                         }
                     }
                 }
+                // Only an abandoned cycle is cancelled; the loop then exits.
+                Err(CallError::Cancelled) => Duration::ZERO,
                 Err(CallError::Transient { message, status } | CallError::Session { message, status }) => {
                     if let Backend::Mcp(c) = &self.backend {
                         c.stats.retries.fetch_add(1, Ordering::Relaxed);
@@ -980,7 +1049,7 @@ impl Watch {
 
     /// One `t3_thread_wait` long-poll, verified by `t3_thread_read` unless
     /// the poll timed out on a still-active thread.
-    fn mcp_cycle(&self, client: &McpClient) -> Result<Cycle, CallError> {
+    fn mcp_cycle(&self, client: &McpClient, cancel: &Cancel) -> Result<Cycle, CallError> {
         let WatchKey::Mcp {
             thread_id,
             environment_id,
@@ -990,6 +1059,12 @@ impl Watch {
         else {
             unreachable!("MCP backend with a local key");
         };
+        // One agent per cycle: cancelling shuts it down and interrupts
+        // whichever request of this cycle is in flight.
+        let agent = client.agent();
+        if !cancel.add_agent(&agent) {
+            return Err(CallError::Cancelled);
+        }
         let slice_ms = self.slice_ms.load(Ordering::Relaxed);
         let mut args = json!({ "threadId": thread_id, "timeoutMs": slice_ms });
         if *until_delegated {
@@ -1001,14 +1076,19 @@ impl Watch {
         let wait_started = Instant::now();
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
         let raw = client.call_tool(
+            &agent,
+            cancel,
             "t3_thread_wait",
             args,
             Duration::from_millis(slice_ms) + Duration::from_secs(30),
         )?;
         let w = WaitReply::parse(&raw);
         if w.timed_out == Some(true) && w.class() == Some(StatusClass::Active) {
-            let state =
-                ThreadState::from_thread_json(&json!({ "status": w.status, "latestRunId": w.run_id }), wait_started);
+            let state = ThreadState::from_thread_json(
+                &json!({ "status": w.status, "latestRunId": w.run_id }),
+                thread_id,
+                wait_started,
+            );
             return Ok(Cycle {
                 state,
                 next: Next::Immediately,
@@ -1020,8 +1100,8 @@ impl Watch {
             args["environmentId"] = json!(env);
         }
         let read_started = Instant::now();
-        let r = client.call_tool("t3_thread_read", args, Duration::from_secs(30))?;
-        let mut state = ThreadState::from_thread_json(&r, read_started);
+        let r = client.call_tool(&agent, cancel, "t3_thread_read", args, Duration::from_secs(30))?;
+        let mut state = ThreadState::from_thread_json(&r, thread_id, read_started);
         state.result_run_id = w.result_run.clone();
         let mut next = if w.timed_out == Some(true) {
             Next::Immediately
@@ -1030,10 +1110,14 @@ impl Watch {
         };
         if *until_delegated {
             let proven = w.proven_runs();
-            state.delegated_settled = w.proves_settled() && run_covered(&proven, state.latest_run_id.as_deref());
-            // The wait settled an older run than the read now shows: a new
-            // run started in between, and its delegated work is unproven.
-            if w.proves_settled() && !state.delegated_settled && !proven.is_empty() {
+            state.delegated_settled = w.proves_settled()
+                && delegated_covered(thread_id, &proven, state.latest_run_id.as_deref(), state.run_count);
+            // The wait settled an older run of this thread than the read now
+            // shows: a new run started in between, and its delegated work is
+            // unproven, so wait on it. A proof made only of other threads'
+            // runs is not a run of this thread at all: poll gently instead.
+            let own_proof = proven.iter().any(|p| run_ordinal_of(thread_id, p).is_some());
+            if w.proves_settled() && !state.delegated_settled && own_proof {
                 next = Next::Rewait;
             }
         }
@@ -1139,10 +1223,11 @@ mod tests {
         ]);
         let started = Instant::now();
         let done = ThreadState::from_thread_json(
-            &json!({"status": "completed", "latestRunId": "r:ordinal:1"}),
+            &json!({"status": "completed", "latestRunId": "run:thread:a:ordinal:1"}),
+            "a",
             Instant::now(),
         );
-        let busy = ThreadState::from_thread_json(&json!({"status": "running"}), Instant::now());
+        let busy = ThreadState::from_thread_json(&json!({"status": "running"}), "b", Instant::now());
         let snaps = vec![
             Snap {
                 last: Some(Observation::State(done.clone())),

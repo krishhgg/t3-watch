@@ -1,5 +1,6 @@
 //! t3-watch: wait for T3 Code threads to settle without spending AI tokens.
 
+mod cancel;
 mod config;
 mod daemon;
 mod engine;
@@ -328,6 +329,67 @@ fn parse_dur(a: &Args, key: &str, default: Duration) -> Duration {
     }
 }
 
+/// Builds the wait request from the parsed options. Errors are the JSON the
+/// CLI prints, so they can go through notification delivery.
+fn prepare_wait(a: &Args) -> Result<WaitRequest, Value> {
+    let usage = |m: String| error_json("usage", &m);
+    let dur = |key: &str, default: Duration| -> Result<Duration, Value> {
+        match a.get(key) {
+            Some(s) => util::parse_duration(s).map_err(|e| usage(format!("--{key}: {e}"))),
+            None => Ok(default),
+        }
+    };
+    let transport = match a.get("transport") {
+        None | Some("auto") => None,
+        Some("mcp") => Some(Transport::Mcp),
+        Some("local") => Some(Transport::Local),
+        Some(t) => return Err(usage(format!("unknown transport {t:?}"))),
+    };
+    let any = match a.get("mode") {
+        None | Some("all") => false,
+        Some("any") => true,
+        Some(m) => return Err(usage(format!("unknown mode {m:?}"))),
+    };
+    let min_run_ordinal = match a.get("expect-min-run-ordinal") {
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|_| usage("--expect-min-run-ordinal needs a whole number".into()))?,
+        None => 0,
+    };
+    let cfg = Config::load().map_err(|e| error_json("config", &e))?;
+    let (base_dir, t3_bin, explicit_bin) =
+        resolve_local_paths(a.get("base-dir"), a.get("t3-bin")).map_err(|e| error_json("config", &e))?;
+    let defaults = WaitDefaults {
+        machine: a.get("machine"),
+        transport,
+        env: a.get("env"),
+        base_dir,
+        t3_bin,
+        explicit_bin,
+    };
+    let targets = a
+        .positional
+        .iter()
+        .map(|t| resolve_target(t, &defaults, &cfg).map_err(usage))
+        .collect::<Result<Vec<TargetSpec>, Value>>()?;
+    let req = WaitRequest {
+        targets,
+        any,
+        predicate: Predicate {
+            min_run_ordinal,
+            until_delegated: a.has("until-delegated-settled"),
+        },
+        timeout: dur("timeout", Duration::from_secs(4 * 3600))?,
+        interval: dur("interval", Duration::from_secs(5))?,
+        slice: dur("slice", Duration::from_secs(240))?,
+    }
+    .normalized();
+    // Refuse up front what the daemon would refuse, such as delegated-work
+    // waits on the local transport, so nothing starts for a doomed request.
+    req.validate().map_err(usage)?;
+    Ok(req)
+}
+
 fn cmd_wait(raw: &[String]) -> ! {
     let a = parse_args(
         raw,
@@ -378,65 +440,18 @@ fn cmd_wait(raw: &[String]) -> ! {
     })
     .unwrap_or_else(|e| fail_json("usage", &e));
 
-    let transport = match a.get("transport") {
-        None | Some("auto") => None,
-        Some("mcp") => Some(Transport::Mcp),
-        Some("local") => Some(Transport::Local),
-        Some(t) => usage_error(&format!("unknown transport {t:?}")),
-    };
-    let any = match a.get("mode") {
-        None | Some("all") => false,
-        Some("any") => true,
-        Some(m) => usage_error(&format!("unknown mode {m:?}")),
-    };
-    let min_run_ordinal = a
-        .get("expect-min-run-ordinal")
-        .map(|s| {
-            s.parse::<u64>()
-                .unwrap_or_else(|_| usage_error("--expect-min-run-ordinal needs a whole number"))
-        })
-        .unwrap_or(0);
     let pretty = a.has("pretty");
-    let cfg = Config::load().unwrap_or_else(|e| fail_json("config", &e));
-    let (base_dir, t3_bin, explicit_bin) =
-        resolve_local_paths(a.get("base-dir"), a.get("t3-bin")).unwrap_or_else(|e| fail_json("config", &e));
-    let defaults = WaitDefaults {
-        machine: a.get("machine"),
-        transport,
-        env: a.get("env"),
-        base_dir,
-        t3_bin,
-        explicit_bin,
-    };
-    let targets: Vec<TargetSpec> = a
-        .positional
-        .iter()
-        .map(|t| resolve_target(t, &defaults, &cfg).unwrap_or_else(|e| fail_json("usage", &e)))
-        .collect();
-    let req = WaitRequest {
-        targets,
-        any,
-        predicate: Predicate {
-            min_run_ordinal,
-            until_delegated: a.has("until-delegated-settled"),
-        },
-        timeout: parse_dur(&a, "timeout", Duration::from_secs(4 * 3600)),
-        interval: parse_dur(&a, "interval", Duration::from_secs(5)),
-        slice: parse_dur(&a, "slice", Duration::from_secs(240)),
-    }
-    .normalized();
-    // Refuse up front what the daemon would refuse, such as delegated-work
-    // waits on the local transport, so nothing starts for a doomed request.
-    if let Err(e) = req.validate() {
-        fail_json("usage", &e);
-    }
-
-    let mut outcome = if a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some() {
-        let hub = Hub::new("direct");
-        let (tx, rx) = mpsc::channel();
-        hub.wait(&req, tx, rx)
-    } else {
-        daemon::wait(&req).unwrap_or_else(|e| Outcome::Error(error_json("daemon", &e)))
+    // From here on the notification config is valid, so every failure,
+    // operational or not, becomes an outcome that goes through delivery: an
+    // unattended bot with --notify-on all hears about a broken config too.
+    let mut outcome = match prepare_wait(&a) {
+        Err(e) => Outcome::Error(e),
+        Ok(req) if a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some() => {
+            let hub = Hub::new("direct");
+            let (tx, rx) = mpsc::channel();
+            hub.wait(&req, tx, rx)
+        }
+        Ok(req) => daemon::wait(&req).unwrap_or_else(|e| Outcome::Error(error_json("daemon", &e))),
     };
 
     let mut code = outcome.exit_code();

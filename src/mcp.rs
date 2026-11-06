@@ -2,10 +2,16 @@
 //! `t3_thread_wait` and `t3_thread_read`.
 //!
 //! One `McpClient` exists per (origin, pairing) and is shared by every watch
-//! on it, so they reuse one `Mcp-Session-Id` and one keep-alive pool. The
-//! origin never changes after construction; only the access token can, when
-//! a 401 is recovered by reloading machines.json or refreshing the token.
+//! on it, so they reuse one `Mcp-Session-Id`. The origin never changes after
+//! construction; only the access token can, when a 401 is recovered by
+//! reloading machines.json or refreshing the token.
+//!
+//! Each upstream cycle runs on its own `ureq::Agent`, registered with a
+//! `Cancel`. Cancelling shuts that agent down, which interrupts a blocked
+//! long-poll at once, and the abandoned call is followed by an MCP
+//! `notifications/cancelled` so the server can stop work too.
 
+use crate::cancel::Cancel;
 use crate::util::{self, lock};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -16,6 +22,8 @@ use std::time::Duration;
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 /// Versions whose `tools/call` behaves the same for our two tools.
 pub const SUPPORTED_VERSIONS: &[&str] = &["2025-03-26", "2025-06-18"];
+/// Server-to-client requests answered per response; more is abuse.
+const MAX_SERVER_REQUESTS: usize = 16;
 
 /// Upper bounds for one HTTP response, so a broken upstream cannot exhaust
 /// the shared daemon's memory.
@@ -33,8 +41,9 @@ pub const LIMITS: Limits = Limits {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallError {
-    /// Network trouble, Cloudflare 5xx/530, timeouts. Retry with backoff and
-    /// never wake the caller for it.
+    /// Network trouble, Cloudflare 5xx/530, timeouts, a token refresh that
+    /// failed for a temporary reason. Retry with backoff and never wake the
+    /// caller for it.
     Transient { message: String, status: Option<u16> },
     /// 401/403 that could not be recovered, or a tool reporting missing
     /// permission. The caller exits 2.
@@ -47,8 +56,10 @@ pub enum CallError {
     /// this by re-initializing; it never reaches the engine.
     Session { message: String, status: Option<u16> },
     /// HTTP 401. `call_tool` tries to recover a token once, then reports
-    /// `Auth`; it never reaches the engine.
+    /// `Auth` or `Transient`; it never reaches the engine.
     Unauthorized(String),
+    /// The operation was cancelled because nobody waits for it any more.
+    Cancelled,
 }
 
 impl CallError {
@@ -56,6 +67,7 @@ impl CallError {
         match self {
             CallError::Transient { message, .. } | CallError::Session { message, .. } => message,
             CallError::Auth(m) | CallError::NotFound(m) | CallError::Fatal(m) | CallError::Unauthorized(m) => m,
+            CallError::Cancelled => "cancelled",
         }
     }
 
@@ -65,10 +77,11 @@ impl CallError {
             CallError::Auth(_) | CallError::Unauthorized(_) => "auth",
             CallError::NotFound(_) => "not_found",
             CallError::Fatal(_) => "fatal",
+            CallError::Cancelled => "cancelled",
         }
     }
 
-    fn transient(message: impl Into<String>) -> Self {
+    pub fn transient(message: impl Into<String>) -> Self {
         CallError::Transient {
             message: message.into(),
             status: None,
@@ -95,17 +108,32 @@ pub struct Stats {
     pub retries: AtomicU64,
     pub session_resets: AtomicU64,
     pub token_recoveries: AtomicU64,
+    pub cancellations: AtomicU64,
+    pub server_requests: AtomicU64,
 }
 
-/// Called on HTTP 401 with the token that was rejected. Returns a token to
-/// retry with (reloaded from machines.json or refreshed), if there is one.
-pub type TokenRecovery = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// What a token recovery found out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recovery {
+    /// A different token to retry with: reloaded or freshly refreshed.
+    Token(String),
+    /// Definitive: no other token exists or the refresh was refused
+    /// (`invalid_grant` and the like). The caller exits 2.
+    Rejected(String),
+    /// Temporary: the authorization server, the network, the config lock or
+    /// the disk failed. Retry later with backoff.
+    Retry(String),
+}
+
+/// Called on HTTP 401 with the token that was rejected.
+pub type TokenRecovery = Box<dyn Fn(&str) -> Recovery + Send + Sync>;
 
 pub struct McpClient {
     /// Machine name at creation time, for messages only.
     pub label: String,
     origin: String,
     endpoint: String,
+    https: bool,
     fingerprint: String,
     token: Mutex<String>,
     recovery: Option<TokenRecovery>,
@@ -116,7 +144,6 @@ pub struct McpClient {
     /// Held for the whole initialize handshake so concurrent callers wait
     /// for one handshake instead of each starting their own.
     init: Mutex<()>,
-    agent: ureq::Agent,
     next_id: AtomicU64,
     pub stats: Stats,
 }
@@ -138,19 +165,10 @@ impl McpClient {
         recovery: Option<TokenRecovery>,
     ) -> Result<Self, String> {
         let url = util::secure_url(origin, &format!("MCP origin of {label:?}"))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .https_only(url.scheme == "https")
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .max_idle_connections_per_host(64)
-            .max_idle_age(Duration::from_secs(300))
-            .user_agent(concat!("t3-watch/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
         Ok(McpClient {
             label: label.to_string(),
             endpoint: format!("{}/mcp", url.origin),
+            https: url.scheme == "https",
             origin: url.origin,
             fingerprint: fingerprint.to_string(),
             token: Mutex::new(token.to_string()),
@@ -158,10 +176,23 @@ impl McpClient {
             recovering: Mutex::new(()),
             session: Mutex::new(Session::default()),
             init: Mutex::new(()),
-            agent,
             next_id: AtomicU64::new(1),
             stats: Stats::default(),
         })
+    }
+
+    /// A fresh agent for one upstream cycle. Its own connection pool means
+    /// shutting it down (on cancel) touches nothing else.
+    pub fn agent(&self) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .https_only(self.https)
+            .timeout_resolve(Some(Duration::from_secs(10)))
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .user_agent(concat!("t3-watch/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into()
     }
 
     pub fn origin(&self) -> &str {
@@ -200,11 +231,21 @@ impl McpClient {
         s.generation += 1;
     }
 
-    fn post(&self, body: &Value, session_id: Option<&str>, timeout: Duration) -> Result<Reply, CallError> {
+    /// POSTs one JSON-RPC message. `version` is the negotiated protocol
+    /// version to announce; `None` uses the session's.
+    fn post(
+        &self,
+        agent: &ureq::Agent,
+        body: &Value,
+        session_id: Option<&str>,
+        version: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Reply, CallError> {
         let token = self.token();
-        let version = lock(&self.session).version.clone();
-        let mut req = self
-            .agent
+        let version = version
+            .map(str::to_string)
+            .or_else(|| lock(&self.session).version.clone());
+        let mut req = agent
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
@@ -212,8 +253,9 @@ impl McpClient {
         if let Some(id) = session_id {
             req = req.header("Mcp-Session-Id", id);
         }
-        // 2025-06-18 requires the negotiated version on every later request.
-        if let Some(v) = version.filter(|v| v.as_str() != "2025-03-26") {
+        // 2025-06-18 requires the negotiated version on every request after
+        // initialize, notifications/initialized included.
+        if let Some(v) = version.as_deref().filter(|v| *v != "2025-03-26") {
             req = req.header("MCP-Protocol-Version", v);
         }
         let resp = req
@@ -255,11 +297,19 @@ impl McpClient {
         }
 
         let want_id = body.get("id");
+        let session_for_replies = new_session.clone().or_else(|| session_id.map(str::to_string));
         let message = match want_id {
             None => None,
             Some(_) if status == 202 => None,
             Some(id) if content_type.starts_with("text/event-stream") => {
-                read_sse_response(&mut body_reader, id, &LIMITS)?
+                let mut answered = 0;
+                let mut on_request = |request: &Value| {
+                    answered += 1;
+                    if answered <= MAX_SERVER_REQUESTS {
+                        self.answer_server_request(agent, request, session_for_replies.as_deref(), version.as_deref());
+                    }
+                };
+                read_sse_response(&mut body_reader, id, &LIMITS, &mut on_request)?
             }
             Some(id) => {
                 let mut bytes = Vec::new();
@@ -292,6 +342,26 @@ impl McpClient {
         })
     }
 
+    /// Answers a request the server sent us inside an SSE stream: `ping`
+    /// gets an empty result, anything else "method not found" (we declare
+    /// no client capabilities). Best effort; failures are ignored.
+    fn answer_server_request(
+        &self,
+        agent: &ureq::Agent,
+        request: &Value,
+        session: Option<&str>,
+        version: Option<&str>,
+    ) {
+        self.stats.server_requests.fetch_add(1, Ordering::Relaxed);
+        let id = request["id"].clone();
+        let reply = if request["method"] == "ping" {
+            json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        } else {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } })
+        };
+        let _ = self.post(agent, &reply, session, version, Duration::from_secs(10));
+    }
+
     fn auth_message(&self, status: u16) -> String {
         format!(
             "{} rejected the token (HTTP {status}); run `t3-watch auth login {} --name {}` again",
@@ -301,7 +371,7 @@ impl McpClient {
 
     /// Returns the current session id and its generation, running the
     /// `initialize` handshake first if needed.
-    fn ensure_session(&self) -> Result<(Option<String>, u64), CallError> {
+    fn ensure_session(&self, agent: &ureq::Agent) -> Result<(Option<String>, u64), CallError> {
         loop {
             let generation = {
                 let s = lock(&self.session);
@@ -318,7 +388,7 @@ impl McpClient {
                     continue;
                 }
             }
-            let (id, version) = self.handshake().map_err(|e| match e {
+            let (id, version) = self.handshake(agent).map_err(|e| match e {
                 CallError::Session { message, status } => CallError::Transient { message, status },
                 e => e,
             })?;
@@ -333,7 +403,7 @@ impl McpClient {
         }
     }
 
-    fn handshake(&self) -> Result<(Option<String>, String), CallError> {
+    fn handshake(&self, agent: &ureq::Agent) -> Result<(Option<String>, String), CallError> {
         self.stats.initialize.fetch_add(1, Ordering::Relaxed);
         let init = json!({
             "jsonrpc": "2.0",
@@ -345,15 +415,22 @@ impl McpClient {
                 "clientInfo": { "name": "t3-watch", "version": env!("CARGO_PKG_VERSION") }
             }
         });
-        let reply = self.post(&init, None, Duration::from_secs(30))?;
+        let reply = self.post(agent, &init, None, None, Duration::from_secs(30))?;
         let msg = reply.message.unwrap_or(Value::Null);
         if let Some(err) = msg.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             return Err(CallError::Fatal(format!("initialize failed (JSON-RPC error {code})")));
         }
         let version = check_protocol_version(&msg)?;
+        // The session is not stored yet, so pass the negotiated version.
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        self.post(&note, reply.session_id.as_deref(), Duration::from_secs(30))?;
+        self.post(
+            agent,
+            &note,
+            reply.session_id.as_deref(),
+            Some(&version),
+            Duration::from_secs(30),
+        )?;
         Ok((reply.session_id, version))
     }
 
@@ -370,28 +447,59 @@ impl McpClient {
 
     /// After a 401 with `used`: if another worker already switched tokens,
     /// retry with that; otherwise ask the recovery hook (reload, then
-    /// refresh). Returns whether a retry makes sense.
-    fn recover_token(&self, used: &str) -> bool {
+    /// refresh).
+    fn recover_token(&self, used: &str) -> Recovery {
         let _one_at_a_time = lock(&self.recovering);
-        if self.token() != used {
-            return true;
+        let current = self.token();
+        if current != used {
+            return Recovery::Token(current);
         }
-        let Some(recover) = &self.recovery else { return false };
+        let Some(recover) = &self.recovery else {
+            return Recovery::Rejected("no saved credentials to recover with".into());
+        };
         match recover(used) {
-            Some(new) if new != used && !new.is_empty() => {
+            Recovery::Token(new) if new != used && !new.is_empty() => {
                 self.stats.token_recoveries.fetch_add(1, Ordering::Relaxed);
                 self.set_token(&new);
-                true
+                Recovery::Token(new)
             }
-            _ => false,
+            Recovery::Token(_) => Recovery::Rejected("machines.json still holds the rejected token".into()),
+            other => other,
         }
+    }
+
+    /// Tells the server we gave up on request `id`. Best effort, on a short
+    /// fresh agent because the cycle's agent is already shut down.
+    fn send_cancelled(&self, id: u64, session: Option<&str>) {
+        self.stats.cancellations.fetch_add(1, Ordering::Relaxed);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .https_only(self.https)
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build()
+            .into();
+        let note = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id, "reason": "no t3-watch client waits for this any more" }
+        });
+        let _ = self.post(&agent, &note, session, None, Duration::from_secs(3));
     }
 
     /// Calls a tool and returns its JSON payload. An expired session is
     /// re-initialized once and the call retried, and a 401 gets one token
-    /// recovery; every other error goes back to the caller, which owns the
-    /// backoff policy.
-    pub fn call_tool(&self, name: &str, args: Value, timeout: Duration) -> Result<Value, CallError> {
+    /// recovery. If `cancel` fires, the request is interrupted, the server is
+    /// told, and `Cancelled` comes back. Every other error goes back to the
+    /// caller, which owns the backoff policy.
+    pub fn call_tool(
+        &self,
+        agent: &ureq::Agent,
+        cancel: &Cancel,
+        name: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, CallError> {
         match name {
             "t3_thread_wait" => self.stats.thread_wait.fetch_add(1, Ordering::Relaxed),
             "t3_thread_read" => self.stats.thread_read.fetch_add(1, Ordering::Relaxed),
@@ -400,19 +508,31 @@ impl McpClient {
         let mut session_retried = false;
         let mut auth_retried = false;
         loop {
+            if cancel.is_cancelled() {
+                return Err(CallError::Cancelled);
+            }
             let used = self.token();
             let mut generation = None;
-            let result = self.ensure_session().and_then(|(session, g)| {
+            let mut sent: Option<(u64, Option<String>)> = None;
+            let result = self.ensure_session(agent).and_then(|(session, g)| {
                 generation = Some(g);
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                sent = Some((id, session.clone()));
                 let req = json!({
                     "jsonrpc": "2.0",
-                    "id": self.next_id.fetch_add(1, Ordering::Relaxed),
+                    "id": id,
                     "method": "tools/call",
                     "params": { "name": name, "arguments": args }
                 });
-                self.post(&req, session.as_deref(), timeout)
+                self.post(agent, &req, session.as_deref(), None, timeout)
                     .and_then(|reply| tool_payload(reply.message.unwrap_or(Value::Null)))
             });
+            if cancel.is_cancelled() {
+                if let (Err(_), Some((id, session))) = (&result, sent) {
+                    self.send_cancelled(id, session.as_deref());
+                }
+                return Err(CallError::Cancelled);
+            }
             match result {
                 Err(CallError::Session { message, status }) => {
                     if let Some(g) = generation {
@@ -430,11 +550,21 @@ impl McpClient {
                     });
                 }
                 Err(CallError::Unauthorized(message)) => {
-                    if !auth_retried && self.recover_token(&used) {
-                        auth_retried = true;
-                        continue;
+                    // A replacement token that is rejected too is final.
+                    if auth_retried {
+                        return Err(CallError::Auth(message));
                     }
-                    return Err(CallError::Auth(message));
+                    auth_retried = true;
+                    match self.recover_token(&used) {
+                        Recovery::Token(_) => continue,
+                        Recovery::Rejected(why) => return Err(CallError::Auth(format!("{message}; {why}"))),
+                        Recovery::Retry(why) => {
+                            return Err(CallError::Transient {
+                                message: format!("token recovery failed for now ({why}); will retry"),
+                                status: Some(401),
+                            })
+                        }
+                    }
                 }
                 other => return other,
             }
@@ -477,10 +607,16 @@ fn cloudflare_hint(status: u16, body: &str) -> String {
     }
 }
 
-/// Reads `text/event-stream` until the event carrying our response arrives,
-/// skipping notifications and comments. Lines may end in LF, CRLF or CR.
+/// Reads `text/event-stream` until the event carrying our response arrives.
+/// Requests the server sends us (with `method` and `id`) go to `on_request`;
+/// notifications and comments are skipped. Lines may end in LF, CRLF or CR.
 /// Every line, every event's data and the whole stream are size-bounded.
-pub fn read_sse_response(mut reader: impl Read, want_id: &Value, limits: &Limits) -> Result<Option<Value>, CallError> {
+pub fn read_sse_response(
+    mut reader: impl Read,
+    want_id: &Value,
+    limits: &Limits,
+    on_request: &mut dyn FnMut(&Value),
+) -> Result<Option<Value>, CallError> {
     let mut chunk = [0u8; 8192];
     let mut line: Vec<u8> = Vec::new();
     let mut data: Vec<u8> = Vec::new();
@@ -509,7 +645,7 @@ pub fn read_sse_response(mut reader: impl Read, want_id: &Value, limits: &Limits
             }
             after_cr = b == b'\r';
             if b == b'\r' || b == b'\n' {
-                if let Some(msg) = sse_line(&line, &mut data, want_id, limits)? {
+                if let Some(msg) = sse_line(&line, &mut data, want_id, limits, on_request)? {
                     return Ok(Some(msg));
                 }
                 line.clear();
@@ -525,16 +661,22 @@ pub fn read_sse_response(mut reader: impl Read, want_id: &Value, limits: &Limits
         }
     }
     if !line.is_empty() {
-        if let Some(msg) = sse_line(&line, &mut data, want_id, limits)? {
+        if let Some(msg) = sse_line(&line, &mut data, want_id, limits, on_request)? {
             return Ok(Some(msg));
         }
     }
-    Ok(dispatch_event(&mut data, want_id))
+    Ok(dispatch_event(&mut data, want_id, on_request))
 }
 
-fn sse_line(line: &[u8], data: &mut Vec<u8>, want_id: &Value, limits: &Limits) -> Result<Option<Value>, CallError> {
+fn sse_line(
+    line: &[u8],
+    data: &mut Vec<u8>,
+    want_id: &Value,
+    limits: &Limits,
+    on_request: &mut dyn FnMut(&Value),
+) -> Result<Option<Value>, CallError> {
     if line.is_empty() {
-        return Ok(dispatch_event(data, want_id));
+        return Ok(dispatch_event(data, want_id, on_request));
     }
     if let Some(rest) = line.strip_prefix(b"data:") {
         let rest = rest.strip_prefix(b" ").unwrap_or(rest);
@@ -553,20 +695,39 @@ fn sse_line(line: &[u8], data: &mut Vec<u8>, want_id: &Value, limits: &Limits) -
     Ok(None)
 }
 
-fn dispatch_event(data: &mut Vec<u8>, want_id: &Value) -> Option<Value> {
+fn dispatch_event(data: &mut Vec<u8>, want_id: &Value, on_request: &mut dyn FnMut(&Value)) -> Option<Value> {
     if data.is_empty() {
         return None;
     }
     let parsed = serde_json::from_slice::<Value>(data).ok();
     data.clear();
-    parsed.and_then(|v| pick_response(v, want_id))
+    let parsed = parsed?;
+    let items: Vec<&Value> = match &parsed {
+        Value::Array(items) => items.iter().collect(),
+        v => vec![v],
+    };
+    for item in items {
+        if is_server_request(item) {
+            on_request(item);
+        }
+    }
+    pick_response(parsed, want_id)
+}
+
+/// A JSON-RPC request (not a response, not a notification).
+fn is_server_request(v: &Value) -> bool {
+    v.get("method").and_then(Value::as_str).is_some() && v.get("id").is_some_and(|id| !id.is_null())
 }
 
 /// Finds the JSON-RPC response with our id in a message or batch.
 fn pick_response(v: Value, want_id: &Value) -> Option<Value> {
     match v {
         Value::Array(items) => items.into_iter().find_map(|i| pick_response(i, want_id)),
-        Value::Object(_) if v.get("id") == Some(want_id) && (v.get("result").is_some() || v.get("error").is_some()) => {
+        Value::Object(_)
+            if v.get("method").is_none()
+                && v.get("id") == Some(want_id)
+                && (v.get("result").is_some() || v.get("error").is_some()) =>
+        {
             Some(v)
         }
         _ => None,
@@ -649,56 +810,69 @@ mod tests {
         max_body: 1024,
     };
 
+    fn sse(stream: &str, id: Value, limits: &Limits) -> (Result<Option<Value>, CallError>, Vec<Value>) {
+        let mut seen = Vec::new();
+        let r = read_sse_response(stream.as_bytes(), &id, limits, &mut |v| seen.push(v.clone()));
+        (r, seen)
+    }
+
     #[test]
     fn sse_skips_notifications_and_joins_data_lines() {
         let stream = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
                       : keepalive\n\n\
                       event: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":7,\"result\":{\"ok\":true}}\r\n\r\n";
-        let msg = read_sse_response(stream.as_bytes(), &json!(7), &LIMITS)
-            .unwrap()
-            .unwrap();
-        assert_eq!(msg["result"]["ok"], true);
+        let (msg, requests) = sse(stream, json!(7), &LIMITS);
+        assert_eq!(msg.unwrap().unwrap()["result"]["ok"], true);
+        assert!(requests.is_empty(), "a notification is not a request");
+    }
+
+    #[test]
+    fn sse_hands_server_requests_to_the_caller() {
+        let stream = "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n\
+                      data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"roots/list\"}\n\n\
+                      data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"done\":true}}\n\n";
+        let (msg, requests) = sse(stream, json!(9), &LIMITS);
+        // A request that reuses our id is not mistaken for our response.
+        assert_eq!(msg.unwrap().unwrap()["result"]["done"], true);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["method"], "ping");
+        assert_eq!(requests[1]["method"], "roots/list");
     }
 
     #[test]
     fn sse_accepts_bare_cr_line_endings() {
         let stream = "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\r\r";
-        assert!(read_sse_response(stream.as_bytes(), &json!(5), &LIMITS)
-            .unwrap()
-            .is_some());
+        assert!(sse(stream, json!(5), &LIMITS).0.unwrap().is_some());
     }
 
     #[test]
     fn sse_without_trailing_blank_line() {
         let stream = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}";
-        assert!(read_sse_response(stream.as_bytes(), &json!(3), &LIMITS)
+        assert!(sse(stream, json!(3), &LIMITS).0.unwrap().is_some());
+        assert!(sse("data: {\"id\":4,\"result\":{}}\n\n", json!(3), &LIMITS)
+            .0
             .unwrap()
-            .is_some());
-        assert!(
-            read_sse_response("data: {\"id\":4,\"result\":{}}\n\n".as_bytes(), &json!(3), &LIMITS)
-                .unwrap()
-                .is_none()
-        );
+            .is_none());
     }
 
     #[test]
     fn sse_rejects_an_overlong_line() {
         let stream = format!("data: {}\n\n", "x".repeat(200));
-        let err = read_sse_response(stream.as_bytes(), &json!(1), &SMALL).unwrap_err();
+        let err = sse(&stream, json!(1), &SMALL).0.unwrap_err();
         assert!(err.message().contains("line longer"), "{err:?}");
     }
 
     #[test]
     fn sse_rejects_an_overlong_event() {
         let stream = "data: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".repeat(5);
-        let err = read_sse_response(stream.as_bytes(), &json!(1), &SMALL).unwrap_err();
+        let err = sse(&stream, json!(1), &SMALL).0.unwrap_err();
         assert!(err.message().contains("event larger"), "{err:?}");
     }
 
     #[test]
     fn sse_rejects_an_endless_stream_of_comments() {
         let stream = ": keepalive\n".repeat(200);
-        let err = read_sse_response(stream.as_bytes(), &json!(1), &SMALL).unwrap_err();
+        let err = sse(&stream, json!(1), &SMALL).0.unwrap_err();
         assert!(err.message().contains("stream larger"), "{err:?}");
         assert!(matches!(err, CallError::Transient { .. }));
     }
@@ -779,29 +953,41 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_tried_once_and_only_with_a_new_token() {
+    fn recovery_results_are_typed() {
         let c = McpClient::new(
             "m",
             "http://127.0.0.1:9",
             "old",
             "f",
-            Some(Box::new(|_used: &str| Some("new".into()))),
+            Some(Box::new(|_used: &str| Recovery::Token("new".into()))),
         )
         .unwrap();
-        assert!(c.recover_token("old"));
+        assert_eq!(c.recover_token("old"), Recovery::Token("new".into()));
         assert_eq!(c.token(), "new");
         // A caller that still holds "old" sees the token already moved on.
-        assert!(c.recover_token("old"));
-        let none = McpClient::new(
+        assert_eq!(c.recover_token("old"), Recovery::Token("new".into()));
+        let same = McpClient::new(
             "m",
             "http://127.0.0.1:9",
             "t",
             "f",
-            Some(Box::new(|used: &str| Some(used.to_string()))),
+            Some(Box::new(|used: &str| Recovery::Token(used.to_string()))),
         )
         .unwrap();
-        assert!(!none.recover_token("t"), "same token again is not a recovery");
+        assert!(
+            matches!(same.recover_token("t"), Recovery::Rejected(_)),
+            "same token is no recovery"
+        );
+        let busy = McpClient::new(
+            "m",
+            "http://127.0.0.1:9",
+            "t",
+            "f",
+            Some(Box::new(|_: &str| Recovery::Retry("503".into()))),
+        )
+        .unwrap();
+        assert_eq!(busy.recover_token("t"), Recovery::Retry("503".into()));
         let absent = McpClient::new("m", "http://127.0.0.1:9", "t", "f", None).unwrap();
-        assert!(!absent.recover_token("t"));
+        assert!(matches!(absent.recover_token("t"), Recovery::Rejected(_)));
     }
 }
