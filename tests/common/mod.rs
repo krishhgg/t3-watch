@@ -1,10 +1,10 @@
 //! Test fixtures: a mock T3 Streamable HTTP MCP server (with a mock OAuth
-//! authorization server on the same origin), a mock local `t3` CLI, and
-//! helpers to run the real `t3-watch` binary against them.
+//! authorization server on the same origin), a mock webhook receiver, a mock
+//! local `t3` CLI, and helpers to run the real `t3-watch` binary against them.
 
 #![allow(dead_code)]
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,13 +20,14 @@ use std::time::{Duration, Instant};
 pub const BIN: &str = env!("CARGO_BIN_EXE_t3-watch");
 pub const TOKEN: &str = "test-token-read-only";
 
-#[derive(Default)]
 pub struct MockState {
     /// threadId -> (status, run ordinal)
     pub threads: HashMap<String, (String, u64)>,
     pub calls: HashMap<String, usize>,
     pub sse: bool,
+    /// The bearer token the MCP endpoint accepts, plus any extras.
     pub token: String,
+    pub extra_tokens: HashSet<String>,
     pub sessions: HashSet<String>,
     pub next_session: u64,
     /// Responses to return, in order, before handling MCP requests normally.
@@ -34,10 +35,60 @@ pub struct MockState {
     pub wait_args: Vec<Value>,
     /// Answer every tools/call with this HTTP status, even on a valid session.
     pub reject_tools_with: Option<u16>,
+    /// Threads whose delegated work has not settled yet.
+    pub delegated_pending: HashSet<String>,
+    /// Right after a `t3_thread_wait` for this thread computes its answer,
+    /// move the thread to (status, ordinal, delegated pending): a new run
+    /// that starts between the wait and the read.
+    pub advance_after_wait: Option<(String, String, u64, bool)>,
+    pub protocol_version: String,
+    /// Merged into the protected resource / authorization server metadata.
+    pub prm_override: Map<String, Value>,
+    pub asm_override: Map<String, Value>,
+    /// Path of the issuer below the origin, e.g. "/tenant".
+    pub issuer_path: String,
+    /// Refresh token handed out with the first access token.
+    pub issue_refresh: Option<String>,
+    /// Access token a valid refresh grant returns.
+    pub refresh_to: Option<String>,
+    /// Make the token endpoint fail with this body.
+    pub token_error_body: Option<String>,
+    /// Answer tool calls with an endless stream of SSE comments.
+    pub sse_flood: Option<usize>,
     pub register_bodies: Vec<Value>,
     pub authorize_queries: Vec<HashMap<String, String>>,
     /// code -> (code_challenge, redirect_uri, client_id)
     pub codes: HashMap<String, (String, String, String)>,
+}
+
+impl Default for MockState {
+    fn default() -> Self {
+        MockState {
+            threads: HashMap::new(),
+            calls: HashMap::new(),
+            sse: false,
+            token: TOKEN.into(),
+            extra_tokens: HashSet::new(),
+            sessions: HashSet::new(),
+            next_session: 0,
+            fail_queue: VecDeque::new(),
+            wait_args: Vec::new(),
+            reject_tools_with: None,
+            delegated_pending: HashSet::new(),
+            advance_after_wait: None,
+            protocol_version: "2025-03-26".into(),
+            prm_override: Map::new(),
+            asm_override: Map::new(),
+            issuer_path: String::new(),
+            issue_refresh: None,
+            refresh_to: None,
+            token_error_body: None,
+            sse_flood: None,
+            register_bodies: Vec::new(),
+            authorize_queries: Vec::new(),
+            codes: HashMap::new(),
+        }
+    }
 }
 
 pub struct MockMcp {
@@ -53,13 +104,7 @@ impl MockMcp {
     pub fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let state = Arc::new((
-            Mutex::new(MockState {
-                token: TOKEN.into(),
-                ..Default::default()
-            }),
-            Condvar::new(),
-        ));
+        let state = Arc::new((Mutex::new(MockState::default()), Condvar::new()));
         let (st, base) = (state.clone(), url.clone());
         thread::spawn(move || {
             for conn in listener.incoming().flatten() {
@@ -92,15 +137,15 @@ impl MockMcp {
     }
 }
 
-struct Req {
-    method: String,
-    path: String,
-    query: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
+pub struct Req {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Req> {
+pub fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut r = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
     r.read_line(&mut line).ok()?;
@@ -173,7 +218,7 @@ pub fn parse_query(q: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn b64url(data: &[u8]) -> String {
+pub fn b64url(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for c in data.chunks(3) {
@@ -185,52 +230,59 @@ fn b64url(data: &[u8]) -> String {
     out
 }
 
+pub fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn merged(mut base: Value, extra: &Map<String, Value>) -> Value {
+    for (k, v) in extra {
+        if v.is_null() {
+            base.as_object_mut().unwrap().remove(k);
+        } else {
+            base[k] = v.clone();
+        }
+    }
+    base
+}
+
 fn handle(mut stream: TcpStream, st: &Arc<(Mutex<MockState>, Condvar)>, base: &str) {
-    let Some(req) = read_request(&mut stream) else { return };
+    let Some(req) = read_request(&mut stream) else {
+        return;
+    };
     let (m, cv) = &**st;
+    let json_ct = || vec![("Content-Type", "application/json".to_string())];
+    let issuer_path = m.lock().unwrap().issuer_path.clone();
+    let asm_path = format!("/.well-known/oauth-authorization-server{issuer_path}");
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/.well-known/oauth-protected-resource/mcp") => {
             let body = json!({
                 "resource": format!("{base}/mcp"),
-                "authorization_servers": [base],
+                "authorization_servers": [format!("{base}{issuer_path}")],
                 "scopes_supported": ["orchestration:read", "orchestration:operate"],
                 "bearer_methods_supported": ["header"],
             });
-            respond(
-                &mut stream,
-                200,
-                &[("Content-Type", "application/json".into())],
-                &body.to_string(),
-            );
+            let body = merged(body, &m.lock().unwrap().prm_override);
+            respond(&mut stream, 200, &json_ct(), &body.to_string());
         }
-        ("GET", "/.well-known/oauth-authorization-server") => {
+        ("GET", p) if p == asm_path => {
             let body = json!({
-                "issuer": base,
+                "issuer": format!("{base}{issuer_path}"),
                 "authorization_endpoint": format!("{base}/oauth/authorize"),
                 "token_endpoint": format!("{base}/oauth/token"),
                 "registration_endpoint": format!("{base}/oauth/register"),
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
             });
-            respond(
-                &mut stream,
-                200,
-                &[("Content-Type", "application/json".into())],
-                &body.to_string(),
-            );
+            let body = merged(body, &m.lock().unwrap().asm_override);
+            respond(&mut stream, 200, &json_ct(), &body.to_string());
         }
         ("POST", "/oauth/register") => {
             let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             m.lock().unwrap().register_bodies.push(v.clone());
             let body = json!({ "client_id": "client-1", "redirect_uris": v["redirect_uris"], "token_endpoint_auth_method": "none" });
-            respond(
-                &mut stream,
-                201,
-                &[("Content-Type", "application/json".into())],
-                &body.to_string(),
-            );
+            respond(&mut stream, 201, &json_ct(), &body.to_string());
         }
         ("GET", "/oauth/authorize") => {
             let q = parse_query(&req.query);
@@ -249,17 +301,29 @@ fn handle(mut stream: TcpStream, st: &Arc<(Mutex<MockState>, Condvar)>, base: &s
                     q["client_id"].clone(),
                 ),
             );
-            let loc = format!(
-                "{}?code={code}&state={}&iss={}",
-                q["redirect_uri"],
-                q["state"],
-                base.replace(':', "%3A").replace('/', "%2F")
-            );
+            let iss = format!("{base}{issuer_path}").replace(':', "%3A").replace('/', "%2F");
+            let loc = format!("{}?code={code}&state={}&iss={iss}", q["redirect_uri"], q["state"]);
             respond(&mut stream, 302, &[("Location", loc)], "");
         }
         ("POST", "/oauth/token") => {
             let f = parse_query(&String::from_utf8_lossy(&req.body));
-            let s = m.lock().unwrap();
+            let mut s = m.lock().unwrap();
+            if let Some(body) = s.token_error_body.clone() {
+                respond(&mut stream, 400, &json_ct(), &body);
+                return;
+            }
+            if f.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                *s.calls.entry("refresh".into()).or_default() += 1;
+                let ok = s.issue_refresh.is_some() && f.get("refresh_token") == s.issue_refresh.as_ref();
+                match (ok, s.refresh_to.clone()) {
+                    (true, Some(new)) => {
+                        let body = json!({ "access_token": new, "token_type": "Bearer", "expires_in": 3600, "scope": "orchestration:read" });
+                        respond(&mut stream, 200, &json_ct(), &body.to_string());
+                    }
+                    _ => respond(&mut stream, 400, &json_ct(), r#"{"error":"invalid_grant"}"#),
+                }
+                return;
+            }
             let ok = s
                 .codes
                 .get(f.get("code").map(String::as_str).unwrap_or(""))
@@ -272,20 +336,13 @@ fn handle(mut stream: TcpStream, st: &Arc<(Mutex<MockState>, Condvar)>, base: &s
                         && f.get("grant_type").map(String::as_str) == Some("authorization_code")
                 });
             if ok {
-                let body = json!({ "access_token": s.token, "token_type": "Bearer", "expires_in": 3600, "scope": "orchestration:read" });
-                respond(
-                    &mut stream,
-                    200,
-                    &[("Content-Type", "application/json".into())],
-                    &body.to_string(),
-                );
+                let mut body = json!({ "access_token": s.token, "token_type": "Bearer", "expires_in": 3600, "scope": "orchestration:read" });
+                if let Some(rt) = &s.issue_refresh {
+                    body["refresh_token"] = json!(rt);
+                }
+                respond(&mut stream, 200, &json_ct(), &body.to_string());
             } else {
-                respond(
-                    &mut stream,
-                    400,
-                    &[("Content-Type", "application/json".into())],
-                    r#"{"error":"invalid_grant"}"#,
-                );
+                respond(&mut stream, 400, &json_ct(), r#"{"error":"invalid_grant"}"#);
             }
         }
         ("POST", "/mcp") => handle_mcp(stream, req, m, cv),
@@ -303,7 +360,10 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
         respond(&mut stream, status, &[("Content-Type", "text/html".into())], &body);
         return;
     }
-    if req.headers.get("authorization") != Some(&format!("Bearer {}", s.token)) {
+    let auth = req.headers.get("authorization").cloned().unwrap_or_default();
+    let presented = auth.strip_prefix("Bearer ").unwrap_or("");
+    if presented != s.token && !s.extra_tokens.contains(presented) {
+        *s.calls.entry("unauthorized".into()).or_default() += 1;
         drop(s);
         respond(
             &mut stream,
@@ -319,10 +379,10 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
         s.next_session += 1;
         let sid = format!("session-{}", s.next_session);
         s.sessions.insert(sid.clone());
-        let sse = s.sse;
+        let (sse, version) = (s.sse, s.protocol_version.clone());
         drop(s);
         let result = json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {
-            "protocolVersion": "2025-03-26", "capabilities": { "tools": {} }, "serverInfo": { "name": "mock-t3", "version": "0" } } });
+            "protocolVersion": version, "capabilities": { "tools": {} }, "serverInfo": { "name": "mock-t3", "version": "0" } } });
         send_result(&mut stream, &result, sse, Some(&sid));
         return;
     }
@@ -347,26 +407,52 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
     let tool = msg["params"]["name"].as_str().unwrap_or("").to_string();
     let args = msg["params"]["arguments"].clone();
     *s.calls.entry(tool.clone()).or_default() += 1;
+    if let Some(n) = s.sse_flood {
+        drop(s);
+        let mut head = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+        head.push_str(": flood\n");
+        let _ = stream.write_all(head.as_bytes());
+        let chunk = ": keepalive keepalive keepalive keepalive\n".repeat(1000);
+        let mut sent = 0;
+        while sent < n {
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                break;
+            }
+            sent += chunk.len();
+        }
+        return;
+    }
     let tid = args["threadId"].as_str().unwrap_or("").to_string();
     let sse = s.sse;
     let tool_result = match tool.as_str() {
         "t3_thread_wait" => {
             s.wait_args.push(args.clone());
+            let delegated = args["untilDelegatedWorkSettled"] == true;
             let deadline = Instant::now() + Duration::from_millis(args["timeoutMs"].as_u64().unwrap_or(1000));
-            loop {
+            let answer = loop {
                 match s.threads.get(&tid).cloned() {
                     None => break Err(()),
-                    Some((status, ord)) if !is_active(&status) || Instant::now() >= deadline => {
-                        break Ok(
-                            json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"), "status": status, "timedOut": is_active(&status) }),
-                        );
-                    }
-                    Some(_) => {
+                    Some((status, ord)) => {
+                        let busy = is_active(&status) || (delegated && s.delegated_pending.contains(&tid));
+                        if !busy || Instant::now() >= deadline {
+                            break Ok(
+                                json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"),
+                                             "status": status, "timedOut": busy }),
+                            );
+                        }
                         let left = deadline.saturating_duration_since(Instant::now());
                         s = cv.wait_timeout(s, left).unwrap().0;
                     }
                 }
+            };
+            if s.advance_after_wait.as_ref().is_some_and(|a| a.0 == tid) {
+                let (_, status, ord, pending) = s.advance_after_wait.take().unwrap();
+                s.threads.insert(tid.clone(), (status, ord));
+                if pending {
+                    s.delegated_pending.insert(tid.clone());
+                }
             }
+            answer
         }
         "t3_thread_read" => match s.threads.get(&tid) {
             None => Err(()),
@@ -414,6 +500,69 @@ fn send_result(stream: &mut TcpStream, result: &Value, sse: bool, session: Optio
     }
 }
 
+// ---- webhook receiver --------------------------------------------------------
+
+#[derive(Clone)]
+pub struct HookReq {
+    pub path: String,
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
+    pub at: Instant,
+}
+
+#[derive(Default)]
+pub struct HookState {
+    pub requests: Vec<HookReq>,
+    /// Responses to give, in order; then 200.
+    pub script: VecDeque<(u16, Vec<(String, String)>)>,
+}
+
+pub struct MockHook {
+    pub url: String,
+    pub state: Arc<Mutex<HookState>>,
+}
+
+impl MockHook {
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/hooks/secret-path-123",
+            listener.local_addr().unwrap().port()
+        );
+        let state = Arc::new(Mutex::new(HookState::default()));
+        let st = state.clone();
+        thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let Some(req) = read_request(&mut conn) else { continue };
+                let (status, headers) = {
+                    let mut s = st.lock().unwrap();
+                    s.requests.push(HookReq {
+                        path: req.path.clone(),
+                        headers: req.headers.clone(),
+                        body: req.body.clone(),
+                        at: Instant::now(),
+                    });
+                    s.script.pop_front().unwrap_or((200, vec![]))
+                };
+                let hs: Vec<(&str, String)> = headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                respond(&mut conn, status, &hs, "receiver body that must never be echoed");
+            }
+        });
+        MockHook { url, state }
+    }
+
+    pub fn push(&self, status: u16, headers: &[(&str, &str)]) {
+        self.state.lock().unwrap().script.push_back((
+            status,
+            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        ));
+    }
+
+    pub fn requests(&self) -> Vec<HookReq> {
+        self.state.lock().unwrap().requests.clone()
+    }
+}
+
 // ---- environment -----------------------------------------------------------
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -441,6 +590,8 @@ impl Env {
             .env_remove("T3_WATCH_SOCKET")
             .env_remove("T3_WATCH_NO_DAEMON")
             .env_remove("T3_WATCH_T3_BIN")
+            .env_remove("T3_WATCH_MAX_WATCHES")
+            .env_remove("T3_WATCH_MAX_CONNECTIONS")
             .env("T3CODE_HOME", self.home.join("no-t3"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -460,6 +611,10 @@ impl Env {
     pub fn add_machine(&self, name: &str, origin: &str, token: &str) {
         let cfg = json!({ "default": null, "machines": { name: { "origin": origin, "accessToken": token, "scope": "orchestration:read" } } });
         fs::write(self.home.join("machines.json"), cfg.to_string()).unwrap();
+    }
+
+    pub fn machines(&self) -> Value {
+        serde_json::from_str(&fs::read_to_string(self.home.join("machines.json")).unwrap()).unwrap()
     }
 
     pub fn status(&self) -> Value {
@@ -541,7 +696,10 @@ pub struct MockT3 {
 
 impl MockT3 {
     pub fn new(env: &Env) -> Self {
-        let dir = env.home.join("mock-t3");
+        Self::in_dir(env.home.join("mock-t3"))
+    }
+
+    pub fn in_dir(dir: PathBuf) -> Self {
         fs::create_dir_all(dir.join("threads")).unwrap();
         let bin = dir.join("t3");
         let script = format!(
@@ -578,8 +736,8 @@ printf '{{"thread":{{"threadId":"%s","title":"mock local","status":"%s","latestR
 }
 
 /// Minimal HTTP GET for driving the OAuth "browser" in tests. Returns
-/// (status, Location header).
-pub fn http_get(url: &str) -> (u16, Option<String>) {
+/// (status, Location header, body).
+pub fn http_get_full(url: &str) -> (u16, Option<String>, String) {
     let rest = url.strip_prefix("http://").expect("http URL");
     let (host, path) = rest
         .split_once('/')
@@ -593,9 +751,24 @@ pub fn http_get(url: &str) -> (u16, Option<String>) {
     let location = resp
         .lines()
         .find_map(|l| l.strip_prefix("Location: ").map(str::to_string));
-    (status, location)
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, location, body)
+}
+
+pub fn http_get(url: &str) -> (u16, Option<String>) {
+    let (s, l, _) = http_get_full(url);
+    (s, l)
 }
 
 pub fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Writes an executable shell script.
+pub fn script(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }

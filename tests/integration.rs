@@ -448,26 +448,23 @@ fn persistent_400_is_a_hard_error_not_a_retry_loop() {
 }
 
 #[test]
-fn local_until_delegated_settles_with_a_warning() {
+fn until_delegated_is_rejected_for_local_threads() {
     let env = Env::new();
     let t3 = MockT3::new(&env);
     t3.set("lt-3", "completed", 1);
-    let out = env.run(&[
-        "wait",
-        "--no-daemon",
-        "--transport",
-        "local",
-        "--t3-bin",
-        t3.bin_str(),
-        "--until-delegated-settled",
-        "--timeout",
-        "5s",
-        "lt-3",
-    ]);
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
-    let v = output_json(&out);
-    assert_eq!(v["threads"][0]["settled"], true);
-    assert!(v["warnings"][0].as_str().unwrap().contains("mcp"));
+    // Explicit local transport, and a bare id that auto-resolves to local.
+    for extra in [&["--transport", "local"][..], &[][..]] {
+        let mut args = vec!["wait", "--t3-bin", t3.bin_str(), "--until-delegated-settled"];
+        args.extend_from_slice(extra);
+        args.push("lt-3");
+        let out = env.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+        let v = output_json(&out);
+        assert_eq!(v["error"]["kind"], "usage");
+        assert!(v["error"]["message"].as_str().unwrap().contains("mcp transport"), "{v}");
+    }
+    assert_eq!(t3.calls(), 0, "nothing may be polled for a rejected request");
+    assert_eq!(env.status()["running"], false, "no daemon for a rejected request");
 }
 
 #[test]
@@ -492,7 +489,7 @@ fn shared_local_watch_polls_at_the_shortest_interval() {
 }
 
 #[test]
-fn custom_socket_dir_keeps_its_permissions() {
+fn custom_socket_dir_must_be_private_and_is_never_chmodded() {
     let env = Env::new();
     let t3 = MockT3::new(&env);
     t3.set("lt-5", "completed", 1);
@@ -505,12 +502,28 @@ fn custom_socket_dir_keeps_its_permissions() {
         .env("T3_WATCH_SOCKET", &sock)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(output_json(&out)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("other users"));
     assert_eq!(
         mode(&shared),
         0o755,
         "t3-watch must not chmod a directory it does not own"
     );
-    assert!(shared.join("w.sock.lock").exists());
+    assert!(!sock.exists());
+
+    // A private directory of the user's choosing works, lock file included.
+    let private = env.home.join("private");
+    let sock = private.join("w.sock");
+    let out = env
+        .cmd(&["wait", "--transport", "local", "--t3-bin", t3.bin_str(), "lt-5"])
+        .env("T3_WATCH_SOCKET", &sock)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(mode(&private), 0o700);
+    assert_eq!(mode(&private.join("w.sock.lock")), 0o600);
     let _ = env.cmd(&["stop"]).env("T3_WATCH_SOCKET", &sock).output();
 }
