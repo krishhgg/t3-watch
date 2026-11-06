@@ -1,0 +1,23 @@
+[package]
+name = "t3-watch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Zero-AI-token watcher for T3 Code threads: thin CLI clients multiplexed through one background daemon."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["t3", "mcp", "agents", "watcher", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+serde_json = "1"
+# Already in the tree through rustls; used directly for SHA-256, secure randomness and setsid.
+ring = "0.17"
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
