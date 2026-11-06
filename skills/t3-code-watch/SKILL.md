@@ -110,7 +110,9 @@ The bot receives the same JSON in a POST, signed with
 `X-T3-Watch-Signature: sha256=HMAC(secret, "<X-T3-Watch-Timestamp>.<X-T3-Watch-Id>.<body>")`.
 `--on-settle <program> --on-settle-arg <arg>` runs a local program with the
 JSON on stdin instead. `--notify-on all` also notifies on timeout and error,
-so an expired token cannot strand an unattended bot.
+including a broken config found before the wait starts, so an expired token
+cannot strand an unattended bot. Files given to `--webhook-url-file` or
+`--webhook-secret-file` must be yours and `chmod 600`.
 
 ## Cost model
 

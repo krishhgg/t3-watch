@@ -130,6 +130,9 @@ t3-watch wait mcp:launch:abc123 \
   `--webhook-secret-env`/`-file` read their values before the daemon or any
   hook starts, and the variables are removed from the environment so no child
   process inherits them. `--webhook-url` also works but puts the URL in `ps`.
+  A `-file` must be a regular file owned by you with no group or other
+  access (`chmod 600`); a symlink is followed and its target checked, and a
+  FIFO or device is refused without blocking.
   Header names and values with CR, LF or NUL are refused. Output reports
   attempts, status and an error category only, never the URL, headers, secret
   or response body.
@@ -139,7 +142,9 @@ t3-watch wait mcp:launch:abc123 \
   `--on-settle-timeout` (default 60 s) its whole process group is killed.
 - By default only `settled` results notify. `--notify-on all` also notifies
   on timeout and error, so an expired token cannot leave an unattended bot
-  waiting forever.
+  waiting forever. Once the notification options themselves are valid, this
+  includes errors before the wait starts: an unreadable machines.json, an
+  unknown machine, a bad `--mode` or duration.
 - When the threads settled but a notification failed, the result still says
   `"event":"settled"`, adds `"notification":{"delivered":false,...}` and the
   exit code is 4.
@@ -214,8 +219,15 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
 - A client only accepts observations made after it subscribed, so a cached
   `completed` from an earlier turn can never wake it.
 - The daemon exits 60 seconds after its last client leaves. A killed client is
-  noticed at once (its socket closes) and unsubscribed; a watch with no
-  subscribers left is dropped at once, even in the middle of a long poll.
+  noticed at once (its socket closes) and unsubscribed.
+- When a watch loses its last subscriber, its upstream call is cancelled for
+  real, not left to finish: the cycle's HTTP agent is shut down (interrupting
+  a blocked long-poll), the server gets MCP `notifications/cancelled` for the
+  request, and a local `t3 thread show` has its process group killed.
+- Every live upstream operation holds a slot in one global budget of
+  `T3_WATCH_MAX_WATCHES` (default 1024) until it has actually ended, so
+  cancelled calls cannot pile up past it. `t3-watch status` reports
+  `upstreamOps.live`, `max` and `cancelled`.
 - The daemon serves at most 512 waiting clients and 1024 watches
   (`T3_WATCH_MAX_CONNECTIONS`, `T3_WATCH_MAX_WATCHES`); past that, a wait
   fails with `error.kind = "limit"`. `status` and `stop` do not count against
@@ -231,8 +243,14 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
   `notifications/initialized`, then `tools/call`, with `POST <origin>/mcp`,
   `Accept: application/json, text/event-stream` and `Authorization: Bearer`.
   The server must answer `initialize` with protocol `2025-03-26` or
-  `2025-06-18`. Both JSON and SSE responses are parsed, and `Mcp-Session-Id`
-  is reused across every watch on the same pairing.
+  `2025-06-18`; with `2025-06-18`, every later request, including
+  `notifications/initialized`, carries `MCP-Protocol-Version`. Both JSON and
+  SSE responses are parsed, and `Mcp-Session-Id` is reused across every watch
+  on the same pairing. Each poll cycle uses its own connection, so it can be
+  cancelled on its own.
+- Requests the server sends inside an SSE response are answered: `ping` with
+  an empty result, anything else with "method not found" (t3-watch declares
+  no client capabilities), at most 16 per response.
 - The origin must be `https://` (plain `http://` only on loopback), so a
   bearer token never crosses a network in clear text.
 - Responses are size-bounded: 1 MiB per SSE line, 8 MiB per event, 16 MiB per
@@ -243,10 +261,16 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
   no longer active, it verifies with `t3_thread_read` (`limit: 1`,
   `maxCharsPerItem: 200`) before reporting.
 - With `--until-delegated-settled`, settling needs proof bound to the run:
-  `t3_thread_wait` must return `timedOut: false` with a settled status for a
-  `runId` (or `resultRun`) at least as new as the `latestRunId` the read sees.
-  If a newer run started in between, t3-watch waits again on that run.
-  Missing `timedOut` or `status` fields never count as proof.
+  `t3_thread_wait` must return `timedOut: false` with a settled status, and
+  its `runId` or `resultRun` must be a run of the watched thread itself
+  (`run:thread:<that thread>:ordinal:N`) at least as new as the `latestRunId`
+  the read sees. A run of another thread, such as a delegated child's
+  `resultRun`, never counts, whatever its ordinal. If a newer run of the
+  thread started in between, t3-watch waits again on that run. Missing
+  `timedOut` or `status` fields never count as proof, and a missing
+  `latestRunId` is unresolved unless the read reports `runCount: 0`.
+- `--expect-min-run-ordinal` only counts a `latestRunId` that belongs to the
+  watched thread; a response about another thread never settles.
 - Network errors, 408, 425, 429, 5xx (including Cloudflare's 52x and 530),
   JSON-RPC internal errors, and tool errors other than not-found, permission
   and validation errors are retried with exponential backoff and jitter (0.5
@@ -255,10 +279,18 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
   Cloudflare's idle limit.
 - A 404 or 400 on a known session re-runs `initialize` once and retries. If
   the fresh session gets the same 400, that is a hard error.
-- On a 401, t3-watch rereads machines.json once (another `auth login` may have
-  replaced the token) and, if the server issued a refresh token, refreshes it
-  under the config lock and saves the result. Only if both fail does it exit 2
-  with `error.kind = "auth"`. A 403 exits 2 at once.
+- On a 401, t3-watch rereads machines.json once (another `auth login` or
+  another process's refresh may have replaced the token) and, if the server
+  issued a refresh token, refreshes it under the config lock and saves the
+  result. The outcome is typed:
+  - definitive (no saved credentials, no refresh token, `invalid_grant` or
+    another 4xx from the token endpoint, or a replacement token that is
+    rejected too): exit 2 with `error.kind = "auth"` and the reason;
+  - temporary (network error, 408, 429 or 5xx from the token endpoint, a busy
+    config lock, a failed write): the watch keeps going with the usual
+    backoff, and `lastError` says why. A refreshed token that could not be
+    saved is still used.
+  A 403 exits 2 at once.
 
 ### Security
 
@@ -280,9 +312,13 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
 - OAuth uses PKCE S256, a random `state`, and checks the `iss` callback
   parameter when the server sends it. Headless logins expire after an hour,
   a callback URL works once, and `oauth-finish` saves the credentials before
-  it deletes the pending login. The loopback login ignores stray requests
-  (a favicon, a stale tab with another `state`) until its deadline and only
-  shows "paired" once the credentials are saved. Errors from the server show
+  it deletes the pending login. `oauth-finish` first claims the pending login
+  with an atomic rename, so concurrent finishes of one callback exchange the
+  code once; a failed exchange or save puts the claim back. The loopback login
+  ignores stray requests (a favicon, a stale tab with another `state`) and
+  only shows "paired" once the credentials are saved. Its `--timeout` is an
+  absolute deadline: it bounds every accept and every header read, so slow or
+  endless connections cannot stretch it. Errors from the server show
   its OAuth `error` code at most, never the response body.
 - The daemon socket is 0600 inside a 0700 directory, and the daemon runs with
   umask 077 so the socket is never briefly open to others. Clients refuse a
@@ -401,7 +437,7 @@ servers in `tests/`, whose responses copy the shapes the real
 ## Development
 
 ```sh
-cargo test                      # unit, integration and hardening tests (about 10 s)
+cargo test                      # unit, integration, hardening and adversarial tests (about 15 s)
 cargo clippy --all-targets -- -D warnings
 python3 bench/run.py --thread <a running local thread id> --settled-thread <a settled one>
 ```
@@ -413,8 +449,7 @@ The integration tests run the real binary against:
   pages, and blocks `t3_thread_wait` like the real server;
 - a mock OAuth authorization server that checks PKCE S256, the redirect URI
   and the requested scope;
-- a mock local `t3` script.
-
+- a mock local `t3` script;
 - a mock webhook receiver with scripted 3xx, 4xx, 429 and 5xx answers.
 
 They cover JSON and SSE parsing, session re-initialization, retry without
@@ -428,8 +463,35 @@ to the run, unknown statuses, strict discovery, concurrent logins, refresh
 and reload on 401, SSE floods, socket and lock-file attacks, re-pairing,
 limits, client-side path resolution, IPC framing, the MCP protocol version
 check and the loopback login's handling of stray requests.
+`tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
+parent run, missing run identity, foreign `latestRunId`s, cancelled
+long-polls checked on the wire (each cancelled before the next starts) and in
+the OS (threads, descriptors, TCP connections back to baseline), killed local
+`t3` processes, token refresh failing with 503, an unreachable token
+endpoint, `invalid_grant`, concurrent refresh-token rotation, a strict
+2025-06-18 server, SSE `ping` and `roots/list` requests, startup errors with
+`--notify-on all`, concurrent `oauth-finish` of one login, slow and endless
+callback connections, and FIFO, symlinked and world-readable secret files.
 
 CI also builds and tests with Rust 1.85, the minimum supported version.
+
+### Live end-to-end check
+
+`e2e/live.sh` runs against the T3 server on the machine it runs on, through
+the real daemon, and is read-only on T3:
+
+```sh
+cargo build --release
+e2e/live.sh <settled-thread-id> <running-thread-id> target/release/t3-watch [relay-origin]
+```
+
+It checks a real settle, a stale run ordinal, the local delegated-work
+refusal, five waits sharing one poller, killed and timed-out clients leaving
+no watch, no upstream operation and no `t3` process behind, cancelled calls,
+daemon threads and descriptors back to baseline, a signed webhook (settled,
+then timeout with `--notify-on all`) delivered to `e2e/receiver.py` on
+127.0.0.1, an `--on-settle` hook, and optionally strict OAuth discovery
+against a relay. The running thread must stay active for about a minute.
 
 ## Limitations
 
@@ -446,6 +508,14 @@ CI also builds and tests with Rust 1.85, the minimum supported version.
   revoked, `wait` exits 2 (after rereading machines.json) and you pair again.
   Servers that do issue refresh tokens are refreshed automatically.
 - Windows is not supported (Unix sockets, `setsid`).
+- Linux is covered by CI (not yet run, since the branch is unpushed) and by
+  cross-builds on macOS with zig as the C compiler and linker: x86_64 and
+  aarch64 `-unknown-linux-gnu` binaries need glibc 2.17 at most, and clippy
+  and the test binaries build for Linux. They have not been executed on Linux
+  from this machine.
+- There is no durable outbox: a notification that is still being delivered
+  when the waiting process is killed is lost, and receivers must deduplicate
+  on `X-T3-Watch-Id` themselves.
 
 ## License
 
