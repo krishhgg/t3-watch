@@ -1,0 +1,154 @@
+{
+  "host": "krishs-mini.local",
+  "machine": "Apple M6",
+  "os": "macOS 27.0.1",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "pythonVersion": "3.9.6",
+  "python": {
+    "1": {
+      "watchers": 1,
+      "exitCodes": [
+        0
+      ],
+      "watcherRssKb": {
+        "median": 11936,
+        "max": 11936,
+        "sum": 11936
+      },
+      "totalRssKb": 11936,
+      "cpuSeconds": 3.99,
+      "t3Calls": 9
+    },
+    "20": {
+      "watchers": 20,
+      "exitCodes": [
+        0
+      ],
+      "watcherRssKb": {
+        "median": 9184.0,
+        "max": 9760,
+        "sum": 183152
+      },
+      "totalRssKb": 183152,
+      "cpuSeconds": 107.99,
+      "t3Calls": 160
+    }
+  },
+  "t3": "0.1.7-nightly.20261102.4066",
+  "date": "2026-11-06T11:14:30-0800",
+  "window": 60.0,
+  "interval": 8.0,
+  "binaryBytes": 1587120,
+  "startup": {
+    "trueFloor": {
+      "runs": 300,
+      "medianMs": 1.11,
+      "p90Ms": 1.24,
+      "minMs": 0.91
+    },
+    "t3watchVersion": {
+      "runs": 300,
+      "medianMs": 1.63,
+      "p90Ms": 1.82,
+      "minMs": 1.4
+    },
+    "pythonBare": {
+      "runs": 100,
+      "medianMs": 8.22,
+      "p90Ms": 8.38,
+      "minMs": 7.96
+    },
+    "pythonWatcherHelp": {
+      "runs": 100,
+      "medianMs": 16.83,
+      "p90Ms": 17.07,
+      "minMs": 16.49
+    },
+    "waitSettledStubT3ViaDaemon": {
+      "runs": 100,
+      "medianMs": 3.3,
+      "p90Ms": 3.4,
+      "minMs": 3.05
+    },
+    "waitSettledStubT3NoDaemon": {
+      "runs": 100,
+      "medianMs": 3.25,
+      "p90Ms": 3.35,
+      "minMs": 3.03
+    },
+    "waitSettledRealT3ViaDaemon": {
+      "runs": 10,
+      "medianMs": 301.96,
+      "p90Ms": 302.89,
+      "minMs": 300.2
+    },
+    "realT3ThreadShow": {
+      "runs": 10,
+      "medianMs": 299.87,
+      "p90Ms": 301.94,
+      "minMs": 297.92
+    },
+    "memory": {
+      "trueFloor": {
+        "runs": 20,
+        "maxRssBytesMedian": 1114112,
+        "peakFootprintBytesMedian": 1130736
+      },
+      "t3watchVersion": {
+        "runs": 20,
+        "maxRssBytesMedian": 2097152,
+        "peakFootprintBytesMedian": 1311080
+      },
+      "t3watchWaitSettledViaDaemon": {
+        "runs": 20,
+        "maxRssBytesMedian": 2408448,
+        "peakFootprintBytesMedian": 1311080
+      },
+      "pythonBare": {
+        "runs": 20,
+        "maxRssBytesMedian": 8126464,
+        "peakFootprintBytesMedian": 4931896
+      },
+      "sleepingRssKb": {
+        "binSleepFloor": 1104,
+        "pythonSleeping": 7904
+      }
+    }
+  },
+  "rust": {
+    "1": {
+      "clients": 1,
+      "exitCodes": [
+        3
+      ],
+      "clientRssKb": {
+        "median": 2320,
+        "max": 2320,
+        "sum": 2320
+      },
+      "daemonRssKb": 2784,
+      "totalRssKb": 5104,
+      "cpuSeconds": 3.49,
+      "cpuSecondsClientsOnly": 0.0,
+      "t3Calls": 8
+    },
+    "20": {
+      "clients": 20,
+      "exitCodes": [
+        3
+      ],
+      "clientRssKb": {
+        "median": 2320.0,
+        "max": 2320,
+        "sum": 46400
+      },
+      "daemonRssKb": 4000,
+      "totalRssKb": 50400,
+      "cpuSeconds": 3.89,
+      "cpuSecondsClientsOnly": 0.0,
+      "t3Calls": 9
+    }
+  },
+  "threadStatusAfter": "running",
+  "valid": true
+}
