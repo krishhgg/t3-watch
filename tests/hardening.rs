@@ -86,6 +86,7 @@ fn webhook_gets_a_signed_result_and_secrets_stay_out_of_output() {
     let env = mcp_env(&mock);
     let secret_file = env.home.join("hook-secret");
     fs::write(&secret_file, "s3cret-key\n").unwrap();
+    fs::set_permissions(&secret_file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let out = env
         .cmd(&[
             "wait",

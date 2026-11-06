@@ -59,6 +59,27 @@ pub struct MockState {
     pub authorize_queries: Vec<HashMap<String, String>>,
     /// code -> (code_challenge, redirect_uri, client_id)
     pub codes: HashMap<String, (String, String, String)>,
+    /// `t3_thread_wait` requests blocked right now, and the most at once.
+    pub active_waits: usize,
+    pub max_active_waits: usize,
+    /// `requestId`s from `notifications/cancelled`.
+    pub cancelled_ids: Vec<Value>,
+    /// JSON-RPC responses the client POSTed (answers to server requests).
+    pub client_responses: Vec<Value>,
+    /// Requests sent to the client inside SSE answers to tool calls.
+    pub server_requests: Vec<Value>,
+    /// Fields merged into every `t3_thread_wait` result.
+    pub wait_override: Map<String, Value>,
+    /// Fields merged into every `t3_thread_read` thread (null removes).
+    pub read_override: Map<String, Value>,
+    /// HTTP statuses the refresh grant returns, in order, before it works.
+    pub refresh_failures: VecDeque<u16>,
+    /// Each good refresh issues token-rN / rt-rN and revokes the old pair.
+    pub rotate_refresh: bool,
+    pub rotations: u64,
+    /// ("wait", request id) when a `t3_thread_wait` arrives and
+    /// ("cancelled", request id) for each cancellation, in arrival order.
+    pub events: Vec<(String, Value)>,
 }
 
 impl Default for MockState {
@@ -87,6 +108,17 @@ impl Default for MockState {
             register_bodies: Vec::new(),
             authorize_queries: Vec::new(),
             codes: HashMap::new(),
+            active_waits: 0,
+            max_active_waits: 0,
+            cancelled_ids: Vec::new(),
+            client_responses: Vec::new(),
+            server_requests: Vec::new(),
+            wait_override: Map::new(),
+            read_override: Map::new(),
+            refresh_failures: VecDeque::new(),
+            rotate_refresh: false,
+            rotations: 0,
+            events: Vec::new(),
         }
     }
 }
@@ -314,7 +346,25 @@ fn handle(mut stream: TcpStream, st: &Arc<(Mutex<MockState>, Condvar)>, base: &s
             }
             if f.get("grant_type").map(String::as_str) == Some("refresh_token") {
                 *s.calls.entry("refresh".into()).or_default() += 1;
+                if let Some(status) = s.refresh_failures.pop_front() {
+                    let code = if status == 400 {
+                        "invalid_grant"
+                    } else {
+                        "temporarily_unavailable"
+                    };
+                    respond(&mut stream, status, &json_ct(), &json!({ "error": code }).to_string());
+                    return;
+                }
                 let ok = s.issue_refresh.is_some() && f.get("refresh_token") == s.issue_refresh.as_ref();
+                if ok && s.rotate_refresh {
+                    s.rotations += 1;
+                    let (access, rt) = (format!("token-r{}", s.rotations), format!("rt-r{}", s.rotations));
+                    s.token = access.clone();
+                    s.issue_refresh = Some(rt.clone());
+                    let body = json!({ "access_token": access, "refresh_token": rt, "token_type": "Bearer", "expires_in": 3600 });
+                    respond(&mut stream, 200, &json_ct(), &body.to_string());
+                    return;
+                }
                 match (ok, s.refresh_to.clone()) {
                     (true, Some(new)) => {
                         let body = json!({ "access_token": new, "token_type": "Bearer", "expires_in": 3600, "scope": "orchestration:read" });
@@ -335,6 +385,7 @@ fn handle(mut stream: TcpStream, st: &Arc<(Mutex<MockState>, Condvar)>, base: &s
                         && f.get("client_id") == Some(client)
                         && f.get("grant_type").map(String::as_str) == Some("authorization_code")
                 });
+            *s.calls.entry("exchange".into()).or_default() += 1;
             if ok {
                 let mut body = json!({ "access_token": s.token, "token_type": "Bearer", "expires_in": 3600, "scope": "orchestration:read" });
                 if let Some(rt) = &s.issue_refresh {
@@ -374,6 +425,17 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
         return;
     }
     let session = req.headers.get("mcp-session-id").cloned();
+    // A strict 2025-06-18 server: every request after initialize must carry
+    // the negotiated version.
+    if s.protocol_version == "2025-06-18"
+        && method != "initialize"
+        && req.headers.get("mcp-protocol-version").map(String::as_str) != Some("2025-06-18")
+    {
+        *s.calls.entry("missing-version-header".into()).or_default() += 1;
+        drop(s);
+        respond(&mut stream, 400, &[], "missing MCP-Protocol-Version");
+        return;
+    }
     if method == "initialize" {
         *s.calls.entry("initialize".into()).or_default() += 1;
         s.next_session += 1;
@@ -394,6 +456,19 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
     }
     if method == "notifications/initialized" {
         *s.calls.entry("initialized".into()).or_default() += 1;
+        drop(s);
+        respond(&mut stream, 202, &[], "");
+        return;
+    }
+    if method == "notifications/cancelled" {
+        s.cancelled_ids.push(msg["params"]["requestId"].clone());
+        s.events.push(("cancelled".into(), msg["params"]["requestId"].clone()));
+        drop(s);
+        respond(&mut stream, 202, &[], "");
+        return;
+    }
+    if method.is_empty() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+        s.client_responses.push(msg.clone());
         drop(s);
         respond(&mut stream, 202, &[], "");
         return;
@@ -424,27 +499,40 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
     }
     let tid = args["threadId"].as_str().unwrap_or("").to_string();
     let sse = s.sse;
+    let server_requests = s.server_requests.clone();
     let tool_result = match tool.as_str() {
         "t3_thread_wait" => {
             s.wait_args.push(args.clone());
+            s.events.push(("wait".into(), msg["id"].clone()));
             let delegated = args["untilDelegatedWorkSettled"] == true;
             let deadline = Instant::now() + Duration::from_millis(args["timeoutMs"].as_u64().unwrap_or(1000));
+            s.active_waits += 1;
+            s.max_active_waits = s.max_active_waits.max(s.active_waits);
             let answer = loop {
                 match s.threads.get(&tid).cloned() {
                     None => break Err(()),
                     Some((status, ord)) => {
                         let busy = is_active(&status) || (delegated && s.delegated_pending.contains(&tid));
                         if !busy || Instant::now() >= deadline {
-                            break Ok(
-                                json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"),
-                                             "status": status, "timedOut": busy }),
-                            );
+                            let mut v = json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"),
+                                                "status": status, "timedOut": busy });
+                            v = merged(v, &s.wait_override);
+                            break Ok(v);
                         }
-                        let left = deadline.saturating_duration_since(Instant::now());
+                        // Like a real server, notice a client that hung up.
+                        if client_gone(&stream) {
+                            s.active_waits -= 1;
+                            *s.calls.entry("client-gone".into()).or_default() += 1;
+                            return;
+                        }
+                        let left = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(50));
                         s = cv.wait_timeout(s, left).unwrap().0;
                     }
                 }
             };
+            s.active_waits -= 1;
             if s.advance_after_wait.as_ref().is_some_and(|a| a.0 == tid) {
                 let (_, status, ord, pending) = s.advance_after_wait.take().unwrap();
                 s.threads.insert(tid.clone(), (status, ord));
@@ -456,11 +544,13 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
         }
         "t3_thread_read" => match s.threads.get(&tid) {
             None => Err(()),
-            Some((status, ord)) => Ok(json!({
-                "thread": { "threadId": tid, "title": "mock thread", "status": status,
-                            "latestRunId": format!("run:thread:{tid}:ordinal:{ord}"),
-                            "link": format!("<t3-thread://v2/env-mock/{tid}>") },
-                "recentRuns": [], "items": [], "hasMore": false })),
+            Some((status, ord)) => {
+                let thread = json!({ "threadId": tid, "title": "mock thread", "status": status,
+                                     "latestRunId": format!("run:thread:{tid}:ordinal:{ord}"), "runCount": ord,
+                                     "link": format!("<t3-thread://v2/env-mock/{tid}>") });
+                Ok(json!({ "thread": merged(thread, &s.read_override),
+                           "recentRuns": [], "items": [], "hasMore": false }))
+            }
         },
         _ => Err(()),
     };
@@ -474,10 +564,27 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
             json!({ "jsonrpc": "2.0", "id": msg["id"], "result": { "isError": true, "content": [{ "type": "text", "text": err.to_string() }] } })
         }
     };
-    send_result(&mut stream, &result, sse, None);
+    send_result_with(&mut stream, &result, sse, None, &server_requests);
+}
+
+/// True once the client has closed its end of the connection.
+fn client_gone(stream: &TcpStream) -> bool {
+    let mut b = [0u8; 1];
+    let _ = stream.set_nonblocking(true);
+    let gone = match stream.peek(&mut b) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 fn send_result(stream: &mut TcpStream, result: &Value, sse: bool, session: Option<&str>) {
+    send_result_with(stream, result, sse, session, &[]);
+}
+
+fn send_result_with(stream: &mut TcpStream, result: &Value, sse: bool, session: Option<&str>, requests: &[Value]) {
     let mut headers = vec![];
     if let Some(sid) = session {
         headers.push(("Mcp-Session-Id", sid.to_string()));
@@ -492,6 +599,9 @@ fn send_result(stream: &mut TcpStream, result: &Value, sse: bool, session: Optio
         s.push_str("\r\n");
         s.push_str(": keepalive\n\n");
         s.push_str("event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n");
+        for r in requests {
+            s.push_str(&format!("event: message\ndata: {r}\n\n"));
+        }
         s.push_str(&format!("event: message\ndata: {result}\n\n"));
         let _ = stream.write_all(s.as_bytes());
     } else {
@@ -765,6 +875,83 @@ pub fn http_get(url: &str) -> (u16, Option<String>) {
 
 pub fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Number of threads in process `pid`, from the OS.
+pub fn thread_count(pid: u32) -> usize {
+    if cfg!(target_os = "linux") {
+        fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    } else {
+        let out = Command::new("ps")
+            .args(["-M", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().count().saturating_sub(1)
+    }
+}
+
+/// Open file descriptors of process `pid`, from the OS.
+pub fn fd_count(pid: u32) -> usize {
+    if cfg!(target_os = "linux") {
+        fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.count()).unwrap_or(0)
+    } else {
+        let out = Command::new("lsof")
+            .args(["-n", "-P", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                l.split_whitespace()
+                    .nth(3)
+                    .is_some_and(|fd| fd.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            })
+            .count()
+    }
+}
+
+/// TCP connections of process `pid` to `port`, from the OS.
+pub fn tcp_connections_to(pid: u32, port: u16) -> usize {
+    if cfg!(target_os = "linux") {
+        // Count socket inodes of the process that /proc/net/tcp shows connected to the port.
+        let inodes: std::collections::HashSet<String> = fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| fs::read_link(e.path()).ok())
+            .filter_map(|l| {
+                l.to_str()
+                    .and_then(|s| s.strip_prefix("socket:["))
+                    .map(|s| s.trim_end_matches(']').to_string())
+            })
+            .collect();
+        let table = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+        table
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() > 9 && f[2].ends_with(&format!(":{port:04X}")) && f[3] == "01" && inodes.contains(f[9])
+            })
+            .count()
+    } else {
+        let out = Command::new("lsof")
+            .args([
+                "-n",
+                "-P",
+                "-a",
+                "-p",
+                &pid.to_string(),
+                &format!("-iTCP:{port}"),
+                "-sTCP:ESTABLISHED",
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().skip(1).count()
+    }
 }
 
 /// Writes an executable shell script.
