@@ -34,6 +34,9 @@ const MAX_REQUEST_LINE: usize = 256 * 1024;
 const MAX_RESPONSE_LINE: usize = 16 << 20;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
+/// Extra connections allowed beyond the wait limit, so `status` and `stop`
+/// still get through when every wait slot is taken.
+const CONTROL_HEADROOM: usize = 64;
 
 fn log(msg: &str) {
     eprintln!("[{}] t3-watch daemon {}: {msg}", util::now_ms(), std::process::id());
@@ -149,8 +152,9 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
     // Paths arrive absolute from clients; do not pin the caller's directory.
     let _ = std::env::set_current_dir("/");
     let limit = max_connections();
+    let waits = Arc::new(AtomicUsize::new(0));
     log(&format!(
-        "listening on {} (idle exit {:?}, max {limit} connections)",
+        "listening on {} (idle exit {:?}, max {limit} waiting clients)",
         sock.display(),
         idle_exit
     ));
@@ -183,20 +187,22 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
             continue;
         }
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        if connections.load(Ordering::SeqCst) >= limit {
+        // Waits are limited in `handle`; this hard cap only bounds threads.
+        if connections.load(Ordering::SeqCst) >= limit + CONTROL_HEADROOM {
             let _ = write_line(
                 &stream,
-                &error_json(
-                    "limit",
-                    &format!("the daemon already serves {limit} connections, its limit"),
-                ),
+                &error_json("limit", "the daemon has too many open connections"),
             );
             continue;
         }
         connections.fetch_add(1, Ordering::SeqCst);
         let (hub, open, sock) = (hub.clone(), connections.clone(), sock.clone());
+        let slots = WaitSlots {
+            used: waits.clone(),
+            max: limit,
+        };
         let spawned = util::spawn_thread("conn", 256 * 1024, move || {
-            if let Err(e) = handle(&hub, stream, &sock) {
+            if let Err(e) = handle(&hub, stream, &sock, &slots) {
                 log(&format!("connection error: {e}"));
             }
             open.fetch_sub(1, Ordering::SeqCst);
@@ -256,7 +262,33 @@ fn read_line_bounded(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, LineEr
     }
 }
 
-fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path) -> io::Result<()> {
+/// Counts waiting clients against `T3_WATCH_MAX_CONNECTIONS`. Control
+/// requests (`status`, `stop`, `ping`) do not take a slot.
+struct WaitSlots {
+    used: Arc<AtomicUsize>,
+    max: usize,
+}
+
+/// Releases a wait slot when the wait ends, however it ends.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl WaitSlots {
+    fn take(&self) -> Option<Slot<'_>> {
+        if self.used.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.used.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Slot(&self.used))
+    }
+}
+
+fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE) {
@@ -285,6 +317,15 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path) -> io::Result<()> {
             shutdown(sock)
         }
         "wait" => {
+            let Some(_slot) = slots.take() else {
+                return write_line(
+                    &stream,
+                    &error_json(
+                        "limit",
+                        &format!("the daemon already serves {} waiting clients, its limit", slots.max),
+                    ),
+                );
+            };
             let wreq = match WaitRequest::from_json(&req) {
                 Ok(r) => r,
                 Err(e) => return write_line(&stream, &error_json("usage", &e)),

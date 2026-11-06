@@ -216,9 +216,10 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
 - The daemon exits 60 seconds after its last client leaves. A killed client is
   noticed at once (its socket closes) and unsubscribed; a watch with no
   subscribers left is dropped at once, even in the middle of a long poll.
-- The daemon serves at most 512 connections and 1024 watches
+- The daemon serves at most 512 waiting clients and 1024 watches
   (`T3_WATCH_MAX_CONNECTIONS`, `T3_WATCH_MAX_WATCHES`); past that, a wait
-  fails with `error.kind = "limit"`. Requests and replies are single
+  fails with `error.kind = "limit"`. `status` and `stop` do not count against
+  the limit, so a full daemon can still be inspected and stopped. Requests and replies are single
   newline-terminated lines with size limits and I/O timeouts.
 - If the daemon dies mid-wait, clients reconnect, start a new one and
   re-register with the remaining time. `--no-daemon` runs the same engine

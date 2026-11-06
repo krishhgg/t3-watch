@@ -805,6 +805,11 @@ fn watch_and_connection_limits_are_enforced() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", stdout_and_stderr(&out));
     assert_eq!(output_json(&out)["error"]["kind"], "limit");
+    // Control requests never count against the wait limit, so a full daemon
+    // can still be inspected and stopped.
+    let status = env.status();
+    assert_eq!(status["running"], true, "{status}");
+    assert_eq!(status["activeWaits"], 2);
     mock.set_thread("a", "completed", 1);
     for c in [first, second] {
         let (code, _, err) = finish(c, secs(10));
