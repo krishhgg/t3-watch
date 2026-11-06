@@ -48,6 +48,13 @@ Remote machines need a one-time read-only pairing (`t3-watch auth login
 token only has `orchestration:read`, so the watcher can never send messages
 or run anything.
 
+## Delegated work
+
+If the thread delegates to other threads and you need their results too, add
+`--until-delegated-settled`. It only works over MCP (a paired machine or a
+thread URL); for a local thread id it exits 2 at once, so pair the machine
+instead of dropping the flag.
+
 ## Always pass `--expect-min-run-ordinal` after a follow-up
 
 Right after `t3_thread_send`, the thread may still report the previous turn as
@@ -66,8 +73,9 @@ once on that stale state. Pass the ordinal of the run you are waiting for.
 | Exit | `event` | What to do |
 | --- | --- | --- |
 | 0 | `settled` | Read the thread (`t3_thread_read`) and continue. `waiting` means it needs input from you; `failed`, `interrupted` and `cancelled` need attention. |
-| 3 | `timeout` | Nothing finished in time. Re-run the same command if you still want to wait. `lastError` shows network trouble, if any. |
-| 2 | `error` | `error.kind` says why: `auth` (pair again), `not_found` (wrong id), `usage` or `config`. Do not retry blindly. |
+| 3 | `timeout` | Nothing finished in time. Re-run the same command if you still want to wait. `lastError` shows network trouble, and `diagnostic` a status this t3-watch does not recognize. |
+| 2 | `error` | `error.kind` says why: `auth` (pair again), `not_found` (wrong id), `usage`, `config` or `limit`. Do not retry blindly. |
+| 4 | `settled` | The threads settled, but the webhook or `--on-settle` program failed; `notification` says which. Continue as for 0. |
 
 ## Harness recipes
 
@@ -87,6 +95,22 @@ t3-watch wait "$THREAD" --expect-min-run-ordinal "$ORD" > /tmp/watch.json; notif
 
 Shell scripts: `t3-watch wait a b c && echo "all done"`. Exit codes compose
 with `&&`, `||` and `set -e`.
+
+Bots with no background terminal (a chat bot behind a webhook, a cron job):
+let t3-watch call them. Keep the URL and secret in the environment, not in
+argv:
+
+```sh
+BOT_URL=https://bot.example/hooks/t3 BOT_SECRET=... \
+  t3-watch wait "$THREAD" --notify-on all \
+    --webhook-url-env BOT_URL --webhook-secret-env BOT_SECRET &
+```
+
+The bot receives the same JSON in a POST, signed with
+`X-T3-Watch-Signature: sha256=HMAC(secret, "<X-T3-Watch-Timestamp>.<X-T3-Watch-Id>.<body>")`.
+`--on-settle <program> --on-settle-arg <arg>` runs a local program with the
+JSON on stdin instead. `--notify-on all` also notifies on timeout and error,
+so an expired token cannot strand an unattended bot.
 
 ## Cost model
 
