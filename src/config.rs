@@ -1,11 +1,12 @@
 //! Paths, the machines file, and local `t3` discovery.
 //!
 //! Layout under the state directory (0700):
-//!   machines.json   saved machines and their read-only tokens (0600)
-//!   pending/        in-progress headless OAuth logins (0600 files)
-//!   daemon.sock     the multiplexer socket (0600)
-//!   daemon.sock.lock held by the running daemon
-//!   daemon.log      daemon stderr
+//!   machines.json     saved machines and their read-only tokens (0600)
+//!   config.lock       held while machines.json is read, changed and written
+//!   pending/          in-progress headless OAuth logins (0600 files)
+//!   daemon.sock       the multiplexer socket (0600)
+//!   daemon.sock.lock  held by the running daemon
+//!   daemon.log        daemon stderr
 
 use crate::util;
 use serde_json::{json, Map, Value};
@@ -13,6 +14,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn home_dir() -> PathBuf {
     env::var_os("HOME")
@@ -31,6 +33,12 @@ pub fn state_dir() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".config").join("t3-watch"))
 }
 
+/// True when the socket location was chosen with `T3_WATCH_SOCKET`, so its
+/// directory belongs to the user rather than to t3-watch.
+pub fn custom_socket() -> bool {
+    env_path("T3_WATCH_SOCKET").is_some()
+}
+
 /// The daemon socket. `$T3_WATCH_HOME` wins so tests and multiple users stay
 /// isolated; otherwise `$XDG_RUNTIME_DIR/t3-watch` when set (Linux), else the
 /// state directory.
@@ -46,9 +54,28 @@ pub fn socket_path() -> PathBuf {
     state_dir().join("daemon.sock")
 }
 
-/// T3 Code's data directory: `$T3CODE_HOME` or `~/.t3`.
+/// T3 Code's data directory: `$T3CODE_HOME` or `~/.t3`. Client side only:
+/// the daemon always gets an absolute path from the client.
 pub fn t3_base_dir() -> PathBuf {
     env_path("T3CODE_HOME").unwrap_or_else(|| home_dir().join(".t3"))
+}
+
+/// `$T3_WATCH_T3_BIN`, read by the client only.
+pub fn t3_bin_override() -> Option<PathBuf> {
+    env_path("T3_WATCH_T3_BIN")
+}
+
+/// Makes `p` absolute against the current directory and resolves symlinks
+/// when it exists, so the daemon (which runs from `/`) sees the same file.
+pub fn absolute(p: &Path) -> Result<PathBuf, String> {
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("cannot resolve {}: {e}", p.display()))?
+            .join(p)
+    };
+    Ok(fs::canonicalize(&joined).unwrap_or(joined))
 }
 
 /// A saved remote T3 MCP server.
@@ -56,11 +83,17 @@ pub fn t3_base_dir() -> PathBuf {
 pub struct Machine {
     pub origin: String,
     pub access_token: String,
+    pub refresh_token: Option<String>,
     pub client_id: Option<String>,
     pub scope: Option<String>,
     pub issuer: Option<String>,
+    pub token_endpoint: Option<String>,
+    pub resource: Option<String>,
     pub expires_at_ms: Option<u64>,
     pub created_at_ms: Option<u64>,
+    /// Random id minted at pairing time. Token refreshes keep it; a new
+    /// `auth login` replaces it, so the daemon never mixes the two.
+    pub credential_id: Option<String>,
 }
 
 impl Machine {
@@ -69,11 +102,15 @@ impl Machine {
         Some(Machine {
             origin: s("origin")?,
             access_token: s("accessToken").unwrap_or_default(),
+            refresh_token: s("refreshToken"),
             client_id: s("clientId"),
             scope: s("scope"),
             issuer: s("issuer"),
+            token_endpoint: s("tokenEndpoint"),
+            resource: s("resource"),
             expires_at_ms: v.get("expiresAtMs").and_then(Value::as_u64),
             created_at_ms: v.get("createdAtMs").and_then(Value::as_u64),
+            credential_id: s("credentialId"),
         })
     }
 
@@ -81,15 +118,26 @@ impl Machine {
         json!({
             "origin": self.origin,
             "accessToken": self.access_token,
+            "refreshToken": self.refresh_token,
             "clientId": self.client_id,
             "scope": self.scope,
             "issuer": self.issuer,
+            "tokenEndpoint": self.token_endpoint,
+            "resource": self.resource,
             "expiresAtMs": self.expires_at_ms,
             "createdAtMs": self.created_at_ms,
+            "credentialId": self.credential_id,
         })
     }
 
-    /// Everything except the token, for `auth list`.
+    /// Identifies this pairing without revealing the token. Stable across
+    /// refreshes when the machine has a `credentialId`.
+    pub fn fingerprint(&self) -> String {
+        let basis = self.credential_id.as_deref().unwrap_or(&self.access_token);
+        util::hex(&util::sha256(format!("{}\n{basis}", self.origin).as_bytes()))[..16].to_string()
+    }
+
+    /// Everything except the tokens, for `auth list`.
     pub fn public_json(&self, name: &str, is_default: bool) -> Value {
         json!({
             "name": name,
@@ -98,6 +146,7 @@ impl Machine {
             "default": is_default,
             "expiresAtMs": self.expires_at_ms,
             "hasToken": !self.access_token.is_empty(),
+            "canRefresh": self.refresh_token.is_some(),
         })
     }
 }
@@ -135,7 +184,7 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    fn save(&self) -> Result<(), String> {
         let mut ms = Map::new();
         for (name, m) in &self.machines {
             ms.insert(name.clone(), m.to_json());
@@ -144,6 +193,26 @@ impl Config {
         let text = serde_json::to_string_pretty(&v).unwrap() + "\n";
         let path = machines_path();
         util::write_private(&path, text.as_bytes()).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// Runs one read-modify-write of machines.json under `config.lock`, so
+    /// concurrent logins, logouts and token refreshes never overwrite each
+    /// other. The config is reloaded inside the lock. If `f` fails, nothing
+    /// is written.
+    pub fn transaction<T>(f: impl FnOnce(&mut Config) -> Result<T, String>) -> Result<T, String> {
+        let dir = state_dir();
+        util::ensure_private_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let lock_path = dir.join("config.lock");
+        let lock = util::open_lock_file(&lock_path).map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
+        match util::flock_within(&lock, Duration::from_secs(60)) {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("timed out waiting for {}", lock_path.display())),
+            Err(e) => return Err(format!("cannot lock {}: {e}", lock_path.display())),
+        }
+        let mut cfg = Config::load()?;
+        let out = f(&mut cfg)?;
+        cfg.save()?;
+        Ok(out)
     }
 
     /// Finds the saved machine whose origin matches.
@@ -163,12 +232,10 @@ fn version_key(v: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Finds T3's local CLI: the newest `<base>/runtime/versions/*/t3`, then
-/// `<base>/bin/t3`, then `t3` on `PATH`.
-pub fn find_t3_bin(base_dir: &Path) -> Option<PathBuf> {
-    if let Some(p) = env_path("T3_WATCH_T3_BIN") {
-        return Some(p);
-    }
+/// Finds T3's local CLI inside a data directory: the newest
+/// `<base>/runtime/versions/*/t3`, then `<base>/bin/t3`. Reads no environment
+/// variables, so the daemon gets the same answer as the client.
+pub fn find_t3_in_base(base_dir: &Path) -> Option<PathBuf> {
     let mut versions: Vec<(Vec<u64>, PathBuf)> = fs::read_dir(base_dir.join("runtime").join("versions"))
         .into_iter()
         .flatten()
@@ -184,9 +251,11 @@ pub fn find_t3_bin(base_dir: &Path) -> Option<PathBuf> {
         return Some(bin);
     }
     let shim = base_dir.join("bin").join("t3");
-    if shim.is_file() {
-        return Some(shim);
-    }
+    shim.is_file().then_some(shim)
+}
+
+/// `t3` on `PATH`, for the client when the data directory has none.
+pub fn find_t3_on_path() -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| env::split_paths(&paths).map(|d| d.join("t3")).find(|p| p.is_file()))
 }
 
@@ -202,5 +271,47 @@ mod tests {
             v,
             ["0.1.9", "0.1.10-nightly.20261020.1", "0.1.10-nightly.20261102.4066"]
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_the_pairing_not_the_name() {
+        let m = Machine {
+            origin: "https://r.example".into(),
+            access_token: "a".into(),
+            credential_id: Some("cred-1".into()),
+            ..Default::default()
+        };
+        let mut refreshed = m.clone();
+        refreshed.access_token = "b".into();
+        assert_eq!(m.fingerprint(), refreshed.fingerprint(), "a refresh keeps the pairing");
+        let mut repaired = m.clone();
+        repaired.credential_id = Some("cred-2".into());
+        assert_ne!(m.fingerprint(), repaired.fingerprint(), "a new login is a new pairing");
+        let mut moved = m.clone();
+        moved.origin = "https://other.example".into();
+        assert_ne!(m.fingerprint(), moved.fingerprint());
+        let legacy = Machine {
+            credential_id: None,
+            ..m.clone()
+        };
+        assert_ne!(
+            legacy.fingerprint(),
+            Machine {
+                access_token: "z".into(),
+                ..legacy.clone()
+            }
+            .fingerprint()
+        );
+        assert_eq!(m.fingerprint().len(), 16);
+        assert!(!m.fingerprint().contains("cred-1"));
+    }
+
+    #[test]
+    fn absolute_resolves_relative_paths() {
+        let p = absolute(Path::new(".")).unwrap();
+        assert!(p.is_absolute());
+        assert_eq!(p, fs::canonicalize(env::current_dir().unwrap()).unwrap());
+        let missing = absolute(Path::new("no/such/dir")).unwrap();
+        assert!(missing.is_absolute() && missing.ends_with("no/such/dir"));
     }
 }

@@ -2,8 +2,14 @@
 //!
 //! Protocol: newline-delimited JSON over a Unix socket. The client sends one
 //! request line. For `wait` the daemon answers `{"event":"accepted"}` at
-//! once and the final outcome line when the wait ends. The socket lives in a
-//! 0700 directory and is itself 0600, so only the owning user can connect.
+//! once and the final outcome line when the wait ends. Every line must end in
+//! `\n` and is size-bounded; every read and write has a timeout except the
+//! long wait itself.
+//!
+//! Access control does not rely on file modes alone: the socket's directory
+//! and the socket must belong to us and be closed to group and others, lock
+//! files are opened without following symlinks, and both ends check the
+//! other's uid with `getpeereid`/`SO_PEERCRED`.
 
 use crate::config;
 use crate::engine::{error_json, Hub, Outcome, SubMsg, WaitRequest};
@@ -11,7 +17,7 @@ use crate::util;
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -24,6 +30,10 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(60);
 /// sockaddr_un.sun_path is 104 bytes on macOS and 108 on Linux.
 const MAX_SOCKET_PATH: usize = 103;
+const MAX_REQUEST_LINE: usize = 256 * 1024;
+const MAX_RESPONSE_LINE: usize = 16 << 20;
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_CONNECTIONS: usize = 512;
 
 fn log(msg: &str) {
     eprintln!("[{}] t3-watch daemon {}: {msg}", util::now_ms(), std::process::id());
@@ -44,17 +54,38 @@ fn socket_dir(sock: &Path) -> PathBuf {
     sock.parent().map(Path::to_path_buf).unwrap_or_else(config::state_dir)
 }
 
-/// Creates the socket's directory. Directories t3-watch owns become 0700; a
-/// directory chosen with `T3_WATCH_SOCKET` (say `/tmp`) is created if missing
-/// but its permissions are left alone.
+/// Creates the socket's directory. Directories t3-watch owns become 0700. A
+/// directory chosen with `T3_WATCH_SOCKET` is created 0700 if missing and
+/// otherwise must already be a private directory of ours; its permissions
+/// are never changed.
 fn prepare_socket_dir(sock: &Path) -> Result<(), String> {
     let dir = socket_dir(sock);
-    let res = if std::env::var_os("T3_WATCH_SOCKET").is_some_and(|v| !v.is_empty()) {
-        fs::create_dir_all(&dir)
+    if config::custom_socket() {
+        util::verify_private_dir(&dir)
     } else {
-        util::ensure_private_dir(&dir)
+        util::ensure_private_dir(&dir).map_err(|e| format!("cannot prepare {}: {e}", dir.display()))
+    }
+}
+
+/// Checks the socket file and its directory before trusting them: both must
+/// be ours and closed to everyone else. `Ok(false)` means there is no socket.
+fn check_socket(sock: &Path) -> Result<bool, String> {
+    let meta = match fs::symlink_metadata(sock) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot inspect {}: {e}", sock.display())),
     };
-    res.map_err(|e| format!("cannot create {}: {e}", dir.display()))
+    if !meta.file_type().is_socket() {
+        return Err(format!("{} exists but is not a socket", sock.display()));
+    }
+    util::check_private(&meta, sock)?;
+    let dir = socket_dir(sock);
+    let dir_meta = fs::symlink_metadata(&dir).map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?;
+    if !dir_meta.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    util::check_private(&dir_meta, &dir)?;
+    Ok(true)
 }
 
 /// The single-daemon lock sits next to the socket it guards.
@@ -68,26 +99,32 @@ fn lock_path(sock: &Path) -> PathBuf {
 /// the socket, gives up at once; otherwise waits briefly in case that daemon
 /// is in the middle of its idle shutdown.
 fn take_lock(path: &Path, sock: &Path) -> io::Result<Option<File>> {
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
+    let f = util::open_lock_file(path)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        match f.try_lock() {
-            Ok(()) => return Ok(Some(f)),
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline && UnixStream::connect(sock).is_err() => {
-                thread::sleep(Duration::from_millis(20))
-            }
-            Err(fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(fs::TryLockError::Error(e)) => return Err(e),
+        if util::try_flock(&f)? {
+            return Ok(Some(f));
         }
+        if Instant::now() >= deadline || UnixStream::connect(sock).is_ok() {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
+fn max_connections() -> usize {
+    std::env::var("T3_WATCH_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
 pub fn run(idle_exit: Duration) -> Result<(), String> {
+    // Everything this process creates (socket, lock, log) starts private.
+    // Without this, `bind` makes the socket with the default umask and a
+    // client could see it open to others before the chmod below.
+    unsafe { libc::umask(0o077) };
     let sock = config::socket_path();
     check_socket_path(&sock)?;
     prepare_socket_dir(&sock)?;
@@ -101,52 +138,72 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
     let _ = lock_file.set_len(0);
     let _ = writeln!(lock_file, "{}", std::process::id());
 
-    // We hold the lock, so any socket file left behind is stale.
-    let _ = fs::remove_file(&sock);
+    // We hold the lock, so a socket left behind is stale. Anything else at
+    // that path is not ours to delete.
+    if check_socket(&sock)? {
+        fs::remove_file(&sock).map_err(|e| format!("cannot remove stale {}: {e}", sock.display()))?;
+    }
     let listener = UnixListener::bind(&sock).map_err(|e| format!("cannot bind {}: {e}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    log(&format!("listening on {} (idle exit {:?})", sock.display(), idle_exit));
+    check_socket(&sock)?;
+    // Paths arrive absolute from clients; do not pin the caller's directory.
+    let _ = std::env::set_current_dir("/");
+    let limit = max_connections();
+    log(&format!(
+        "listening on {} (idle exit {:?}, max {limit} connections)",
+        sock.display(),
+        idle_exit
+    ));
 
     let hub = Hub::new("daemon");
     let connections = Arc::new(AtomicUsize::new(0));
     {
         let (hub, connections, sock) = (hub.clone(), connections.clone(), sock.clone());
-        thread::Builder::new()
-            .name("idle".into())
-            .stack_size(64 * 1024)
-            .spawn(move || loop {
-                thread::sleep((idle_exit / 4).clamp(Duration::from_millis(50), Duration::from_secs(1)));
-                if connections.load(Ordering::SeqCst) == 0 && hub.idle_for().is_some_and(|d| d >= idle_exit) {
-                    log("idle; exiting");
-                    shutdown(&sock);
-                }
-            })
-            .map_err(|e| e.to_string())?;
+        util::spawn_thread("idle", 64 * 1024, move || loop {
+            thread::sleep((idle_exit / 4).clamp(Duration::from_millis(50), Duration::from_secs(1)));
+            if connections.load(Ordering::SeqCst) == 0 && hub.idle_for().is_some_and(|d| d >= idle_exit) {
+                log("idle; exiting");
+                shutdown(&sock);
+            }
+        })
+        .map_err(|e| format!("cannot start idle thread: {e}"))?;
     }
 
     for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                connections.fetch_add(1, Ordering::SeqCst);
-                let (hub, open, sock) = (hub.clone(), connections.clone(), sock.clone());
-                let spawned = thread::Builder::new()
-                    .name("conn".into())
-                    .stack_size(256 * 1024)
-                    .spawn(move || {
-                        if let Err(e) = handle(&hub, stream, &sock) {
-                            log(&format!("connection error: {e}"));
-                        }
-                        open.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    log("cannot spawn connection thread");
-                    connections.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
+        let stream = match conn {
+            Ok(s) => s,
             Err(e) => {
                 log(&format!("accept failed: {e}"));
                 thread::sleep(Duration::from_millis(50));
+                continue;
             }
+        };
+        if let Err(e) = util::check_peer(&stream) {
+            log(&format!("rejected connection: {e}"));
+            continue;
+        }
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        if connections.load(Ordering::SeqCst) >= limit {
+            let _ = write_line(
+                &stream,
+                &error_json(
+                    "limit",
+                    &format!("the daemon already serves {limit} connections, its limit"),
+                ),
+            );
+            continue;
+        }
+        connections.fetch_add(1, Ordering::SeqCst);
+        let (hub, open, sock) = (hub.clone(), connections.clone(), sock.clone());
+        let spawned = util::spawn_thread("conn", 256 * 1024, move || {
+            if let Err(e) = handle(&hub, stream, &sock) {
+                log(&format!("connection error: {e}"));
+            }
+            open.fetch_sub(1, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            log("cannot spawn connection thread");
+            connections.fetch_sub(1, Ordering::SeqCst);
         }
     }
     Ok(())
@@ -164,12 +221,58 @@ fn write_line(mut w: &UnixStream, v: &Value) -> io::Result<()> {
     w.flush()
 }
 
+#[derive(Debug)]
+enum LineError {
+    TooLong,
+    /// The peer closed the stream before sending `\n`.
+    Incomplete,
+    Io(io::Error),
+}
+
+/// Reads one `\n`-terminated line of at most `max` bytes (newline excluded).
+fn read_line_bounded(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, LineError> {
+    let mut out = Vec::new();
+    loop {
+        let buf = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(LineError::Io(e)),
+        };
+        if buf.is_empty() {
+            return Err(LineError::Incomplete);
+        }
+        let (take, done) = match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => (i, true),
+            None => (buf.len(), false),
+        };
+        if out.len() + take > max {
+            return Err(LineError::TooLong);
+        }
+        out.extend_from_slice(&buf[..take]);
+        r.consume(if done { take + 1 } else { take });
+        if done {
+            return Ok(out);
+        }
+    }
+}
+
 fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    (&mut reader).take(1 << 20).read_line(&mut line)?;
-    let req: Value = match serde_json::from_str(line.trim()) {
+    let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE) {
+        Ok(l) => l,
+        Err(LineError::TooLong) => {
+            return write_line(
+                &stream,
+                &error_json("protocol", &format!("request longer than {MAX_REQUEST_LINE} bytes")),
+            )
+        }
+        Err(LineError::Incomplete) => {
+            return write_line(&stream, &error_json("protocol", "request must end with a newline"))
+        }
+        Err(LineError::Io(e)) => return Err(e),
+    };
+    let req: Value = match serde_json::from_slice(&line) {
         Ok(v) => v,
         Err(e) => return write_line(&stream, &error_json("protocol", &format!("bad request: {e}"))),
     };
@@ -186,23 +289,27 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path) -> io::Result<()> {
                 Ok(r) => r,
                 Err(e) => return write_line(&stream, &error_json("usage", &e)),
             };
-            write_line(&stream, &json!({ "event": "accepted", "pid": std::process::id() }))?;
-            stream.set_read_timeout(None)?;
             let (tx, rx) = mpsc::channel();
-            // Blocks in read() until the client hangs up: no polling.
+            // Blocks in read() until the client hangs up: no polling. The
+            // read timeout is per socket, so clear it for this reader.
+            stream.set_read_timeout(None)?;
             let gone = tx.clone();
-            thread::Builder::new()
-                .name("hangup".into())
-                .stack_size(32 * 1024)
-                .spawn(move || {
-                    let mut buf = [0u8; 64];
-                    while let Ok(n) = reader.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
+            let hangup = util::spawn_thread("hangup", 32 * 1024, move || {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
                     }
-                    let _ = gone.send(SubMsg::ClientGone);
-                })?;
+                }
+                let _ = gone.send(SubMsg::ClientGone);
+            });
+            if let Err(e) = hangup {
+                return write_line(
+                    &stream,
+                    &error_json("resource", &format!("cannot start a connection thread: {e}")),
+                );
+            }
+            write_line(&stream, &json!({ "event": "accepted", "pid": std::process::id() }))?;
             let outcome = hub.wait(&wreq, tx, rx);
             if let Some(v) = outcome.json() {
                 let _ = write_line(&stream, v);
@@ -210,7 +317,10 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path) -> io::Result<()> {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             Ok(())
         }
-        op => write_line(&stream, &error_json("usage", &format!("unknown op {op:?}"))),
+        op => write_line(
+            &stream,
+            &error_json("usage", &format!("unknown op {:?}", util::sanitize_text(op, 40))),
+        ),
     }
 }
 
@@ -229,10 +339,12 @@ fn spawn_daemon() -> Result<(), String> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&log_path)
         .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log_file);
@@ -247,11 +359,27 @@ fn spawn_daemon() -> Result<(), String> {
     cmd.spawn().map(drop).map_err(|e| format!("cannot start daemon: {e}"))
 }
 
+/// Connects only to a socket that passes `check_socket`, and only to a
+/// daemon running as our uid. `Ok(None)` means nothing is listening.
+fn connect(sock: &Path) -> Result<Option<UnixStream>, String> {
+    if !check_socket(sock)? {
+        return Ok(None);
+    }
+    let Ok(s) = UnixStream::connect(sock) else {
+        return Ok(None);
+    };
+    util::check_peer(&s).map_err(|e| format!("refusing daemon at {}: {e}", sock.display()))?;
+    let _ = s.set_write_timeout(Some(IO_TIMEOUT));
+    let _ = s.set_read_timeout(Some(IO_TIMEOUT));
+    Ok(Some(s))
+}
+
 /// Connects to the daemon, starting it first if nothing is listening.
 pub fn connect_or_spawn() -> Result<UnixStream, String> {
     let sock = config::socket_path();
     check_socket_path(&sock)?;
-    if let Ok(s) = UnixStream::connect(&sock) {
+    prepare_socket_dir(&sock)?;
+    if let Some(s) = connect(&sock)? {
         return Ok(s);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -264,7 +392,7 @@ pub fn connect_or_spawn() -> Result<UnixStream, String> {
         }
         thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_millis(50));
-        if let Ok(s) = UnixStream::connect(&sock) {
+        if let Some(s) = connect(&sock)? {
             return Ok(s);
         }
         if Instant::now() > deadline {
@@ -276,33 +404,30 @@ pub fn connect_or_spawn() -> Result<UnixStream, String> {
     }
 }
 
+fn read_response(stream: &UnixStream) -> Result<Value, String> {
+    let mut reader = BufReader::new(stream);
+    let line = read_line_bounded(&mut reader, MAX_RESPONSE_LINE).map_err(|e| format!("daemon reply: {e:?}"))?;
+    serde_json::from_slice(&line).map_err(|e| format!("daemon reply is not JSON: {e}"))
+}
+
 /// Sends one request to a running daemon without starting one.
 pub fn request(op: &str) -> Result<Option<Value>, String> {
     let sock = config::socket_path();
-    let Ok(stream) = UnixStream::connect(&sock) else {
+    let Some(stream) = connect(&sock)? else {
         return Ok(None);
     };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
     write_line(&stream, &json!({ "op": op })).map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    serde_json::from_str(line.trim()).map(Some).map_err(|e| e.to_string())
+    read_response(&stream).map(Some)
 }
 
 /// Reads the daemon's answer to a wait. `None` means the connection dropped
 /// before an outcome arrived.
 fn read_outcome(stream: &UnixStream, started: Instant) -> Option<Outcome> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return None,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+        let line = match read_line_bounded(&mut reader, MAX_RESPONSE_LINE) {
+            Ok(l) => l,
+            Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                 return Some(Outcome::Timeout(json!({
                     "event": "timeout",
                     "elapsedMs": started.elapsed().as_millis() as u64,
@@ -311,10 +436,10 @@ fn read_outcome(stream: &UnixStream, started: Instant) -> Option<Outcome> {
                     "lastError": "the daemon did not answer before the timeout",
                 })));
             }
+            Err(LineError::TooLong) => return Some(Outcome::Error(error_json("protocol", "daemon reply is too long"))),
             Err(_) => return None,
-            Ok(_) => {}
-        }
-        let v = serde_json::from_str::<Value>(line.trim()).ok()?;
+        };
+        let v = serde_json::from_slice::<Value>(&line).ok()?;
         if v.get("event").and_then(Value::as_str) != Some("accepted") {
             return Some(Outcome::from_json(v));
         }
@@ -334,17 +459,52 @@ pub fn wait(req: &WaitRequest) -> Result<Outcome, String> {
         // The daemon enforces the timeout; this bound only matters if the
         // daemon itself stops answering.
         let _ = stream.set_read_timeout(Some(r.timeout + Duration::from_secs(30)));
-        // A failed write means the daemon exited after we connected (idle
-        // exit or `stop`): reconnect like any other dropped connection.
-        if write_line(&stream, &r.to_json()).is_ok() {
-            if let Some(outcome) = read_outcome(&stream, started) {
-                return Ok(outcome);
-            }
+        // Read even if the write failed: a daemon at its connection limit
+        // answers with an error and closes before our request lands. With no
+        // answer at all, the daemon exited after we connected (idle exit or
+        // `stop`): reconnect like any other dropped connection.
+        let _ = write_line(&stream, &r.to_json());
+        if let Some(outcome) = read_outcome(&stream, started) {
+            return Ok(outcome);
         }
         reconnects += 1;
         if reconnects > 5 {
             return Err("daemon kept closing the connection".into());
         }
         thread::sleep(Duration::from_millis(50 * reconnects));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_must_end_in_newline_and_fit() {
+        let mut ok = BufReader::new(&b"{\"op\":\"ping\"}\nrest"[..]);
+        assert_eq!(read_line_bounded(&mut ok, 64).unwrap(), b"{\"op\":\"ping\"}");
+        let mut unterminated = BufReader::new(&b"{\"op\":\"ping\"}"[..]);
+        assert!(matches!(
+            read_line_bounded(&mut unterminated, 64),
+            Err(LineError::Incomplete)
+        ));
+        let mut empty = BufReader::new(&b""[..]);
+        assert!(matches!(read_line_bounded(&mut empty, 64), Err(LineError::Incomplete)));
+        let long = vec![b'x'; 1000];
+        let mut too_long = BufReader::with_capacity(16, &long[..]);
+        assert!(matches!(read_line_bounded(&mut too_long, 100), Err(LineError::TooLong)));
+        // Exactly at the limit is fine, across several buffer refills.
+        let mut exact = vec![b'y'; 100];
+        exact.push(b'\n');
+        let mut r = BufReader::with_capacity(7, &exact[..]);
+        assert_eq!(read_line_bounded(&mut r, 100).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn lock_path_sits_next_to_the_socket() {
+        assert_eq!(
+            lock_path(Path::new("/a/b/daemon.sock")),
+            Path::new("/a/b/daemon.sock.lock")
+        );
     }
 }

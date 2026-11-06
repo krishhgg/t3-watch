@@ -1,12 +1,15 @@
 //! Small helpers that would otherwise pull in extra crates: durations, URL and
-//! base64url encoding, randomness, backoff, and private file writes.
+//! base64url encoding, randomness, backoff, private files, file locks, peer
+//! credentials and error sanitizing.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Locks a mutex, ignoring poisoning. A panicking worker thread must not take
 /// every other watch in the daemon down with it.
@@ -74,6 +77,15 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 
 pub fn sha256(data: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, data).as_ref().to_vec()
+}
+
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&key, msg).as_ref().to_vec()
+}
+
+pub fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Unpadded base64url (RFC 4648 section 5), as PKCE requires.
@@ -157,6 +169,7 @@ pub fn query_get<'a>(q: &'a [(String, String)], key: &str) -> Option<&'a str> {
 pub struct Url {
     /// `scheme://host[:port]`, lowercased, without a trailing slash.
     pub origin: String,
+    pub scheme: String,
     pub host: String,
     /// Path without the query, always starting with `/`.
     pub path: String,
@@ -165,6 +178,9 @@ pub struct Url {
 
 pub fn parse_url(s: &str) -> Option<Url> {
     let s = s.trim().trim_start_matches('<').trim_end_matches('>');
+    if has_control_chars(s) || s.contains(' ') {
+        return None;
+    }
     let (scheme, rest) = s.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
@@ -189,10 +205,14 @@ pub fn parse_url(s: &str) -> Option<Url> {
             _ => authority.clone(),
         }
     };
+    if host.is_empty() {
+        return None;
+    }
     let default_port = if scheme == "https" { ":443" } else { ":80" };
     let authority = authority.strip_suffix(default_port).unwrap_or(&authority).to_string();
     Some(Url {
         origin: format!("{scheme}://{authority}"),
+        scheme,
         host,
         path: if path.is_empty() { "/".into() } else { path.to_string() },
         query: query.to_string(),
@@ -209,6 +229,65 @@ pub fn normalize_origin(s: &str) -> Option<String> {
         format!("https://{s}")
     };
     parse_url(&with_scheme).map(|u| u.origin)
+}
+
+/// The only hosts plain `http://` is allowed for.
+pub fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+/// Parses `s` and requires `https://`, or `http://` on a loopback host.
+/// Anything else would put a bearer token or webhook payload on the wire in
+/// clear text.
+pub fn secure_url(s: &str, what: &str) -> Result<Url, String> {
+    let u = parse_url(s).ok_or_else(|| format!("{what} is not a valid http(s) URL"))?;
+    match u.scheme.as_str() {
+        "https" => Ok(u),
+        "http" if is_loopback_host(&u.host) => Ok(u),
+        _ => Err(format!(
+            "{what} must use https:// (plain http:// is only allowed for 127.0.0.1, [::1] and localhost)"
+        )),
+    }
+}
+
+pub fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
+}
+
+/// Keeps only characters that are safe to echo from an untrusted server: an
+/// OAuth error code, for example. Never echo response bodies.
+pub fn sanitize_code(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(64)
+        .collect()
+}
+
+/// Printable ASCII, collapsed whitespace, bounded length.
+pub fn sanitize_text(s: &str, max: usize) -> String {
+    let cleaned: String = s.chars().map(|c| if c.is_ascii_graphic() { c } else { ' ' }).collect();
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect()
+}
+
+/// Describes a transport error without its Display text, which can carry a
+/// full URL (and so a webhook secret embedded in a path or query).
+pub fn describe_ureq_error(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Timeout(_) => "timed out".into(),
+        ureq::Error::HostNotFound => "host not found".into(),
+        ureq::Error::ConnectionFailed => "connection failed".into(),
+        ureq::Error::Io(io) => format!("network error ({:?})", io.kind()),
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "TLS error".into(),
+        ureq::Error::TooManyRedirects | ureq::Error::RedirectFailed => "redirect refused".into(),
+        ureq::Error::StatusCode(c) => format!("HTTP {c}"),
+        _ => "request failed".into(),
+    }
 }
 
 /// xorshift64* seeded from the OS. Only for backoff jitter, never for secrets.
@@ -237,36 +316,236 @@ impl Jitter {
     }
 }
 
-/// Creates `dir` (and parents) and restricts it to the owner (0700).
-pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+pub fn geteuid() -> u32 {
+    unsafe { libc::geteuid() }
 }
 
-/// Writes a file readable only by the owner (0600), atomically via rename so
-/// a crash never leaves a half-written token file behind.
-pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_private_dir(parent)?;
+/// Requires `meta` to belong to us and be closed to group and others.
+pub fn check_private(meta: &fs::Metadata, what: &Path) -> Result<(), String> {
+    if meta.uid() != geteuid() {
+        return Err(format!("{} is owned by uid {}, not by you", what.display(), meta.uid()));
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    {
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is accessible to other users (mode {:o}); use a private 0700 directory",
+            what.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// Creates `dir` (and parents) if needed and makes it 0700. Refuses a symlink
+/// or a directory owned by someone else. Only for directories t3-watch owns.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::other(format!("{} is not a directory", dir.display())));
+    }
+    if meta.uid() != geteuid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is owned by uid {}, not by you", dir.display(), meta.uid()),
+        ));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// For a directory the user chose: creates it 0700 if missing, otherwise
+/// requires it to be a private directory we own. Never changes permissions.
+pub fn verify_private_dir(dir: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(dir).is_err() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory (symlinks are refused)", dir.display()));
+    }
+    check_private(&meta, dir)
+}
+
+/// Opens (creating if needed) a 0600 lock file without following symlinks,
+/// and checks that it is a regular file we own.
+pub fn open_lock_file(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != geteuid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular file owned by you", path.display()),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
+}
+
+/// Takes an exclusive `flock` without blocking. `Ok(false)` means someone
+/// else holds it. (`File::try_lock` would need Rust 1.89.)
+pub fn try_flock(f: &File) -> io::Result<bool> {
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        Some(libc::EINTR) => try_flock(f),
+        _ => Err(err),
+    }
+}
+
+/// Waits up to `timeout` for an exclusive `flock`.
+pub fn flock_within(f: &File, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if try_flock(f)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Writes a file readable only by the owner (0600), atomically: a fresh
+/// `O_EXCL` temp file next to it, fsync, rename, then fsync the directory, so
+/// a crash leaves either the old or the new file and never a partial one.
+pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    ensure_private_dir(parent)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), hex(&random_bytes(6))));
+    let result = (|| {
         let mut f = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
         f.write_all(contents)?;
         f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)
+    result
+}
+
+/// The uid of the process on the other end of a Unix socket.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+pub fn peer_uid(s: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    if unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn peer_uid(s: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+/// Fails unless the peer runs as our effective uid.
+pub fn check_peer(s: &std::os::unix::net::UnixStream) -> io::Result<()> {
+    let uid = peer_uid(s)?;
+    if uid != geteuid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("socket peer runs as uid {uid}, not as you"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(skip, fail)`: let the next `skip` `spawn_thread` calls on this
+    /// thread succeed, then fail the `fail` after them, so tests can exercise
+    /// each error path.
+    pub static FAIL_SPAWNS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `thread::Builder::spawn` with a name and stack size. Callers must handle
+/// the error; nothing here falls back silently.
+pub fn spawn_thread<F, T>(name: &str, stack: usize, f: F) -> io::Result<JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(test)]
+    if FAIL_SPAWNS.with(|c| match c.get() {
+        (0, 0) => false,
+        (0, fail) => {
+            c.set((0, fail - 1));
+            true
+        }
+        (skip, fail) => {
+            c.set((skip - 1, fail));
+            false
+        }
+    }) {
+        return Err(io::Error::other("injected spawn failure"));
+    }
+    thread::Builder::new().name(name.into()).stack_size(stack).spawn(f)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("t3wu-{tag}-{}-{}", std::process::id(), hex(&random_bytes(4))));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
 
     #[test]
     fn durations() {
@@ -300,6 +579,15 @@ mod tests {
     }
 
     #[test]
+    fn hmac_matches_rfc4231_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
     fn percent_round_trip() {
         let id = "mcp:launch:abc/def ghi";
         assert_eq!(pct_encode(id), "mcp%3Alaunch%3Aabc%2Fdef%20ghi");
@@ -321,10 +609,35 @@ mod tests {
         assert_eq!(u.path, "/");
         assert!(parse_url("ftp://x").is_none());
         assert!(parse_url("t3-thread://v2/a/b").is_none());
+        assert!(parse_url("https://a.example/x\r\nInjected: 1").is_none());
+        assert!(parse_url("https://user@a.example/").is_none());
         assert_eq!(
             normalize_origin("prod-x.t3coderelay.com/mcp").unwrap(),
             "https://prod-x.t3coderelay.com"
         );
+    }
+
+    #[test]
+    fn plain_http_only_on_loopback() {
+        assert!(secure_url("https://relay.example/mcp", "x").is_ok());
+        for ok in ["http://127.0.0.1:3773", "http://localhost:9/x", "http://[::1]:8080/"] {
+            assert!(secure_url(ok, "x").is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://relay.example",
+            "http://127.0.0.2:80",
+            "http://10.0.0.1",
+            "ws://localhost",
+        ] {
+            assert!(secure_url(bad, "x").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sanitizers_drop_unsafe_text() {
+        assert_eq!(sanitize_code("invalid_grant\r\n<script>"), "invalid_grantscript");
+        assert_eq!(sanitize_text("a\r\n\tb\u{7f}c  d", 100), "a b c d");
+        assert_eq!(sanitize_text("abcdef", 3), "abc");
     }
 
     #[test]
@@ -337,5 +650,79 @@ mod tests {
                 .min(Duration::from_secs(30));
             assert!(d >= full / 2 && d <= full, "attempt {attempt}: {d:?}");
         }
+    }
+
+    #[test]
+    fn flock_excludes_a_second_handle() {
+        let d = tmpdir("flock");
+        let p = d.join("x.lock");
+        let a = open_lock_file(&p).unwrap();
+        let b = open_lock_file(&p).unwrap();
+        assert!(try_flock(&a).unwrap());
+        assert!(!try_flock(&b).unwrap());
+        assert!(!flock_within(&b, Duration::from_millis(30)).unwrap());
+        drop(a);
+        assert!(try_flock(&b).unwrap());
+        assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn lock_file_refuses_symlinks() {
+        let d = tmpdir("symlink");
+        let target = d.join("target");
+        fs::write(&target, "keep").unwrap();
+        let link = d.join("x.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_lock_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn write_private_is_atomic_and_private() {
+        let d = tmpdir("write");
+        let p = d.join("machines.json");
+        write_private(&p, b"one").unwrap();
+        write_private(&p, b"two").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "two");
+        assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+        let leftovers: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != "machines.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn verify_private_dir_rejects_shared_dirs() {
+        let d = tmpdir("verify");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_private_dir(&d).unwrap_err().contains("other users"));
+        assert_eq!(fs::metadata(&d).unwrap().mode() & 0o777, 0o755, "must not chmod");
+        let fresh = d.join("new");
+        verify_private_dir(&fresh).unwrap();
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o777, 0o700);
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(verify_private_dir(&link).is_err());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn peer_uid_is_ours_on_a_socketpair() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), geteuid());
+        check_peer(&b).unwrap();
+    }
+
+    #[test]
+    fn injected_spawn_failures_are_reported() {
+        FAIL_SPAWNS.with(|c| c.set((1, 1)));
+        spawn_thread("x", 64 * 1024, || ()).unwrap().join().unwrap();
+        assert!(spawn_thread("x", 64 * 1024, || ()).is_err());
+        spawn_thread("x", 64 * 1024, || ()).unwrap().join().unwrap();
     }
 }

@@ -6,18 +6,24 @@ mod engine;
 mod local;
 mod mcp;
 mod model;
+mod notify;
 mod oauth;
 mod util;
 
 use config::Config;
 use engine::{error_json, Hub, Outcome, TargetSpec, Transport, WaitRequest, LOCAL_MACHINE};
 use model::Predicate;
+use notify::{Notify, NotifyArgs};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// The threads settled but a configured notification could not be delivered.
+const EXIT_NOTIFY_FAILED: i32 = 4;
 
 const USAGE: &str = "\
 t3-watch: wait for T3 Code threads to settle without spending AI tokens.
@@ -43,14 +49,28 @@ WAIT OPTIONS
       --env <ENV_ID>               environmentId for a peer-linked environment
       --mode <all|any>             wait for all threads (default) or the first
       --expect-min-run-ordinal <N> ignore runs older than ordinal N
-      --until-delegated-settled    also wait for delegated work (mcp only)
+      --until-delegated-settled    also wait for delegated work (mcp transport only;
+                                   rejected for local threads)
       --timeout <DUR>              give up after DUR (default 4h)
       --interval <DUR>             local poll interval (default 5s)
-      --slice <DUR>                mcp long-poll length (default 240s)
+      --slice <DUR>                mcp long-poll length (default 240s, at most 10m)
       --base-dir <DIR>             T3 data dir for local (default $T3CODE_HOME or ~/.t3)
       --t3-bin <PATH>              T3 CLI for local (default: newest under base dir)
       --no-daemon                  watch in this process instead of the shared daemon
       --pretty                     indent the JSON output
+
+NOTIFICATIONS (run by this process when the wait ends)
+      --webhook-url-env <VAR>      POST the result JSON to the https URL in $VAR
+      --webhook-url-file <PATH>    ... or to the URL stored in a file
+      --webhook-url <URL>          ... or to this URL (visible in `ps`; prefer -env/-file)
+      --webhook-header-env <H>=<VAR>  add header H with the value of $VAR (repeatable)
+      --webhook-secret-env <VAR>   sign with HMAC-SHA256 using the secret in $VAR
+      --webhook-secret-file <PATH> ... or the secret stored in a file
+      --on-settle <PROG>           run PROG (no shell) with the result JSON on stdin
+      --on-settle-arg <ARG>        pass ARG to PROG (repeatable)
+      --on-settle-timeout <DUR>    kill PROG after DUR (default 60s)
+      --notify-on <settled|all>    notify on settle only (default) or also on
+                                   timeout and error
 
 AUTH OPTIONS
       --name <NAME>                machine name (default from the host)
@@ -61,18 +81,25 @@ AUTH OPTIONS
 
 EXIT CODES
   0 settled   2 error (auth revoked, unknown thread, bad usage)   3 timed out
+  4 settled, but a notification could not be delivered
   Output is one JSON object on stdout.
 ";
 
 struct Args {
     positional: Vec<String>,
-    values: HashMap<&'static str, String>,
+    values: HashMap<&'static str, Vec<String>>,
     flags: Vec<&'static str>,
 }
 
 impl Args {
+    /// The last value given for an option.
     fn get(&self, k: &str) -> Option<&str> {
-        self.values.get(k).map(String::as_str)
+        self.values.get(k).and_then(|v| v.last()).map(String::as_str)
+    }
+
+    /// Every value given for a repeatable option, in order.
+    fn get_all(&self, k: &str) -> Vec<String> {
+        self.values.get(k).cloned().unwrap_or_default()
     }
 
     fn has(&self, k: &str) -> bool {
@@ -120,7 +147,7 @@ fn parse_args(raw: &[String], value_opts: &[&'static str], flag_opts: &[&'static
                     v.clone()
                 }
             };
-            a.values.insert(k, v);
+            a.values.entry(k).or_default().push(v);
         } else if let Some(&k) = flag_opts.iter().find(|k| **k == name) {
             a.flags.push(k);
         } else {
@@ -135,13 +162,22 @@ fn usage_error(msg: &str) -> ! {
     exit(2)
 }
 
+/// Writes to stdout without panicking when the reader has gone away
+/// (`println!` panics on EPIPE). The result of a wait must never depend on
+/// whether anyone is still reading.
+fn write_stdout(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes()).and_then(|_| out.flush());
+}
+
 fn print_json(v: &Value, pretty: bool) {
-    let s = if pretty {
+    let mut s = if pretty {
         serde_json::to_string_pretty(v).unwrap()
     } else {
         v.to_string()
     };
-    println!("{s}");
+    s.push('\n');
+    write_stdout(&s);
 }
 
 fn fail_json(kind: &str, msg: &str) -> ! {
@@ -149,16 +185,55 @@ fn fail_json(kind: &str, msg: &str) -> ! {
     exit(2)
 }
 
-fn is_loopback(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
-}
-
 struct WaitDefaults<'a> {
     machine: Option<&'a str>,
     transport: Option<Transport>,
     env: Option<&'a str>,
-    base_dir: Option<PathBuf>,
+    /// Absolute T3 data directory, resolved in this process.
+    base_dir: PathBuf,
+    /// Absolute `t3` binary, resolved in this process.
     t3_bin: Option<PathBuf>,
+    /// The user named a binary (`--t3-bin` or `$T3_WATCH_T3_BIN`). A `t3`
+    /// that merely happens to be on `PATH` does not make bare ids local.
+    explicit_bin: bool,
+}
+
+impl WaitDefaults<'_> {
+    fn local_available(&self) -> bool {
+        self.base_dir.is_dir() || self.explicit_bin
+    }
+}
+
+/// Resolves the local `t3` paths here, in the client, so the daemon (which
+/// runs from `/` with whatever environment its first client had) watches
+/// exactly what this caller meant. Returns the data dir, a binary if the
+/// daemon cannot find one under that dir, and whether the user named it.
+fn resolve_local_paths(
+    base_dir: Option<&str>,
+    t3_bin: Option<&str>,
+) -> Result<(PathBuf, Option<PathBuf>, bool), String> {
+    let base = match base_dir {
+        Some(p) => config::absolute(&PathBuf::from(p))?,
+        None => config::absolute(&config::t3_base_dir())?,
+    };
+    let explicit = match t3_bin {
+        Some(p) => Some(PathBuf::from(p)),
+        None => config::t3_bin_override(),
+    };
+    let named = explicit.is_some();
+    let bin = match explicit {
+        Some(p) => {
+            let abs = config::absolute(&p)?;
+            if !abs.is_file() {
+                return Err(format!("t3 binary {} does not exist", abs.display()));
+            }
+            Some(abs)
+        }
+        // The daemon finds the newest install under the data dir itself.
+        None if config::find_t3_in_base(&base).is_some() => None,
+        None => config::find_t3_on_path().map(|p| config::absolute(&p)).transpose()?,
+    };
+    Ok((base, bin, named))
 }
 
 /// Turns one THREAD argument into a target: which machine and transport,
@@ -198,7 +273,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
         thread_id,
         environment_id: None,
         t3_bin: d.t3_bin.clone(),
-        base_dir: d.base_dir.clone(),
+        base_dir: Some(d.base_dir.clone()),
     };
     let mcp = |name: &str, thread_id: String, env: Option<String>| TargetSpec {
         transport: Transport::Mcp,
@@ -224,7 +299,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
         if let Some((name, _)) = cfg.by_origin(&origin) {
             return Ok(mcp(name, thread_id, env));
         }
-        if is_loopback(&host) && d.transport != Some(Transport::Mcp) {
+        if util::is_loopback_host(&host) && d.transport != Some(Transport::Mcp) {
             return Ok(local(thread_id));
         }
         return Err(format!(
@@ -234,8 +309,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
     if let Some(name) = cfg.default.as_deref().filter(|n| cfg.machines.contains_key(*n)) {
         return Ok(mcp(name, thread_id, env));
     }
-    let base = d.base_dir.clone().unwrap_or_else(config::t3_base_dir);
-    if d.transport != Some(Transport::Mcp) && (base.is_dir() || d.t3_bin.is_some()) {
+    if d.transport != Some(Transport::Mcp) && d.local_available() {
         return Ok(local(thread_id));
     }
     if cfg.machines.len() == 1 {
@@ -268,6 +342,16 @@ fn cmd_wait(raw: &[String]) -> ! {
             "slice",
             "base-dir",
             "t3-bin",
+            "webhook-url",
+            "webhook-url-env",
+            "webhook-url-file",
+            "webhook-header-env",
+            "webhook-secret-env",
+            "webhook-secret-file",
+            "on-settle",
+            "on-settle-arg",
+            "on-settle-timeout",
+            "notify-on",
         ],
         &["until-delegated-settled", "no-daemon", "pretty"],
     )
@@ -275,6 +359,25 @@ fn cmd_wait(raw: &[String]) -> ! {
     if a.positional.is_empty() {
         usage_error("wait needs at least one thread id or URL");
     }
+
+    // Secrets are read (and scrubbed from the environment) before anything
+    // else runs, in particular before the daemon is started.
+    let notify = Notify::from_args(&NotifyArgs {
+        webhook_url: a.get("webhook-url").map(str::to_string),
+        webhook_url_env: a.get("webhook-url-env").map(str::to_string),
+        webhook_url_file: a.get("webhook-url-file").map(str::to_string),
+        header_envs: a.get_all("webhook-header-env"),
+        secret_env: a.get("webhook-secret-env").map(str::to_string),
+        secret_file: a.get("webhook-secret-file").map(str::to_string),
+        on_settle: a.get("on-settle").map(str::to_string),
+        on_settle_args: a.get_all("on-settle-arg"),
+        on_settle_timeout: a
+            .get("on-settle-timeout")
+            .map(|_| parse_dur(&a, "on-settle-timeout", notify::DEFAULT_HOOK_TIMEOUT)),
+        notify_on: a.get("notify-on").map(str::to_string),
+    })
+    .unwrap_or_else(|e| fail_json("usage", &e));
+
     let transport = match a.get("transport") {
         None | Some("auto") => None,
         Some("mcp") => Some(Transport::Mcp),
@@ -295,12 +398,15 @@ fn cmd_wait(raw: &[String]) -> ! {
         .unwrap_or(0);
     let pretty = a.has("pretty");
     let cfg = Config::load().unwrap_or_else(|e| fail_json("config", &e));
+    let (base_dir, t3_bin, explicit_bin) =
+        resolve_local_paths(a.get("base-dir"), a.get("t3-bin")).unwrap_or_else(|e| fail_json("config", &e));
     let defaults = WaitDefaults {
         machine: a.get("machine"),
         transport,
         env: a.get("env"),
-        base_dir: a.get("base-dir").map(PathBuf::from),
-        t3_bin: a.get("t3-bin").map(PathBuf::from),
+        base_dir,
+        t3_bin,
+        explicit_bin,
     };
     let targets: Vec<TargetSpec> = a
         .positional
@@ -315,23 +421,39 @@ fn cmd_wait(raw: &[String]) -> ! {
             until_delegated: a.has("until-delegated-settled"),
         },
         timeout: parse_dur(&a, "timeout", Duration::from_secs(4 * 3600)),
-        // Same floors the daemon applies, so `--no-daemon --interval 0`
-        // cannot spawn `t3` in a tight loop.
-        interval: parse_dur(&a, "interval", Duration::from_secs(5)).max(Duration::from_millis(50)),
-        slice: parse_dur(&a, "slice", Duration::from_secs(240)).max(Duration::from_millis(100)),
-    };
+        interval: parse_dur(&a, "interval", Duration::from_secs(5)),
+        slice: parse_dur(&a, "slice", Duration::from_secs(240)),
+    }
+    .normalized();
+    // Refuse up front what the daemon would refuse, such as delegated-work
+    // waits on the local transport, so nothing starts for a doomed request.
+    if let Err(e) = req.validate() {
+        fail_json("usage", &e);
+    }
 
-    let outcome = if a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some() {
+    let mut outcome = if a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some() {
         let hub = Hub::new("direct");
         let (tx, rx) = mpsc::channel();
         hub.wait(&req, tx, rx)
     } else {
         daemon::wait(&req).unwrap_or_else(|e| Outcome::Error(error_json("daemon", &e)))
     };
+
+    let mut code = outcome.exit_code();
+    let event = outcome.event();
+    if let Some(v) = outcome.json_mut() {
+        let body = v.to_string().into_bytes();
+        if let Some(summary) = notify.deliver(event, &body) {
+            if summary["delivered"] == false && code == 0 {
+                code = EXIT_NOTIFY_FAILED;
+            }
+            v["notification"] = summary;
+        }
+    }
     if let Some(v) = outcome.json() {
         print_json(v, pretty);
     }
-    exit(outcome.exit_code())
+    exit(code)
 }
 
 fn cmd_auth(raw: &[String]) -> ! {
@@ -389,6 +511,7 @@ fn run_auth(sub: &str, raw: &[String]) -> ! {
                     "authorizationEndpoint": d.authorization_endpoint,
                     "tokenEndpoint": d.token_endpoint,
                     "registrationEndpoint": d.registration_endpoint,
+                    "refreshTokens": d.supports_refresh,
                     "scope": oauth::SCOPE,
                 })
             }),
@@ -402,7 +525,7 @@ fn run_auth(sub: &str, raw: &[String]) -> ! {
         }),
         "default" | "logout" => {
             let name = one("machine name");
-            Config::load().and_then(|mut cfg| {
+            Config::transaction(|cfg| {
                 if !cfg.machines.contains_key(&name) {
                     return Err(format!("no saved machine named {name:?}"));
                 }
@@ -414,7 +537,6 @@ fn run_auth(sub: &str, raw: &[String]) -> ! {
                 } else {
                     cfg.default = Some(name.clone());
                 }
-                cfg.save()?;
                 Ok(serde_json::json!({ "ok": true, "machine": name, "default": cfg.default }))
             })
         }
@@ -452,16 +574,16 @@ fn main() {
                 v["running"] = Value::Bool(true);
                 print_json(&v, rest.iter().any(|a| a == "--pretty"))
             }
-            Ok(None) => println!("{{\"running\":false}}"),
+            Ok(None) => write_stdout("{\"running\":false}\n"),
             Err(e) => fail_json("daemon", &e),
         },
         Some("stop") => match daemon::request("stop") {
             Ok(Some(v)) => print_json(&v, false),
-            Ok(None) => println!("{{\"ok\":true,\"running\":false}}"),
+            Ok(None) => write_stdout("{\"ok\":true,\"running\":false}\n"),
             Err(e) => fail_json("daemon", &e),
         },
-        Some("-V" | "--version" | "version") => println!("t3-watch {}", env!("CARGO_PKG_VERSION")),
-        Some("-h" | "--help" | "help") | None => print!("{USAGE}"),
+        Some("-V" | "--version" | "version") => write_stdout(&format!("t3-watch {}\n", env!("CARGO_PKG_VERSION"))),
+        Some("-h" | "--help" | "help") | None => write_stdout(USAGE),
         Some(other) => usage_error(&format!("unknown command {other:?}")),
     }
 }
@@ -488,8 +610,9 @@ mod tests {
             machine: None,
             transport: None,
             env: None,
-            base_dir: Some("/nonexistent".into()),
+            base_dir: "/nonexistent".into(),
             t3_bin: None,
+            explicit_bin: false,
         }
     }
 
@@ -516,12 +639,23 @@ mod tests {
         );
         let t = resolve_target("mcp:launch:abc", &defaults(), &cfg()).unwrap();
         assert_eq!(t.machine, "relay");
-        let mut d = defaults();
-        d.transport = Some(Transport::Local);
+        // A `t3` found on PATH alone does not pull bare ids to local.
+        let mut on_path = defaults();
+        on_path.t3_bin = Some("/usr/local/bin/t3".into());
         assert_eq!(
-            resolve_target("mcp:launch:abc", &d, &cfg()).unwrap().transport,
+            resolve_target("mcp:launch:abc", &on_path, &cfg()).unwrap().machine,
+            "relay"
+        );
+        on_path.explicit_bin = true;
+        assert_eq!(
+            resolve_target("mcp:launch:abc", &on_path, &cfg()).unwrap().transport,
             Transport::Local
         );
+        let mut d = defaults();
+        d.transport = Some(Transport::Local);
+        let t = resolve_target("mcp:launch:abc", &d, &cfg()).unwrap();
+        assert_eq!(t.transport, Transport::Local);
+        assert_eq!(t.base_dir.as_deref(), Some(std::path::Path::new("/nonexistent")));
     }
 
     #[test]
@@ -533,15 +667,35 @@ mod tests {
     }
 
     #[test]
+    fn local_paths_are_made_absolute_here() {
+        let (base, bin, _) = resolve_local_paths(Some("."), None).unwrap();
+        assert!(base.is_absolute());
+        assert_eq!(base, std::fs::canonicalize(".").unwrap());
+        assert!(bin.as_ref().is_none_or(|b| b.is_absolute()));
+        assert!(resolve_local_paths(Some("."), Some("no/such/t3")).is_err());
+    }
+
+    #[test]
     fn args() {
-        let raw: Vec<String> = ["a", "--mode=any", "-m", "x", "--pretty", "b"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let a = parse_args(&raw, &["mode", "machine"], &["pretty"]).unwrap();
+        let raw: Vec<String> = [
+            "a",
+            "--mode=any",
+            "-m",
+            "x",
+            "--pretty",
+            "b",
+            "--on-settle-arg",
+            "--v",
+            "--on-settle-arg=2",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_args(&raw, &["mode", "machine", "on-settle-arg"], &["pretty"]).unwrap();
         assert_eq!(a.positional, ["a", "b"]);
         assert_eq!(a.get("mode"), Some("any"));
         assert_eq!(a.get("machine"), Some("x"));
+        assert_eq!(a.get_all("on-settle-arg"), ["--v", "2"]);
         assert!(a.has("pretty"));
         assert!(parse_args(&raw, &["mode"], &[]).is_err());
     }
