@@ -29,9 +29,21 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  msrv:
+    name: test (Rust 1.85, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo test --locked
+
   release:
     name: build (${{ matrix.target }})
-    needs: test
+    needs: [test, msrv]
     strategy:
       fail-fast: false
       matrix:
