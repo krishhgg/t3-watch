@@ -4,7 +4,7 @@ verifies the X-T3-Watch-Signature HMAC with the secret in SECRET_FILE, checks
 an expected Authorization header, and appends one JSON line per request to
 LOG_FILE. Writes its port to PORT_FILE. Never prints secrets.
 
-Usage: receiver.py SECRET_FILE EXPECTED_AUTH LOG_FILE PORT_FILE
+Usage: receiver.py SECRET_FILE EXPECTED_AUTH LOG_FILE PORT_FILE [PORT]
 """
 
 import hashlib
@@ -35,8 +35,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "id": event_id,
             "signatureOk": hmac.compare_digest(expected, self.headers.get("X-T3-Watch-Signature", "")),
             "authorizationOk": self.headers.get("Authorization") == EXPECTED_AUTH,
+            "idempotencyOk": self.headers.get("Idempotency-Key") == event_id,
+            "attempt": self.headers.get("X-T3-Watch-Attempt"),
+            "outcome": payload.get("outcome"),
             "bodyEvent": payload.get("event"),
-            "threadStatus": (payload.get("threads") or [{}])[0].get("status"),
+            "threadStatus": next(iter(t.get("status") for t in payload.get("threads") or [] if isinstance(t, dict)), None),
             "bytes": len(body),
         }
         with open(LOG, "a") as f:
@@ -50,7 +53,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+server = http.server.HTTPServer(("127.0.0.1", int(sys.argv[5]) if len(sys.argv) > 5 else 0), Handler)
 with open(PORT_FILE, "w") as f:
     f.write(str(server.server_address[1]))
 server.serve_forever()

@@ -7,21 +7,22 @@ long T3 thread through MCP, it usually either polls `t3_thread_read` or keeps
 a subagent open until the thread finishes. Both burn context and tokens.
 `t3-watch wait` does the waiting in the operating system instead. The agent
 starts it as a background command and ends its turn. When the watched threads
-leave the active statuses (`preparing`, `queued`, `starting`, `running`), the
-command prints one line of JSON and exits, and the harness wakes the agent
-once.
+finish, fail, or stop to ask a question, the command prints one line of JSON
+and exits with a code that says which, and the harness wakes the agent once.
 
 ```sh
 t3-watch wait mcp:launch:4c5afd1c... --expect-min-run-ordinal 2
 # ... minutes later ...
-{"event":"settled","mode":"all","elapsedMs":81234,"via":"daemon","threads":[{"machine":"local","threadId":"mcp:launch:4c5afd1c...","status":"completed","settled":true,"latestRunId":"run:thread:...:ordinal:2","runOrdinal":2,"title":"Fix the flaky test"}]}
+{"event":"settled","outcome":"completed","until":"turn","mode":"all","elapsedMs":81234,"via":"daemon","threads":[{"machine":"local","threadId":"mcp:launch:4c5afd1c...","status":"completed","outcome":"completed","settled":true,"latestRunId":"run:thread:...:ordinal:2","runOrdinal":2,"title":"Fix the flaky test"}],"startedAt":"2026-11-06T18:01:02.000Z","endedAt":"2026-11-06T18:02:23.234Z","watchId":"5d1c..."}
 ```
 
-- One 1.6 MB binary with TLS built in (rustls). No Python or Node runtime, 26 runtime crates (29 with build-time ones), no proc-macros.
+- One 1.7 MB binary with TLS built in (rustls). No Python or Node runtime, 26 runtime crates (29 with build-time ones), no proc-macros.
 - Thin clients share one background daemon per user. Twenty agents watching one thread cost one upstream long-poll.
 - Watches threads on this machine through T3's own CLI with no setup, and on other machines over T3's Streamable HTTP MCP endpoint with a read-only OAuth token.
-- Rides out Cloudflare tunnel errors (502, 504, 530 / error 1033 when a laptop sleeps) and expired MCP sessions without waking anyone, and fails fast with exit 2 when a token is revoked.
-- Can also wake a bot that has no background terminal: a signed HTTPS webhook and/or a local program, run when the wait ends.
+- Two completion contracts: a turn (the latest run finished) or a whole workstream (the run, its delegated work, and the parent runs that deliver the results, proven by T3 itself). See [Completion contracts](#completion-contracts).
+- A question or approval that blocks a thread wakes the caller with its own outcome and exit code (5), even while the run still says `running`. Failed, interrupted and cancelled runs exit 6, never 0.
+- Rides out Cloudflare tunnel errors (502, 504, 530 / error 1033 when a laptop sleeps, a tunnel's challenge-less 401), and expired MCP sessions without waking anyone, and fails fast with exit 2 when a token is really revoked.
+- Can also wake a bot that has no background terminal: a signed HTTPS webhook and/or a local program, run when the wait ends. With `--durable`, an undelivered webhook is kept on disk and retried until a 2xx.
 
 ## Install
 
@@ -61,8 +62,9 @@ user as the T3 server. `--base-dir`, `--t3-bin`, `$T3CODE_HOME` and
 `$T3_WATCH_T3_BIN` are resolved to absolute paths by the waiting client, so a
 relative path means the same file however the daemon was started.
 
-The local CLI cannot see delegated work, so `--until-delegated-settled` is
-refused (exit 2) for local threads instead of silently doing less.
+The local CLI cannot prove that delegated work has settled, so
+`--until workstream` is refused (exit 2) for local threads instead of
+silently doing less. `--final-marker` works locally (see below).
 
 ### Threads on another machine
 
@@ -101,6 +103,106 @@ Right after `t3_thread_send`, a thread can still report the previous run as
 t3-watch wait mcp:launch:abc123 --expect-min-run-ordinal 2
 ```
 
+To skip a run you already know about without doing ordinal arithmetic, pass
+its id: `--after-run run:thread:...:ordinal:5` waits for a run newer than 5
+(one thread per wait). Every result names `latestRunId` (and `resultRunId`
+in workstream mode), so a bot can feed the last one back.
+
+When retries are expected (a failed run gets resent, and the resend becomes
+a new run), `--follow` keeps one watcher across them: a failed, interrupted
+or cancelled run is reported as `run_failed` progress (a webhook and a line
+on stderr), and the wait goes on until a later run of the thread completes,
+asks for input, or the timeout passes. The final result lists the failed
+runs in `failedRuns`.
+
+## Completion contracts
+
+A T3 turn and the work it starts are different things. On 2026-11-06 a
+research thread's run 2 finished its own turn after launching four reviewer
+threads; their completions came back as parent runs 3 to 5, and the
+synthesis was run 6. A watcher waiting for "run 2 or later, finished" exited
+at run 2, as it was asked to. t3-watch now offers two explicit contracts:
+
+| `--until` | Settles when | Proof | Transports |
+| --- | --- | --- | --- |
+| `turn` (default) | The latest run of the thread (at least `--expect-min-run-ordinal`) has a terminal status and no run is active | `t3_thread_read` (MCP) or `t3 thread show` (local) | both |
+| `workstream` | The run, its delegated and background tasks, and the parent runs that deliver their completions have all settled | T3's own `t3_thread_wait` with `untilDelegatedWorkSettled`, whose `resultRun` names the run with the final answer | MCP only |
+
+Turn mode is unchanged for ordinary single turns. Over MCP it also asks T3,
+without waiting (`t3_thread_wait` with `timeoutMs: 1`), whether the finished
+turn left delegated work running, and reports `delegatedWorkPending: true`
+with a diagnostic when it did. That is a hint; it never changes the result.
+
+Workstream mode settles only when all of these hold, checked on each cycle:
+
+1. `t3_thread_wait` returned `timedOut: false` with a settled status, for
+   this thread (`threadId` matches when present).
+2. It named `resultRun`, and that run is a run of this thread
+   (`run:thread:<this thread>:ordinal:N`) whose status, when given, is
+   settled. A run of another thread (a child's) never counts.
+3. The header read afterwards shows a settled status, no `activeRunId`, and
+   a latest run no newer than `resultRun`, or the same latest run a read had
+   already seen before this wait was sent (a wait without `runId` covers the
+   latest run and its delegated work, so T3 may name an earlier run as the
+   one holding the answer).
+
+If a newer run appears (a late child completion continuing the parent),
+t3-watch waits again on it. If T3 finishes the wait without `resultRun`,
+nothing can prove the workstream, and the result is an error
+(`error.kind = "unsupported"`, exit 2), never a completion.
+
+What this cannot prove: that nobody will start a new run later. A user
+message or a delegated task created after T3 reported the workstream settled
+starts a new workstream. And the proof is only as good as T3's own
+bookkeeping of delegated work.
+
+`--final-marker <TEXT>` is an explicit final-result contract for both modes
+and both transports: the final assistant message of the deciding run (the
+latest run, or `resultRun` in workstream mode) must contain TEXT. Put the
+marker in the instructions ("end your final synthesis with
+`SYNTHESIS-COMPLETE`"); until it appears, a completed status keeps waiting,
+with `finalMarkerSeen: false` and a diagnostic. A failed run ends the wait
+without the marker. Over MCP the message is found with a one-character
+listing of the last 100 timeline items and then read alone, page by page.
+T3 marks a delegated child's final result as delivered when it is read, so
+`--final-marker` refuses child threads (exit 2, `unsupported`); watch the
+parent instead.
+
+## When a thread needs input
+
+A thread blocked on a question or an approval never finishes by itself. The
+wait ends at once with `event` and `outcome` `needs_input` and exit 5, in
+either completion mode, when the thread's status is `waiting` or its
+`pendingRequestCount` is above zero (an approval can block a run that still
+says `running`). That is never reported as completion, and t3-watch never
+answers or approves anything: it can only call `t3_thread_wait`,
+`t3_thread_read` and `t3_pending_request` with `action` `list` or `read`.
+
+Over MCP each pending request is described from the end of the activity
+timeline and `t3_pending_request list` (which lists questions only, not
+approvals):
+
+```json
+{"kind":"question","itemId":"turn-item:runtime-request:...","requestId":"runtime-request:...","userOnly":false,
+ "questions":[{"header":"Deploy","question":"Use the staging key for this run?","options":["Yes (Recommended)","No"],"multiSelect":false}]}
+```
+
+- `kind` is `question`, `approval` or `request`. Approvals have
+  `userOnly: true`: a bot may answer questions, but approvals are for the
+  user in T3.
+- Question text is cut to 600 characters, option labels to 120, option
+  descriptions are dropped, and anything that looks like a credential (key
+  prefixes such as `sk-` or `ghp_`, JWTs, long mixed alphanumeric runs,
+  `password=`/`token:` values, URL userinfo, the word after `Bearer`) is
+  replaced with `[redacted]`.
+- The thread gets a `pendingKey`. Once the caller has passed the request on,
+  `--acknowledge <pendingKey>` keeps waiting past that exact set of
+  requests; a different or additional request wakes it again.
+- The local transport sees `waiting` and `pendingRequestCount` but has no
+  way to read the request itself, so `requests` is empty there.
+- A request that appears while the run still says `running` is noticed by
+  the read after each long-poll slice, so within `--slice` (default 60 s).
+
 ### Wake notifications
 
 An agent with a background terminal is woken by the process exiting. A bot
@@ -117,11 +219,14 @@ t3-watch wait mcp:launch:abc123 \
   --on-settle /usr/local/bin/wake-bot --on-settle-arg --channel --on-settle-arg ops
 ```
 
-- The webhook gets `POST` with the result JSON as the body. `X-T3-Watch-Event`
-  is `settled`, `timeout` or `error`, and `X-T3-Watch-Id` is the same for
-  every retry. With a secret, `X-T3-Watch-Timestamp` and
-  `X-T3-Watch-Signature: sha256=<hex>` carry an HMAC-SHA256 over
-  `<timestamp>.<id>.<body>`.
+- The webhook gets `POST` with the result JSON as the body.
+  `X-T3-Watch-Event` is the event (`settled`, `needs_input`, `timeout`,
+  `error`, or progress: `run_failed`, `upstream_unreachable`,
+  `upstream_restored`, `heartbeat`). `X-T3-Watch-Id` and `Idempotency-Key`
+  carry the same id on every retry of one event, inline or from the outbox;
+  `X-T3-Watch-Attempt` counts the attempts. With a secret,
+  `X-T3-Watch-Timestamp` and `X-T3-Watch-Signature: sha256=<hex>` carry an
+  HMAC-SHA256 over `<timestamp>.<id>.<body>`, fresh for each attempt.
 - The URL must be `https://` (plain `http://` only on 127.0.0.1, [::1] or
   localhost). Redirects are not followed. Network errors, 408, 429 and 5xx are
   retried, at most 4 attempts within 60 s, honoring a `Retry-After` in seconds;
@@ -138,16 +243,87 @@ t3-watch wait mcp:launch:abc123 \
   or response body.
 - `--on-settle` runs the program directly (no shell) with the
   `--on-settle-arg` values, the result JSON on stdin and `T3_WATCH_EVENT` in
-  its environment. Its stdout and stderr go to t3-watch's stderr. After
-  `--on-settle-timeout` (default 60 s) its whole process group is killed.
-- By default only `settled` results notify. `--notify-on all` also notifies
-  on timeout and error, so an expired token cannot leave an unattended bot
-  waiting forever. Once the notification options themselves are valid, this
-  includes errors before the wait starts: an unreadable machines.json, an
-  unknown machine, a bad `--mode` or duration.
-- When the threads settled but a notification failed, the result still says
-  `"event":"settled"`, adds `"notification":{"delivered":false,...}` and the
-  exit code is 4.
+  its environment. Its stdout and stderr go to `hooks.log` in the state
+  directory (0600), never to t3-watch's stdout or stderr: a hook that leaves
+  a background process holding an inherited pipe would otherwise keep a
+  harness that reads t3-watch's output waiting after t3-watch has exited.
+  After `--on-settle-timeout` (default 60 s) its whole process group is
+  killed.
+- `--notify-on` takes `all` or a comma list of `settled`, `needs_input`,
+  `timeout`, `error`, `run_failed` and `upstream`. The default is everything
+  but `timeout` and `error`; `all` adds those, so an expired token cannot
+  leave an unattended bot waiting forever. Once the notification options
+  themselves are valid, this includes errors before the wait starts: an
+  unreadable machines.json, an unknown machine, a bad `--mode` or duration.
+- When the threads completed but a notification failed (or was only
+  queued), the result adds `"notification":{"delivered":false,...}` and the
+  exit code is 4. Exit codes 5 and 6 are kept as they are; check
+  `notification.delivered` there.
+
+### Durable delivery
+
+The legacy shell watcher this replaces timed out, then lost its only
+notification to a DNS failure (`Could not resolve host`) with no retry.
+With `--durable`, a webhook is never fire-and-forget:
+
+1. Before the first attempt, the event is written to
+   `<state>/outbox/<id>.json` (0600 in a 0700 directory, through an fsynced
+   temp file and a rename). A crash from here on loses nothing.
+2. The waiting client tries it inline (up to 4 attempts within 60 s). A 2xx
+   removes the entry.
+3. Otherwise the client exits (4 if the threads completed) with
+   `notification.queued: true` and the outbox id, and makes sure the daemon
+   runs. The daemon's sender retries every entry with exponential backoff
+   (2 s doubling, with jitter, capped at 5 min, `Retry-After` honored) until
+   a 2xx, then removes it. DNS failures, refused connections, 5xx and 4xx
+   alike are retried; after `--durable-max-age` (default 7 days) the entry
+   moves to `outbox/dead/`.
+4. The daemon does not idle-exit while the outbox holds entries. One sender
+   runs at a time (`outbox/sender.lock`).
+
+Every attempt for an entry carries the same `X-T3-Watch-Id` and
+`Idempotency-Key`. A receiver that processed a request whose answer was lost,
+or a sender that crashed between the 2xx and removing the entry, produces a
+duplicate with the same id; receivers should drop repeats of an id they
+have seen.
+
+```sh
+t3-watch outbox list            # ids, events, destination origin, attempts, next attempt, last error
+t3-watch outbox run --once      # try every entry now (exit 4 while some remain)
+t3-watch outbox run             # the sender in the foreground, for launchd/systemd
+t3-watch outbox drop <id>
+```
+
+An entry holds the webhook URL, extra headers and signing secret, protected
+like the OAuth tokens in machines.json; `outbox list` shows only the
+destination's origin. If the machine reboots, nothing resends until a
+t3-watch command starts the daemon again (any `wait` does), unless
+`t3-watch outbox run` is supervised by launchd or systemd.
+
+### Outages, heartbeats and a dead host
+
+t3-watch separates what it can prove from what only someone else can:
+
+- **T3 unreachable from the watcher.** Network errors, 5xx, Cloudflare 530
+  / 1033 and a 401 or 403 without a `WWW-Authenticate: Bearer` challenge
+  (what a tunnel answers while its origin is away, for example
+  `Unauthorized: Tunnel not found`) are an outage, not an auth failure. The
+  watcher keeps retrying, and since only a fresh proof can settle a wait, an
+  outage never ends one as completed. Each thread in the result shows
+  `upstream: {reachable: false, unreachableSince, unreachableForMs,
+  consecutiveFailures, lastError}` while it lasts, `t3-watch status` shows
+  the same per watch, and `--notify-unreachable <dur>` sends
+  `upstream_unreachable` progress once an outage has lasted that long and
+  `upstream_restored` when it ends.
+- **The watcher (or its host) is gone.** A dead or powered-off host cannot
+  report its own death. `--heartbeat <dur>` POSTs a signed `heartbeat`
+  event every `<dur>` with the `watchId`, host, pid, `seq`, start time and
+  each watch's upstream state; the final result carries the same `watchId`.
+  A receiver-side monitor that has seen no heartbeat for about two intervals
+  and no final event should treat the watcher as gone and restart it
+  elsewhere. Heartbeats are best effort and never queued: a missing one is
+  the signal.
+
 
 ### Options
 
@@ -157,17 +333,25 @@ t3-watch wait mcp:launch:abc123 \
 | `--transport auto\|mcp\|local` | Override transport detection |
 | `--env <envId>` | `environmentId` for a peer-linked environment (URLs set it for you) |
 | `--mode all\|any` | Wait for every thread (default) or the first |
+| `--until turn\|workstream` | Completion contract (default `turn`; see [Completion contracts](#completion-contracts)) |
+| `--until-delegated-settled` | Same as `--until workstream` (MCP only; refused for local threads) |
 | `--expect-min-run-ordinal <N>` | Ignore runs older than ordinal N |
-| `--until-delegated-settled` | Also wait for delegated and background work (MCP only; refused for local threads) |
+| `--after-run <runId>` | Ignore that run and older ones (one thread) |
+| `--final-marker <text>` | Also require this text in the final assistant message of the deciding run |
+| `--follow` | Report a failed run as progress and keep following the thread |
+| `--acknowledge <pendingKey>` | Keep waiting past the pending requests this key names |
 | `--timeout <dur>` | Give up after this long (default `4h`) |
 | `--interval <dur>` | Local poll interval (default `5s`) |
-| `--slice <dur>` | MCP long-poll length (default `240s`, capped at `10m`) |
+| `--slice <dur>` | MCP long-poll length (default `60s`, capped at `10m`) |
 | `--no-daemon` | Watch in this process instead of the shared daemon |
 | `--pretty` | Indent the JSON |
 | `--webhook-url-env`, `--webhook-url-file`, `--webhook-url` | Where to POST the result (see above) |
 | `--webhook-header-env <H>=<VAR>`, `--webhook-secret-env`, `--webhook-secret-file` | Extra header and signing secret |
 | `--on-settle <prog>`, `--on-settle-arg <arg>`, `--on-settle-timeout <dur>` | Program to run with the result on stdin |
-| `--notify-on settled\|all` | Which results notify (default `settled`) |
+| `--notify-on <classes>\|all` | Which events notify (default: all but `timeout` and `error`) |
+| `--durable`, `--durable-max-age <dur>` | Keep an undelivered webhook in the outbox and retry it until a 2xx |
+| `--heartbeat <dur>` | POST a signed heartbeat every `<dur>` while waiting |
+| `--notify-unreachable <dur>` | Report an upstream outage once it lasts `<dur>`, and its end |
 
 Durations accept `90`, `90s`, `1500ms`, `5m`, `4h`, `1h30m`.
 
@@ -175,12 +359,15 @@ Durations accept `90`, `90s`, `1500ms`, `5m`, `4h`, `1h30m`.
 
 stdout is always one JSON object.
 
-| Exit | `event` | Meaning |
-| --- | --- | --- |
-| 0 | `settled` | The threads reached a settled status: `completed`, `idle`, `waiting`, `failed`, `error`, `interrupted`, `cancelled`, `stopped` or `rolled_back` |
-| 2 | `error` | Hard failure. `error.kind` is `auth` (401/403 that a reload or refresh could not fix), `not_found`, `fatal`, `usage`, `config`, `limit`, `resource`, `protocol` or `daemon` |
-| 3 | `timeout` | `--timeout` passed first. Each thread shows its last known `status` and any `lastError` |
-| 4 | `settled` | Settled, but a configured notification could not be delivered |
+| Exit | `event` | `outcome` | Meaning |
+| --- | --- | --- | --- |
+| 0 | `settled` | `completed` | Every awaited thread (or the first, with `--mode any`) completed: status `completed` or `idle`, with the contract's requirements met |
+| 6 | `settled` | `failed` | A thread ended `failed`, `error`, `interrupted`, `cancelled`, `stopped` or `rolled_back` |
+| 5 | `needs_input` | `needs_input` | A question or approval waits on a thread (see [When a thread needs input](#when-a-thread-needs-input)) |
+| 3 | `timeout` | `timeout` | `--timeout` passed first. Each thread shows its last known `status`, `lastError` and `upstream` |
+| 2 | `error` | `error` | Hard failure. `error.kind` is `auth` (a token rejection with a bearer challenge that a reload or refresh could not fix), `not_found`, `unsupported`, `fatal`, `usage`, `config`, `limit`, `resource`, `protocol` or `daemon` |
+| 4 | `settled` | `completed` | Completed, but a configured notification could not be delivered or is only queued |
+| 1 | | | Internal |
 
 Statuses are matched against two explicit lists. Active ones (`preparing`,
 `queued`, `starting`, `running`, `resuming`, `cancelling`, `interrupting`,
@@ -188,15 +375,22 @@ Statuses are matched against two explicit lists. Active ones (`preparing`,
 or an empty one, never counts as settled; the thread gets a `diagnostic`
 explaining why.
 
-Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
-`latestRunId`, `runOrdinal`, and when known `title`, `link`,
-`pendingRequestCount`, `resultRunId`, `delegatedSettled` and `diagnostic`.
+Each entry in `threads` has `machine`, `threadId`, `status`, `outcome`,
+`settled`, `latestRunId`, `runOrdinal`, and when known `activeRunId`,
+`title`, `link`, `parentThreadId`, `pendingRequestCount`, `pendingKey`,
+`requests`, `resultRunId`, `delegatedSettled`, `delegatedWorkPending`,
+`finalMarkerSeen`, `upstream`, `lastError` and `diagnostic`.
+
+The top level also has `until`, `startedAt` and `endedAt` (UTC, from the
+waiting client), `elapsedMs` (the client's whole wait), `watchId`, and after
+a daemon restart mid-wait `daemonReconnects` and `registrationElapsedMs`
+(the daemon's time since the last re-registration).
 
 ## How it works
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon.sock ─▶ hub ┤   then t3_thread_read       ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-p2.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -204,22 +398,27 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
 
 - The first `t3-watch wait` starts `t3-watch daemon` in its own session
   (`setsid`), with stdout on `/dev/null`, so the harness never waits on it.
-  The daemon listens on `daemon.sock` in a 0700 directory (`$T3_WATCH_HOME`,
-  else `$XDG_RUNTIME_DIR/t3-watch`, else `~/.config/t3-watch`). A lock file
-  keeps it to one per socket.
+  The daemon listens on `daemon-p2.sock` in a 0700 directory
+  (`$T3_WATCH_HOME`, else `$XDG_RUNTIME_DIR/t3-watch`, else
+  `~/.config/t3-watch`). A lock file keeps it to one per socket. The number
+  in the name changes with the protocol, so a daemon left by an older
+  t3-watch (which would ignore new options and report a failed run as
+  success) never serves a newer client; the old one idles out on its own.
 - Each client sends one request line and blocks in `read()`. It uses no CPU
   and no network until the answer arrives.
 - The daemon keeps one worker per watch key: (origin, pairing, thread,
-  environment, delegated-flag) over MCP, (data dir, `t3` binary, thread)
-  locally. Keys never use the machine name, so renaming or re-pairing a
+  environment, completion mode, final marker) over MCP, (data dir, `t3`
+  binary, thread, final marker) locally. Keys never use the machine name, so renaming or re-pairing a
   machine cannot reuse a stale session. Every client evaluates its own
   condition (`mode`, `--expect-min-run-ordinal`) against the worker's shared
   observations, and the result it prints comes from the same snapshot the
   decision used.
 - A client only accepts observations made after it subscribed, so a cached
   `completed` from an earlier turn can never wake it.
-- The daemon exits 60 seconds after its last client leaves. A killed client is
-  noticed at once (its socket closes) and unsubscribed.
+- The daemon exits 60 seconds after its last client leaves, unless the
+  outbox still holds notifications. A killed client is noticed at once (its
+  socket closes) and unsubscribed. Progress (`run_failed`, outages) reaches
+  the client as extra lines before the final one.
 - When a watch loses its last subscriber, its upstream call is cancelled for
   real, not left to finish: the cycle's HTTP agent is shut down (interrupting
   a blocked long-poll), the server gets MCP `notifications/cancelled` for the
@@ -257,29 +456,35 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
   response, comments included. A server that goes past that gets a retry,
   not the daemon's memory.
 - Each cycle calls `t3_thread_wait` (`timeoutMs` = the slice, plus
-  `untilDelegatedWorkSettled` and `environmentId` when set). If the thread is
-  no longer active, it verifies with `t3_thread_read` (`limit: 1`,
-  `maxCharsPerItem: 200`) before reporting.
-- With `--until-delegated-settled`, settling needs proof bound to the run:
-  `t3_thread_wait` must return `timedOut: false` with a settled status, and
-  its `runId` or `resultRun` must be a run of the watched thread itself
-  (`run:thread:<that thread>:ordinal:N`) at least as new as the `latestRunId`
-  the read sees. A run of another thread, such as a delegated child's
-  `resultRun`, never counts, whatever its ordinal. If a newer run of the
-  thread started in between, t3-watch waits again on that run. Missing
-  `timedOut` or `status` fields never count as proof, and a missing
+  `untilDelegatedWorkSettled` in workstream mode and `environmentId` when
+  set), then always reads the thread header with `t3_thread_read`
+  (`afterPosition` past the end, so no timeline item is returned: reading a
+  delegated child's final result would mark it delivered). Reading after
+  every slice is how a pending request on a `running` thread is noticed.
+- Only when a thread needs input does a cycle read more: the last 40
+  activity items (not for a finished child thread) and
+  `t3_pending_request list`. `--final-marker` reads one message, as
+  described above. Answers are cached until the thread's header changes.
+- The workstream proof is described in [Completion contracts](#completion-contracts).
+  Missing `timedOut` or `status` fields never count as proof, and a missing
   `latestRunId` is unresolved unless the read reports `runCount: 0`.
 - `--expect-min-run-ordinal` only counts a `latestRunId` that belongs to the
   watched thread; a response about another thread never settles.
 - Network errors, 408, 425, 429, 5xx (including Cloudflare's 52x and 530),
-  JSON-RPC internal errors, and tool errors other than not-found, permission
-  and validation errors are retried with exponential backoff and jitter (0.5
-  to 1 s at first, capped at 30 s). They never wake the caller.
+  a 401 or 403 without a bearer challenge or credential error code, JSON-RPC
+  internal errors, and tool errors other than not-found, permission and
+  validation errors are retried with exponential backoff and jitter (0.5 to
+  1 s at first, capped at 30 s). They never wake the caller as completed;
+  the result and `t3-watch status` show the outage (`upstream`).
   A 504 or 524 shortens that watch's long-poll to 90 s, so it finishes before
   Cloudflare's idle limit.
 - A 404 or 400 on a known session re-runs `initialize` once and retries. If
   the fresh session gets the same 400, that is a hard error.
-- On a 401, t3-watch rereads machines.json once (another `auth login` or
+- A 401 or 403 counts as a token rejection only with a
+  `WWW-Authenticate: Bearer` challenge (RFC 6750) or an `invalid_token`,
+  `insufficient_scope` or `invalid_mcp_credential` error in the body, which
+  is what the T3 relay sends.
+- On such a 401, t3-watch rereads machines.json once (another `auth login` or
   another process's refresh may have replaced the token) and, if the server
   issued a refresh token, refreshes it under the config lock and saves the
   result. The outcome is typed:
@@ -290,7 +495,7 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
     config lock, a failed write): the watch keeps going with the usual
     backoff, and `lastError` says why. A refreshed token that could not be
     saved is still used.
-  A 403 exits 2 at once.
+  Such a 403 exits 2 at once.
 
 ### Security
 
@@ -301,8 +506,15 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `settled`,
   written through a fresh `O_EXCL` temp file that is fsynced, renamed and
   followed by an fsync of the directory.
 - t3-watch only requests `orchestration:read` and refuses servers whose
-  metadata lists scopes without it. If a server grants more, t3-watch warns
-  and still only calls `t3_thread_wait` and `t3_thread_read`.
+  metadata lists scopes without it. Whatever a server grants, the MCP client
+  refuses any tool call other than `t3_thread_wait`, `t3_thread_read` and
+  `t3_pending_request` with `action` `list` or `read`; it cannot answer a
+  question, approve, send or interrupt.
+- Pending request text is redacted and bounded before it leaves the
+  machine (see [When a thread needs input](#when-a-thread-needs-input)).
+- Outbox entries hold webhook URLs, headers and signing secrets in 0600
+  files in a 0700 directory, like tokens in machines.json; listings show the
+  destination origin only.
 - Discovery is strict. The protected resource metadata must name
   `<origin>/mcp`, the authorization server metadata (fetched from the RFC 8414
   location, including issuers with a path) must name the same issuer, PKCE
@@ -366,7 +578,9 @@ What they show:
 The remote (MCP) path was not benchmarked against a live relay because that
 needs a browser-approved token. Its deduplication is checked by the
 integration test instead: 20 concurrent daemon clients on one thread make
-exactly 1 `initialize`, 1 `t3_thread_wait` and 1 `t3_thread_read` upstream.
+exactly 1 `initialize`, 1 `t3_thread_wait` and 1 `t3_thread_read` upstream
+(plus, since turn mode reports pending delegated work, one non-blocking
+delegated-work probe).
 
 Measured on `krishs-mini.local` (Apple M6, macOS 27.0.1), rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.9.6, T3 `0.1.7-nightly.20261102.4066`, on 2026-11-06.
 Raw results: [`bench/results/krishs-mini-2026-11-06.json`](bench/results/krishs-mini-2026-11-06.json). Reproduce with `bench/run.py`.
@@ -382,6 +596,10 @@ Raw results: [`bench/results/krishs-mini-2026-11-06.json`](bench/results/krishs-
 | `wait` on a settled thread via the warm daemon, stub `t3` (`sh`), median of 100 | 3.40 ms |
 | Same with `--no-daemon` | 3.29 ms |
 | `wait` on a settled thread via the daemon, real `t3`, median of 10 | 306.0 ms (`t3 thread show` alone: 304.1 ms) |
+
+The benchmarks were measured on an earlier build of the same day; the
+current macOS arm64 release binary is 1,803,776 bytes (1.72 MiB), and the
+Linux x86_64 and aarch64 ones are 2,345,696 and 2,015,152 bytes.
 
 Startup times are wall clock from a Python `subprocess.run` loop, so they include about 1 ms of fork and exec cost; the `/usr/bin/true` row is that floor.
 
@@ -409,7 +627,34 @@ Both tools poll the local `t3` CLI every 8 s (the Python watcher's default) and 
 
 Each of the 20 t3-watch clients reported 0.00 s of CPU for the whole window, which is below the 10 ms resolution of `/usr/bin/time`. All of t3-watch's CPU time is the daemon and the `t3` processes it ran. The watched thread was still `running` at the end, and every watcher timed out rather than settling, so both tools did the same job.
 
-### Checked against the live T3 server on this Mac mini (final build)
+### Checked against the live T3 server on this Mac mini (completion-contract build)
+
+- `e2e/live.sh` (below), 36 checks, all passed on 2026-11-06 against T3
+  `0.1.7-nightly.20261102.4066`: completion with `outcome`, stale ordinals and
+  `--after-run`, local refusal of `--until workstream`, a missing
+  `--final-marker`, shared polling, cancellation back to baseline threads and
+  descriptors, signed webhooks with Authorization and `Idempotency-Key`,
+  heartbeats, a durable delivery queued while the receiver was down and
+  delivered with the same id by `outbox run --once`, hook output in
+  `hooks.log`, and strict discovery against the relay.
+- A real watcher on thread `mcp:launch:398d7180...` (local transport,
+  `--durable --heartbeat 5m --notify-on all`) reported `outcome: completed`
+  at run 3 through the daemon and delivered one signed, authorized `settled`
+  webhook to the loopback receiver. An earlier start with a state directory
+  whose socket path was too long reported that as an `error` event, delivered
+  the same way.
+- The live T3 MCP tools answered the requests this build relies on: a header
+  read with `afterPosition` past the end returns `items: []` with
+  `activeRunId`, `runCount`, `itemCount` and `pendingRequestCount`; an
+  `itemId` read pages one message with `textTruncated`/`nextTextOffset`;
+  `t3_thread_wait` with `untilDelegatedWorkSettled` and `timeoutMs: 1` answers
+  at once, with `resultRun {runId, status}` when settled and without it when
+  timed out.
+
+See [docs/live-integration.md](docs/live-integration.md) for the supported
+plan against paired machines and real bots.
+
+### Checked against the live T3 server on this Mac mini (earlier build)
 
 - Local transport, read-only `t3 thread show`: a completed thread settles in
   about 0.31 s, a stale `ordinal:1` with `--expect-min-run-ordinal 2` keeps
@@ -437,7 +682,7 @@ servers in `tests/`, whose responses copy the shapes the real
 ## Development
 
 ```sh
-cargo test                      # unit, integration, hardening and adversarial tests (about 15 s)
+cargo test                      # unit, integration, hardening, adversarial, workstream and outbox tests (about 30 s)
 cargo clippy --all-targets -- -D warnings
 python3 bench/run.py --thread <a running local thread id> --settled-thread <a settled one>
 ```
@@ -463,7 +708,18 @@ to the run, unknown statuses, strict discovery, concurrent logins, refresh
 and reload on 401, SSE floods, socket and lock-file attacks, re-pairing,
 limits, client-side path resolution, IPC framing, the MCP protocol version
 check and the loopback login's handling of stray requests.
-`tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
+`tests/workstream.rs` covers the completion contracts: the research
+incident (run 2 with four delegated children, synthesis in run 6), a late
+child completion after the proof, an earlier `resultRun`, a child's run as
+`resultRun`, a single turn, `--final-marker` (missing, split across pages,
+local, refused on a child), questions and approvals while `running`,
+`--acknowledge`, failed, interrupted and cancelled runs, a tunnel's 401
+without a challenge, outages reported both ways and on timeout, `--follow`,
+`--after-run` and signed heartbeats. `tests/outbox.rs` covers durable
+delivery: a DNS failure kept privately, a receiver that comes back, a
+SIGKILL mid-delivery, an answer lost after the receiver accepted (duplicates
+with one id), dead letters, and the daemon retrying a needs-input wake
+while staying up. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
 parent run, missing run identity, foreign `latestRunId`s, cancelled
 long-polls checked on the wire (each cancelled before the next starts) and in
 the OS (threads, descriptors, TCP connections back to baseline), killed local
@@ -485,18 +741,28 @@ cargo build --release
 e2e/live.sh <settled-thread-id> <running-thread-id> target/release/t3-watch [relay-origin]
 ```
 
-It checks a real settle, a stale run ordinal, the local delegated-work
-refusal, five waits sharing one poller, killed and timed-out clients leaving
-no watch, no upstream operation and no `t3` process behind, cancelled calls,
-daemon threads and descriptors back to baseline, a signed webhook (settled,
-then timeout with `--notify-on all`) delivered to `e2e/receiver.py` on
-127.0.0.1, an `--on-settle` hook, and optionally strict OAuth discovery
-against a relay. The running thread must stay active for about a minute.
+It checks a real completion, a stale run ordinal and `--after-run`, the
+local workstream refusal, a missing `--final-marker`, five waits sharing one
+poller, killed and timed-out clients leaving no watch, no upstream operation
+and no `t3` process behind, cancelled calls, daemon threads and descriptors
+back to baseline, signed webhooks (completed, timeout with `--notify-on all`,
+heartbeats) delivered to `e2e/receiver.py` on 127.0.0.1 with Authorization
+and `Idempotency-Key` verified, a durable delivery that waits for the
+receiver to come back, an `--on-settle` hook whose output lands in
+`hooks.log`, optionally a thread blocked on input (`WAITING_THREAD=<id>`),
+and optionally strict OAuth discovery against a relay. The running thread
+must stay active for about two minutes.
 
 ## Limitations
 
-- `--until-delegated-settled` needs the MCP transport. The local CLI cannot
-  see delegated work, so local threads are refused with exit 2.
+- `--until workstream` needs the MCP transport and a T3 that returns
+  `resultRun`; without it the wait fails closed (exit 2). Locally, use
+  `--final-marker` with instructions that end the final synthesis with the
+  marker. Neither contract can know about work started after T3 reported the
+  workstream settled.
+- Over MCP, a question or approval on a thread that still says `running` is
+  seen within one `--slice` (default 60 s), not instantly. The local
+  transport reports needs-input without the request text.
 - The local transport costs one `t3 thread show` per watched thread per
   interval, about 0.4 s of CPU on this Mac mini. For many local threads, the
   local server's own MCP endpoint should give long-polling instead
@@ -513,9 +779,14 @@ against a relay. The running thread must stay active for about a minute.
   aarch64 `-unknown-linux-gnu` binaries need glibc 2.17 at most, and clippy
   and the test binaries build for Linux. They have not been executed on Linux
   from this machine.
-- There is no durable outbox: a notification that is still being delivered
-  when the waiting process is killed is lost, and receivers must deduplicate
-  on `X-T3-Watch-Id` themselves.
+- Without `--durable`, a notification still being delivered when the
+  waiting process is killed is lost. With it, delivery is at least once:
+  receivers must deduplicate on `X-T3-Watch-Id` / `Idempotency-Key`. After a
+  reboot, queued entries wait for the next t3-watch command (or a supervised
+  `t3-watch outbox run`). Heartbeats and progress events from before a
+  daemon restart are not replayed.
+- A watcher cannot report its own host's death; that needs a receiver-side
+  monitor of `--heartbeat` events.
 
 ## License
 
