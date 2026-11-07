@@ -20,29 +20,32 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.5.0 (engine 7, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.6.0 (engine 8, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
 Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;
-`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0`, engine 6): this
-build never talks to their daemons (sockets `daemon-e4.sock`,
-`daemon-e5.sock` and `daemon-e6.sock`, or older; on a shared
+`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0`, engine 6; `0.5.0`,
+engine 7): this build never talks to their daemons (sockets
+`daemon-e4.sock` to `daemon-e7.sock`, or older; on a shared
 `T3_WATCH_SOCKET` it refuses them, by engine and by missing capabilities).
 It keeps its entries in `outbox-v4/`, which engine-4 and engine-5 senders
-never read; `0.4.0` uses the same directory with the same rules. Their
-daemons keep serving their own running clients and idle out afterwards; to
-retire one sooner, run its own binary's `t3-watch stop` once its clients
-are done. Do that for a `0.4.0` daemon in particular: its sender still
-removes expired engine-4 entries, which this build keeps (README, "Durable
-delivery", item 8). Entries older builds leave in `outbox-v2/` or
+never read; `0.4.0` and `0.5.0` use the same directory with the same
+rules. Their daemons keep serving their own running clients and idle out
+afterwards; to retire one sooner, run its own binary's `t3-watch stop` once
+its clients are done. Entries older builds leave in `outbox-v2/` or
 `outbox-v3/` are never moved: this build's daemon delivers them in place,
 under their leases and sender lock, so a client of theirs that is still
-running reports its event queued or delivered truthfully (item 7). An
-`outbox-v2/` entry that expires or is dropped stays, marked as the
-sender's, until the trace shows its engine-4 client is done with it
-(item 8). Entries in `outbox/` (before engine 4) move over after the 90 s
-inline grace. All of them count as pending until delivered or retained, so
-the daemon does not idle out with an event unsent.
+running reports its event queued or delivered truthfully (README, "Durable
+delivery", item 7). An `outbox-v2/` entry that expires or is dropped stays
+where its engine-4 client looks, held back so that engine-4, engine-6 and
+engine-7 senders leave it alone too, until the trace shows that client is
+done with it (item 8). A `0.3.0` (engine 5) sender moves such entries
+regardless; it was never released, `outbox list` and `status` report its
+daemon under `incompatibleSenders`, and it must be stopped before engine-4
+clients can rely on retention. Entries in `outbox/` (before engine 4) move
+over after the 90 s inline grace. All of them count as pending until
+delivered or retained, so the daemon does not idle out with an event
+unsent.
 
 `<state>/trace.jsonl` records each wait, the daemon build that served it,
 the first proof or settled observation (with T3's `completedAt`), the
