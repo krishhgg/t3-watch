@@ -143,6 +143,45 @@ Status as reported by the parent (not re-verified from this worktree):
 | Replay of a queued event after receiver downtime (`--durable`) | Pending |
 | Native Linux run of the x86_64 / aarch64 archives | Pending |
 
+## 5. Acceptance harness (completion, needs-input, durable replay)
+
+The release gate is the correct bot's receipt and continuation, with
+timestamps, without a user ping, separately for completion, needs-input and
+durable replay. t3-watch can prove what it did; only the bot's own records
+show what happened after. `e2e/timeline.py` joins the two:
+
+```sh
+# On the watcher host, after the event:
+python3 -I e2e/timeline.py ~/.config/t3-watch/trace.jsonl --watch <watchId from the result> \
+  --receipt <time the bot's routine logged the request> \
+  --continuation <time of the bot's first message or action naming the thread> \
+  --bot <bot name>
+```
+
+It prints each step (run `completedAt`, first proof or settled observation,
+payload end, outbox entry, every HTTP attempt and retry deadline, the 2xx,
+then the receipt and continuation you supply) with the time since
+completion, and a JSON summary to record. It verifies nothing by itself.
+
+Per scenario:
+
+1. **Completion.** A workstream wait with `--durable --notify-on all`, as
+   in step 3c. Record the summary with the bot's receipt and continuation.
+2. **Needs-input.** A thread that asks a question (a test thread told to
+   ask one; never answer it from the watcher). Expect exit 5, a
+   `needs_input` event with the request id and question, and the bot
+   continuing by relaying the question (or answering it, if it is a
+   question the bot may answer; approvals stay with the user).
+3. **Durable replay.** Make the receiver unreachable from the watcher host
+   only (for example a firewall rule for its address), run a wait to
+   completion, confirm `t3-watch outbox list` holds the event and the trace
+   shows failed attempts, restore reachability, and confirm the daemon's
+   `outbox.attempt` with a 2xx, then the bot's receipt and continuation.
+   The event id is the same in every attempt.
+4. **Native Linux.** Unpack the archive on the Linux host, check that
+   `t3-watch --version` prints the expected `rev`, run `e2e/live.sh` there
+   against that host's T3, then scenarios 1 to 3 with that binary.
+
 ## Investigation notes (2026-11-06)
 
 ### The watcher that exited at run 2

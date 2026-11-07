@@ -321,10 +321,22 @@ With `--durable`, a webhook is never fire-and-forget:
    one entry at once, and neither writes over the other's newer state
    (`outbox run --once` reports a leased entry as `inFlight`). A process
    that dies drops its lease, so the sender takes over at once.
-6. Builds before this one kept entries in `outbox/` without leases or
+6. How an entry leaves is written down, never inferred. Before an entry is
+   removed (`delivered`, `dropped`) or moved to `dead/` (`expired`), a
+   receipt `outbox-v2/receipts/<id>.json` (kept 7 days) records the
+   disposition, under the entry's lease. A client that finds its entry gone
+   reports what the receipt says: only `delivered` counts as delivered; an
+   expired, dropped, unreadable or receipt-less entry is
+   `"delivered": false` with its `disposition` (`expired`, `dropped`,
+   `unreadable`, `unknown`), and a completed wait then exits 4.
+7. Builds before this one kept entries in `outbox/` without leases or
    `Retry-After` floors. Their senders never look at `outbox-v2/`. Entries
-   they left behind (older than the 90 s inline grace) are moved into
-   `outbox-v2/` under their own `outbox/sender.lock`.
+   they left behind are moved into `outbox-v2/` under their own
+   `outbox/sender.lock` once older than the 90 s inline grace (a client of
+   that build may still be sending a younger one). Until then they count as
+   pending everywhere: `outbox list` (under `legacy`), `status`
+   (`legacyPending`), the exit code of `outbox run --once`, and the daemon,
+   which stays up until they are migrated and delivered.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -455,9 +467,16 @@ saw the run settled or proven, next to T3's `completedAt`),
 and `Retry-After`, `outbox.queued` with the next attempt time,
 `notify.result`, `outbox.delivered` and `wait.exit` with the exit code.
 Every line carries `at`, `pid`, `engine` and `rev`, and ids, statuses and
-times only: never a URL, header, secret or message text. When a wake comes
-late or never, the trace shows how far the watcher got and when, even if
-its stdout went nowhere.
+times only: never a URL, header, secret or message text. Threads appear as
+parsed ids, never as the arguments given (a thread URL's query can carry a
+token), and messages that echo an argument drop its userinfo, query and
+fragment. Tracing never blocks or fails a wait: the trace, `hooks.log` and
+`daemon.log` are opened non-blocking and only written when they are
+regular files owned by you, so a FIFO or device at one of those paths
+costs log lines, nothing else. When a wake comes late or never, the trace
+shows how far the watcher got and when, even if its stdout went nowhere.
+`e2e/timeline.py <trace.jsonl>` prints one wait's steps with the time since
+the run completed.
 
 ## How it works
 
@@ -814,12 +833,15 @@ an earlier final result, read without touching its timeline.
 `accepted` line on a shared custom socket, no `accepted` line at all, an old
 daemon at the old default socket, this daemon refusing old requests) and
 old outbox senders (migration of their entries, this build's entries out of
-their reach). `tests/delivery.rs` covers closed stdout and stderr together for
+their reach, and a young entry left by a crashed old client kept pending
+and delivered). `tests/delivery.rs` covers closed stdout and stderr together for
 `run_failed`, outage progress, completion and needs-input (with the
 receiver up and down), `Retry-After` across the hand-off and past the
 sender's cap, and the final event persisted while a progress delivery
 hangs, a 429 with `Retry-After` recorded while a slow hook still runs, the
-sender leaving a live inline delivery alone, and the trace and build fields. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
+sender leaving a live inline delivery alone, the trace and build fields, a
+final event that expires unsent reported undelivered (exit 4), no thread
+URL query in the trace, and FIFOs at the trace, hook and daemon logs. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
 parent run, missing run identity, foreign `latestRunId`s, cancelled
 long-polls checked on the wire (each cancelled before the next starts) and in
 the OS (threads, descriptors, TCP connections back to baseline), killed local
