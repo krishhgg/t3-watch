@@ -770,7 +770,9 @@ fn re_pairing_a_machine_never_reuses_the_old_backend() {
 // ---- 10: limits and prompt cleanup -----------------------------------------
 
 #[test]
-fn slice_is_capped_at_ten_minutes() {
+fn slice_is_capped_by_the_attention_interval() {
+    // `--slice` is validated up to ten minutes, but no long-poll outlasts
+    // the 30 s attention interval: only a read sees input on a running run.
     let mock = MockMcp::start();
     mock.set_thread(T, "completed", 1);
     let env = mcp_env(&mock);
@@ -778,7 +780,7 @@ fn slice_is_capped_at_ten_minutes() {
         env.run(&["wait", "--no-daemon", "--slice", "2h", T]).status.code(),
         Some(0)
     );
-    assert_eq!(mock.state.0.lock().unwrap().wait_args[0]["timeoutMs"], 600_000);
+    assert_eq!(mock.state.0.lock().unwrap().wait_args[0]["timeoutMs"], 30_000);
 }
 
 #[test]

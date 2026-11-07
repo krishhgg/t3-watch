@@ -60,6 +60,14 @@ pub struct Hook {
     log: std::path::PathBuf,
 }
 
+/// An event with its id, already in the outbox when `--durable` is on.
+pub struct Prepared {
+    event: String,
+    id: String,
+    body: Vec<u8>,
+    queued: Option<Result<(), String>>,
+}
+
 pub struct Notify {
     webhook: Option<Webhook>,
     hook: Option<Hook>,
@@ -295,12 +303,18 @@ impl Notify {
         self.on.contains(&class_of(event))
     }
 
-    /// Delivers `body` (the result JSON) for `event`. Returns `None` when
-    /// nothing was configured for this event; otherwise a JSON summary with
-    /// an overall `delivered` flag. The webhook and the hook run in parallel.
-    /// With `--durable` the webhook is written to the outbox first, so a
-    /// crash during delivery loses nothing, and stays there until a 2xx.
+    /// Delivers `body` (the result JSON) for `event`: `prepare` then `send`.
+    /// Returns `None` when nothing was configured for this event.
+    #[cfg(test)]
     pub fn deliver(&self, event: &str, body: &[u8]) -> Option<Value> {
+        self.prepare(event, body).map(|p| self.send(p))
+    }
+
+    /// Gives the event its id and, with `--durable`, writes it to the outbox
+    /// before anything is attempted, so a crash or a slow earlier delivery
+    /// from here on loses nothing. `None` when nothing is configured for
+    /// this event.
+    pub fn prepare(&self, event: &str, body: &[u8]) -> Option<Prepared> {
         if self.is_empty() || !self.applies_to(event) {
             return None;
         }
@@ -309,6 +323,26 @@ impl Notify {
             (Some(w), Some(max_age)) => Some(outbox::enqueue(w, event, &id, body, max_age)),
             _ => None,
         };
+        Some(Prepared {
+            event: event.to_string(),
+            id,
+            body: body.to_vec(),
+            queued,
+        })
+    }
+
+    /// Attempts a prepared event: the webhook and the hook in parallel. With
+    /// `--durable` a 2xx removes the outbox entry; anything else hands it to
+    /// the sender, with any server `Retry-After` as its not-before time.
+    /// Returns a JSON summary with an overall `delivered` flag.
+    pub fn send(&self, p: Prepared) -> Value {
+        let Prepared {
+            event,
+            id,
+            body,
+            queued,
+        } = p;
+        let (event, body) = (event.as_str(), body.as_slice());
         let (webhook, hook) = thread::scope(|scope| {
             let web = self.webhook.as_ref().map(|w| {
                 let id = id.as_str();
@@ -331,10 +365,13 @@ impl Notify {
             match queued {
                 Ok(()) if w["delivered"] == true => outbox::remove(&id),
                 Ok(()) => {
-                    let attempts = w["attempts"].as_u64().unwrap_or(0) as u32;
-                    let error = w["error"].as_str().unwrap_or("not delivered").to_string();
-                    let status = w["status"].as_u64().map(|s| s as u16);
-                    match outbox::after_inline_failure(&id, attempts, &error, status) {
+                    let failure = outbox::InlineFailure {
+                        attempts: w["attempts"].as_u64().unwrap_or(0) as u32,
+                        error: w["error"].as_str().unwrap_or("not delivered").to_string(),
+                        status: w["status"].as_u64().map(|s| s as u16),
+                        not_before_ms: w["notBeforeMs"].as_u64(),
+                    };
+                    match outbox::after_inline_failure(&id, &failure) {
                         Ok(()) => {
                             w["queued"] = json!(true);
                             w["outboxId"] = json!(id);
@@ -356,7 +393,7 @@ impl Notify {
         if let Some(h) = hook {
             out["onSettle"] = h;
         }
-        Some(out)
+        out
     }
 
     /// One best-effort heartbeat POST (no retries, never queued): a missing
@@ -478,6 +515,9 @@ fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
     let mut attempts = 0;
     let mut last_error = String::from("no attempt fit in the time budget");
     let mut last_status: Option<u16> = None;
+    // The latest server `Retry-After`, as an absolute time: the outbox
+    // must not send before it, whatever its own backoff says.
+    let mut not_before_ms: Option<u64> = None;
     while attempts < WEBHOOK_ATTEMPTS {
         let remaining = budget_end.saturating_duration_since(Instant::now());
         if remaining < Duration::from_millis(500) {
@@ -490,6 +530,7 @@ fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
             return json!({ "delivered": true, "attempts": attempts, "status": a.status });
         }
         last_error = a.error.unwrap_or_default();
+        not_before_ms = a.retry_after.map(|d| util::now_ms() + d.as_millis() as u64);
         if a.permanent {
             let mut out = json!({ "delivered": false, "attempts": attempts, "error": last_error });
             if let Some(s) = a.status {
@@ -513,6 +554,9 @@ fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
     let mut out = json!({ "delivered": false, "attempts": attempts, "error": last_error });
     if let Some(s) = last_status {
         out["status"] = json!(s);
+    }
+    if let Some(t) = not_before_ms {
+        out["notBeforeMs"] = json!(t);
     }
     out
 }

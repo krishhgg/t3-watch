@@ -98,6 +98,15 @@ pub struct MockState {
     pub omit_result_run: bool,
     /// Turn-mode probes (`timeoutMs: 1` with `untilDelegatedWorkSettled`).
     pub probes: usize,
+    /// After the Nth `t3_thread_read` (1-based) has been answered, move the
+    /// thread to (status, ordinal): a run that starts between two reads of
+    /// one cycle.
+    pub after_read: HashMap<usize, (String, String, u64)>,
+    /// Reads of a delegated child that returned one of its assistant
+    /// messages: T3 marks a child's final result delivered when it is read.
+    pub child_final_reads: usize,
+    /// requestId -> what `t3_pending_request read` returns.
+    pub pending_reads: HashMap<String, Value>,
 }
 
 impl Default for MockState {
@@ -146,6 +155,9 @@ impl Default for MockState {
             parent: HashMap::new(),
             omit_result_run: false,
             probes: 0,
+            after_read: HashMap::new(),
+            child_final_reads: 0,
+            pending_reads: HashMap::new(),
         }
     }
 }
@@ -657,6 +669,13 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                     if let Some(parent) = s.parent.get(&tid) {
                         thread["parentThreadId"] = json!(parent);
                         thread["relationshipToParent"] = json!("subagent");
+                        if items.iter().any(|i| i["type"] == "assistant_message") {
+                            s.child_final_reads += 1;
+                        }
+                    }
+                    let n = s.read_args.len();
+                    if let Some((t, status, ord)) = s.after_read.remove(&n) {
+                        s.threads.insert(t, (status, ord));
                     }
                     Ok(json!({ "thread": merged(thread, &s.read_override),
                                "recentRuns": [], "items": items, "hasMore": false }))
@@ -667,6 +686,10 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
             s.pending_args.push(args.clone());
             match args["action"].as_str() {
                 Some("list") => Ok(json!({ "requestIds": s.pending_ids.get(&tid).cloned().unwrap_or_default() })),
+                Some("read") => args["requestId"]
+                    .as_str()
+                    .and_then(|id| s.pending_reads.get(id).cloned())
+                    .ok_or(()),
                 _ => Err(()),
             }
         }

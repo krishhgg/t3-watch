@@ -36,9 +36,10 @@ fn json_response_settles_after_thread_completes() {
     assert_eq!(mock.calls("initialize"), 1);
     assert_eq!(mock.calls("initialized"), 1);
     assert_eq!(mock.calls("t3_thread_wait"), 1);
-    assert_eq!(mock.calls("t3_thread_read"), 1);
+    // One header read before the first wait, one after it.
+    assert_eq!(mock.calls("t3_thread_read"), 2);
     let args = &mock.state.0.lock().unwrap().wait_args[0];
-    assert_eq!(args["timeoutMs"], 60000);
+    assert_eq!(args["timeoutMs"], 30000);
     assert!(args.get("environmentId").is_none());
 }
 
@@ -234,7 +235,11 @@ fn twenty_daemon_clients_share_one_upstream_long_poll() {
         "20 clients must cost one upstream t3_thread_wait: {calls:?} {}",
         env.status()
     );
-    assert_eq!(mock.calls("t3_thread_read"), 1);
+    assert_eq!(
+        mock.calls("t3_thread_read"),
+        2,
+        "one header read before the wait, one after"
+    );
     assert_eq!(mock.with(|s| s.probes), 1, "one delegated-work probe for all 20");
     assert_eq!(mock.calls("initialize"), 1, "one MCP session for the machine");
 }

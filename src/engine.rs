@@ -39,10 +39,12 @@ pub const MIN_SLICE: Duration = Duration::from_millis(100);
 /// Longest single `t3_thread_wait`. Longer slices only tie up a connection
 /// and outlive most proxies.
 pub const MAX_SLICE: Duration = Duration::from_secs(600);
-/// Default long-poll slice. A question or approval that arrives while the
-/// run still says `running` is only seen by the read after each slice, so
-/// this also bounds how late a needs-input wake can be.
-pub const DEFAULT_SLICE: Duration = Duration::from_secs(60);
+/// Default long-poll slice.
+pub const DEFAULT_SLICE: Duration = Duration::from_secs(30);
+/// Longest time between two header reads of a watch, whatever `--slice`
+/// says: a question or approval on a run that still says `running` does not
+/// end a long-poll, and only a read sees it.
+pub const ATTENTION_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_TARGETS: usize = 256;
 const DEFAULT_MAX_WATCHES: usize = 1024;
 const MAX_MARKER: usize = 256;
@@ -398,6 +400,8 @@ struct Caches {
     /// The latest run the previous read saw, so a later wait is known to
     /// have been issued after that run existed.
     seen_latest: Option<String>,
+    /// The watch has read the header at least once (before its first wait).
+    primed: bool,
 }
 
 struct Watch {
@@ -436,6 +440,7 @@ struct Cycle {
 #[derive(Debug, Default)]
 struct WaitReply {
     thread_id: Option<String>,
+    run_id: Option<String>,
     status: Option<String>,
     timed_out: Option<bool>,
     result_run: Option<String>,
@@ -457,6 +462,7 @@ impl WaitReply {
         };
         WaitReply {
             thread_id: s(v, "threadId"),
+            run_id: s(v, "runId"),
             status: s(v, "status"),
             timed_out: v.get("timedOut").and_then(Value::as_bool),
             result_run,
@@ -524,6 +530,28 @@ fn workstream_proof(thread_id: &str, w: &WaitReply, s: &ThreadState, seen_before
         return Proof::NotYet;
     }
     let idle = s.active_run_id.is_none() && s.class() == StatusClass::Settled;
+    let (result_ord, latest_ord) = (
+        run_ordinal_of(thread_id, result),
+        s.latest_run_id.as_deref().and_then(|l| run_ordinal_of(thread_id, l)),
+    );
+    // The two answers must agree before anything is reported. A header
+    // behind the proof, or one that disagrees with it about the same run,
+    // is re-checked, never settled from either side alone.
+    if let (Some(r), Some(l)) = (result_ord, latest_ord) {
+        if r > l {
+            return Proof::Stale(format!(
+                "T3 proved run {r} settled but the thread header still shows run {l}; re-checking"
+            ));
+        }
+        let success = |st: &str| SUCCESS_STATUSES.contains(&st);
+        if let (true, Some(rs), Some(hs)) = (r == l, w.result_status.as_deref(), s.status.as_deref()) {
+            if success(rs) != success(hs) {
+                return Proof::Stale(format!(
+                    "T3 reports run {r} as {rs} in the proof but {hs} in the thread header; re-checking"
+                ));
+            }
+        }
+    }
     let covered = workstream_covered(thread_id, Some(result), s.latest_run_id.as_deref(), s.run_count);
     if covered && idle {
         return Proof::Proven;
@@ -1239,6 +1267,55 @@ fn same_run(a: &str, b: &str) -> bool {
         )
 }
 
+/// Why a later response in the same cycle (anything with a `thread`
+/// header) contradicts the observation `base`, if it does: another
+/// thread, a different latest run, a run that became active, a changed
+/// status, or input that appeared or went away.
+fn drift(base: &ThreadState, v: &Value) -> Option<String> {
+    v.get("thread").filter(|t| t.is_object())?;
+    let now = ThreadState::from_thread_json(v, &base.thread_id, base.observed_at);
+    let run = |s: &ThreadState| s.ordinal().map_or_else(|| "unknown".to_string(), |n| n.to_string());
+    if now.foreign_thread {
+        return Some("a later read answered for a different thread".into());
+    }
+    let same_latest = match (base.latest_run_id.as_deref(), now.latest_run_id.as_deref()) {
+        (Some(a), Some(b)) => same_run(a, b),
+        (a, b) => a == b,
+    };
+    if !same_latest {
+        return Some(format!(
+            "the thread moved on to run {} while this cycle was checking run {}",
+            run(&now),
+            run(base)
+        ));
+    }
+    if now.active_run_id.is_some() && base.active_run_id.is_none() {
+        return Some(format!(
+            "run {} became active while this cycle was checking it",
+            run(&now)
+        ));
+    }
+    if now.status != base.status {
+        return Some(format!(
+            "the thread's status changed from {} to {} during this cycle",
+            base.status.as_deref().unwrap_or("none"),
+            now.status.as_deref().unwrap_or("none")
+        ));
+    }
+    if now.needs_input() != base.needs_input() {
+        return Some("a request for input appeared or was answered during this cycle".into());
+    }
+    None
+}
+
+/// What the final-marker check found.
+enum MarkerCheck {
+    /// `read`: whether this took reads of its own (not a cached answer).
+    Seen { seen: bool, read: bool },
+    /// A response showed the thread moved on; the reason.
+    Drift(String),
+}
+
 /// `--final-marker` reads the final assistant message, which T3 counts as
 /// delivering a delegated child's result. Refuse it on child threads.
 fn refuse_marker_on_child(state: &ThreadState) -> Result<(), CallError> {
@@ -1499,7 +1576,10 @@ impl Watch {
     /// (always: a pending request can block a run that still says
     /// `running`), then whatever the observation needs: the workstream
     /// proof, pending request details, the turn-mode delegated-work hint,
-    /// the final marker.
+    /// the final marker. Any later response of the cycle that contradicts
+    /// the header (a newer run, active work, a changed status, new input)
+    /// voids the observation: the cycle then reports a fresh header marked
+    /// for re-checking, and the next cycle gets a new proof.
     fn mcp_cycle(&self, client: &McpClient, cancel: &Cancel) -> Result<Cycle, CallError> {
         let WatchKey::Mcp {
             thread_id,
@@ -1518,7 +1598,41 @@ impl Watch {
         if !cancel.add_agent(&agent) {
             return Err(CallError::Cancelled);
         }
-        let slice_ms = self.slice_ms.load(Ordering::Relaxed);
+        let read_header = |at: &mut Instant| -> Result<Value, CallError> {
+            *at = Instant::now();
+            client.call_tool(
+                &agent,
+                cancel,
+                "t3_thread_read",
+                header_args(thread_id, env),
+                Duration::from_secs(30),
+            )
+        };
+
+        // Look before the first wait, so a thread already blocked on input
+        // is reported at once rather than after a long-poll.
+        if !lock(&self.caches).primed {
+            let mut at = Instant::now();
+            let r = read_header(&mut at)?;
+            let mut state = ThreadState::from_thread_json(&r, thread_id, at);
+            {
+                let mut c = lock(&self.caches);
+                c.primed = true;
+                c.seen_latest = state.latest_run_id.clone();
+            }
+            if state.needs_input() {
+                self.fill_pending(client, &agent, cancel, &mut state, env)?;
+                return Ok(Cycle {
+                    state,
+                    next: Next::Immediately,
+                });
+            }
+        }
+
+        let slice_ms = self
+            .slice_ms
+            .load(Ordering::Relaxed)
+            .min(ATTENTION_INTERVAL.as_millis() as u64);
         let mut args = with_env(json!({ "threadId": thread_id, "timeoutMs": slice_ms }), env);
         if *until_delegated {
             args["untilDelegatedWorkSettled"] = json!(true);
@@ -1534,14 +1648,8 @@ impl Watch {
         let w = WaitReply::parse(&raw);
         let seen_before = lock(&self.caches).seen_latest.clone();
 
-        let read_started = Instant::now();
-        let r = client.call_tool(
-            &agent,
-            cancel,
-            "t3_thread_read",
-            header_args(thread_id, env),
-            Duration::from_secs(30),
-        )?;
+        let mut read_started = Instant::now();
+        let r = read_header(&mut read_started)?;
         let mut state = ThreadState::from_thread_json(&r, thread_id, read_started);
         lock(&self.caches).seen_latest = state.latest_run_id.clone();
         let mut next = if w.timed_out == Some(true) {
@@ -1552,6 +1660,7 @@ impl Watch {
 
         if *until_delegated {
             state.result_run_id = w.result_run.clone();
+            state.result_status = w.result_status.clone();
             match workstream_proof(thread_id, &w, &state, seen_before.as_deref()) {
                 Proof::Proven => state.delegated_settled = true,
                 Proof::NotYet => {}
@@ -1574,28 +1683,87 @@ impl Watch {
         }
 
         if state.needs_input() {
-            self.fill_pending(client, &agent, cancel, &mut state, env)?;
+            if let Some(reason) = self.fill_pending(client, &agent, cancel, &mut state, env)? {
+                return self.recheck(client, &agent, cancel, reason, env);
+            }
         }
 
         let settled_ok = success_status(&state) && state.active_run_id.is_none();
         if !*until_delegated && settled_ok {
-            state.delegated_pending_hint = self.probe_delegated(client, &agent, cancel, &state, env)?;
+            let (hint, drift) = self.probe_delegated(client, &agent, cancel, &state, env)?;
+            if let Some(reason) = drift {
+                return self.recheck(client, &agent, cancel, reason, env);
+            }
+            state.delegated_pending_hint = hint;
         }
         if let Some(marker) = final_marker {
             if settled_ok && (!*until_delegated || state.delegated_settled) {
                 refuse_marker_on_child(&state)?;
                 if let Some(run) = state.deciding_run().map(str::to_string) {
-                    state.marker_seen = Some(self.marker_seen(client, &agent, cancel, &state, &run, marker, env)?);
+                    match self.marker_seen(client, &agent, cancel, &state, &run, marker, env)? {
+                        MarkerCheck::Drift(reason) => return self.recheck(client, &agent, cancel, reason, env),
+                        MarkerCheck::Seen { seen, read } => {
+                            state.marker_seen = Some(seen);
+                            // The marker came from separate reads: confirm
+                            // the thread is still where the header said.
+                            if read {
+                                let mut at = Instant::now();
+                                let again = read_header(&mut at)?;
+                                if let Some(reason) = drift(&state, &again) {
+                                    return self.recheck(client, &agent, cancel, reason, env);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         Ok(Cycle { state, next })
     }
 
-    /// Fills in which questions or approvals are pending, from the end of
-    /// the activity timeline and `t3_pending_request list` (read-only;
-    /// approvals are not listed there). Failures leave the details empty:
-    /// the count alone still wakes the caller.
+    /// The cycle's observation was contradicted by a later response: report
+    /// a fresh header instead, marked so it can show input but never
+    /// complete or fail, and wait again right away for a new proof.
+    fn recheck(
+        &self,
+        client: &McpClient,
+        agent: &ureq::Agent,
+        cancel: &Cancel,
+        reason: String,
+        env: Option<&String>,
+    ) -> Result<Cycle, CallError> {
+        let WatchKey::Mcp { thread_id, .. } = &self.key else {
+            unreachable!("MCP backend with a local key");
+        };
+        let at = Instant::now();
+        let r = client.call_tool(
+            agent,
+            cancel,
+            "t3_thread_read",
+            header_args(thread_id, env),
+            Duration::from_secs(30),
+        )?;
+        let mut state = ThreadState::from_thread_json(&r, thread_id, at);
+        lock(&self.caches).seen_latest = state.latest_run_id.clone();
+        state.recheck = Some(format!("{reason}; checking again"));
+        if state.needs_input() {
+            // Whatever it reports now, input is input.
+            let _ = self.fill_pending(client, agent, cancel, &mut state, env)?;
+        }
+        Ok(Cycle {
+            state,
+            next: Next::Rewait,
+        })
+    }
+
+    /// Fills in which questions or approvals are pending, from
+    /// `t3_pending_request` (read-only; it lists questions, not approvals)
+    /// and, for a thread that is not a delegated child, the end of its
+    /// activity timeline. A child's timeline is never read: it can hold the
+    /// final results of its earlier runs, and T3 marks a child's final
+    /// result as delivered when it is read. Failures leave the details
+    /// empty: the count alone still wakes the caller. Returns why the
+    /// timeline's own header contradicts `state`, if it does.
     fn fill_pending(
         &self,
         client: &McpClient,
@@ -1603,7 +1771,7 @@ impl Watch {
         cancel: &Cancel,
         state: &mut ThreadState,
         env: Option<&String>,
-    ) -> Result<(), CallError> {
+    ) -> Result<Option<String>, CallError> {
         let key = format!(
             "{:?}|{:?}|{:?}|{:?}",
             state.item_count, state.pending_requests, state.status, state.latest_run_id
@@ -1612,7 +1780,7 @@ impl Watch {
             if *k == key {
                 state.requests = requests.clone();
                 state.pending_ids = ids.clone();
-                return Ok(());
+                return Ok(None);
             }
         }
         let mut complete = true;
@@ -1634,9 +1802,32 @@ impl Watch {
             Err(CallError::Cancelled) => return Err(CallError::Cancelled),
             Err(_) => complete = false,
         }
-        // A finished child's timeline holds its final result; leave it unread.
-        let finished_child = state.parent_thread_id.is_some() && success_status(state);
-        if !finished_child {
+        if state.parent_thread_id.is_some() {
+            // Questions one by one, through the read-only `read` action.
+            let mut requests = Vec::new();
+            for id in state.pending_ids.iter().take(5) {
+                let args = with_env(
+                    json!({ "action": "read", "threadId": state.thread_id, "requestId": id }),
+                    env,
+                );
+                let questions =
+                    match client.call_tool(agent, cancel, "t3_pending_request", args, Duration::from_secs(30)) {
+                        Ok(v) => questions_from_request(&v),
+                        Err(CallError::Cancelled) => return Err(CallError::Cancelled),
+                        Err(_) => {
+                            complete = false;
+                            Vec::new()
+                        }
+                    };
+                requests.push(crate::model::PendingRequest {
+                    kind: "question".into(),
+                    item_id: format!("turn-item:runtime-request:{}", util::pct_encode(id)),
+                    request_id: Some(id.clone()),
+                    questions,
+                });
+            }
+            state.requests = requests;
+        } else {
             let mut args = json!({
                 "threadId": state.thread_id,
                 "view": "activity",
@@ -1654,6 +1845,9 @@ impl Watch {
                 Duration::from_secs(30),
             ) {
                 Ok(v) => {
+                    if let Some(reason) = drift(state, &v) {
+                        return Ok(Some(reason));
+                    }
                     let items = v.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
                     state.requests = pending_from_activity(&items);
                 }
@@ -1664,11 +1858,14 @@ impl Watch {
         if complete {
             lock(&self.caches).pending = Some((key, state.requests.clone(), state.pending_ids.clone()));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Turn mode only: asks T3, without waiting, whether delegated work the
-    /// finished turn started is still running. A hint for the caller.
+    /// finished turn started is still running. A hint for the caller. Also
+    /// returns why the answer contradicts the header, when it names a newer
+    /// run of this thread (its status is not used for that: a timed-out
+    /// probe may describe the delegated work rather than the parent run).
     fn probe_delegated(
         &self,
         client: &McpClient,
@@ -1676,14 +1873,14 @@ impl Watch {
         cancel: &Cancel,
         state: &ThreadState,
         env: Option<&String>,
-    ) -> Result<Option<bool>, CallError> {
+    ) -> Result<(Option<bool>, Option<String>), CallError> {
         let Some(run) = state.latest_run_id.clone() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if let Some((r, pending)) = &lock(&self.caches).probe {
             // Pending work only ever becomes settled, so re-ask until it is.
             if *r == run && !*pending {
-                return Ok(Some(false));
+                return Ok((Some(false), None));
             }
         }
         let args = with_env(
@@ -1693,12 +1890,29 @@ impl Watch {
         match client.call_tool(agent, cancel, "t3_thread_wait", args, Duration::from_secs(30)) {
             Ok(v) => {
                 let w = WaitReply::parse(&v);
+                let newer = w
+                    .run_id
+                    .as_deref()
+                    .and_then(|r| run_ordinal_of(&state.thread_id, r))
+                    .zip(state.ordinal())
+                    .is_some_and(|(probe, seen)| probe > seen);
+                if newer {
+                    let probe_run = w.run_id.as_deref().unwrap_or_default();
+                    return Ok((
+                        None,
+                        Some(format!(
+                            "the delegated-work probe saw {} after the header showed run {}",
+                            util::sanitize_text(probe_run, 160),
+                            state.ordinal().unwrap_or(0)
+                        )),
+                    ));
+                }
                 let pending = w.timed_out == Some(true) || w.class() == Some(StatusClass::Active);
                 lock(&self.caches).probe = Some((run, pending));
-                Ok(Some(pending))
+                Ok((Some(pending), None))
             }
             Err(CallError::Cancelled) => Err(CallError::Cancelled),
-            Err(_) => Ok(None),
+            Err(_) => Ok((None, None)),
         }
     }
 
@@ -1715,11 +1929,14 @@ impl Watch {
         run: &str,
         marker: &str,
         env: Option<&String>,
-    ) -> Result<bool, CallError> {
+    ) -> Result<MarkerCheck, CallError> {
         let key = format!("{run}|{:?}", state.item_count);
         if let Some((k, seen)) = &lock(&self.caches).marker {
             if *k == key {
-                return Ok(*seen);
+                return Ok(MarkerCheck::Seen {
+                    seen: *seen,
+                    read: false,
+                });
             }
         }
         let mut args = json!({
@@ -1740,6 +1957,9 @@ impl Watch {
                 with_env(args.clone(), env),
                 Duration::from_secs(30),
             )?;
+            if let Some(reason) = drift(state, &v) {
+                return Ok(MarkerCheck::Drift(reason));
+            }
             for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
                 let is_final = item.get("type").and_then(Value::as_str) == Some("assistant_message")
                     && item
@@ -1770,6 +1990,9 @@ impl Watch {
                         env,
                     );
                     let v = client.call_tool(agent, cancel, "t3_thread_read", page, Duration::from_secs(30))?;
+                    if let Some(reason) = drift(state, &v) {
+                        return Ok(MarkerCheck::Drift(reason));
+                    }
                     let Some(item) = v.get("items").and_then(Value::as_array).and_then(|a| a.first()) else {
                         break;
                     };
@@ -1798,8 +2021,28 @@ impl Watch {
             }
         };
         lock(&self.caches).marker = Some((key, seen));
-        Ok(seen)
+        Ok(MarkerCheck::Seen { seen, read: true })
     }
+}
+
+/// Question details from a `t3_pending_request read` answer. The shape is
+/// read defensively: a `questions` array (possibly under `request`), or the
+/// same JSON text an activity item carries. Unknown shapes give nothing.
+fn questions_from_request(v: &Value) -> Vec<Value> {
+    let body = v.get("request").filter(|r| r.is_object()).unwrap_or(v);
+    let text = match body.get("questions") {
+        Some(q @ Value::Array(_)) => q.to_string(),
+        _ => match body.get("text").and_then(Value::as_str) {
+            Some(t) => t.to_string(),
+            None => return Vec::new(),
+        },
+    };
+    let item = json!({ "type": "user_input_request", "status": "pending", "text": text });
+    pending_from_activity(&[item])
+        .into_iter()
+        .next()
+        .map(|r| r.questions)
+        .unwrap_or_default()
 }
 
 fn success_status(s: &ThreadState) -> bool {
@@ -1974,6 +2217,44 @@ mod tests {
             ),
             Proof::Proven
         );
+    }
+
+    #[test]
+    fn any_later_response_that_contradicts_the_header_is_drift() {
+        let base = read(json!({"threadId": T, "status": "completed", "latestRunId": run(T, 2), "runCount": 2}));
+        let header = |t: Value| json!({ "thread": t, "items": [] });
+        let same = header(json!({"threadId": T, "status": "completed", "latestRunId": run(T, 2)}));
+        assert_eq!(drift(&base, &same), None);
+        assert_eq!(
+            drift(&base, &json!({"requestIds": []})),
+            None,
+            "no header, nothing to compare"
+        );
+        for (t, why) in [
+            (
+                json!({"threadId": T, "status": "running", "latestRunId": run(T, 3), "activeRunId": run(T, 3)}),
+                "moved on",
+            ),
+            (
+                json!({"threadId": T, "status": "completed", "latestRunId": run(T, 2), "activeRunId": run(T, 2)}),
+                "active",
+            ),
+            (
+                json!({"threadId": T, "status": "failed", "latestRunId": run(T, 2)}),
+                "status",
+            ),
+            (
+                json!({"threadId": T, "status": "completed", "latestRunId": run(T, 2), "pendingRequestCount": 1}),
+                "input",
+            ),
+            (
+                json!({"threadId": "other", "status": "completed", "latestRunId": run(T, 2)}),
+                "different thread",
+            ),
+        ] {
+            let d = drift(&base, &header(t.clone())).unwrap_or_else(|| panic!("no drift for {t}"));
+            assert!(d.contains(why), "{d}");
+        }
     }
 
     #[test]

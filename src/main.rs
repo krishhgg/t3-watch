@@ -69,7 +69,8 @@ WAIT OPTIONS
                                    this key (from a needs_input result)
       --timeout <DUR>              give up after DUR (default 4h)
       --interval <DUR>             local poll interval (default 5s)
-      --slice <DUR>                mcp long-poll length (default 60s, at most 10m)
+      --slice <DUR>                mcp long-poll length (default 30s; no long-poll
+                                   exceeds 30s, so input is seen within about 30s)
       --base-dir <DIR>             T3 data dir for local (default $T3CODE_HOME or ~/.t3)
       --t3-bin <PATH>              T3 CLI for local (default: newest under base dir)
       --no-daemon                  watch in this process instead of the shared daemon
@@ -184,7 +185,7 @@ fn parse_args(raw: &[String], value_opts: &[&'static str], flag_opts: &[&'static
 }
 
 fn usage_error(msg: &str) -> ! {
-    eprintln!("t3-watch: {msg}\nRun `t3-watch --help` for usage.");
+    util::warn(&format!("t3-watch: {msg}\nRun `t3-watch --help` for usage."));
     exit(2)
 }
 
@@ -595,18 +596,36 @@ fn cmd_wait(raw: &[String]) -> ! {
     let threads: Vec<String> = a.positional.clone();
     let host = hostname();
 
-    // Progress notifications go out from their own thread, in order, so a
-    // slow receiver never stops this process from reading the daemon.
-    let (progress_tx, progress_rx) = mpsc::channel::<Value>();
+    // Every event of this wait, progress and final, gets the next
+    // `eventSeq`, so a receiver can order them however they arrive (an
+    // outbox retry can land after a later event).
+    let event_seq = std::cell::Cell::new(0u64);
+    let next_seq = || {
+        event_seq.set(event_seq.get() + 1);
+        event_seq.get()
+    };
+
+    // Progress events are prepared (with --durable: persisted) as they
+    // happen, then sent from their own thread, in order, so a slow
+    // receiver never stops this process from reading the daemon. If that
+    // thread cannot start, they are sent inline instead, never dropped.
+    let (progress_tx, progress_rx) = mpsc::channel::<notify::Prepared>();
     let progress_sender = {
         let notify = notify.clone();
         util::spawn_thread("progress", 128 * 1024, move || {
             for p in progress_rx {
-                let event = p["event"].as_str().unwrap_or("progress").to_string();
-                let _ = notify.deliver(&event, p.to_string().as_bytes());
+                let _ = notify.send(p);
             }
         })
-        .ok()
+    };
+    let (progress_tx, progress_sender) = match progress_sender {
+        Ok(handle) => (Some(progress_tx), Some(handle)),
+        Err(e) => {
+            util::warn(&format!(
+                "t3-watch: cannot start the progress sender ({e}); progress notifications are sent inline"
+            ));
+            (None, None)
+        }
     };
     // A daemon reconnect re-registers the wait, which may report the same
     // failed run again; pass each one on once.
@@ -619,8 +638,23 @@ fn cmd_wait(raw: &[String]) -> ! {
             }
         }
         p["watchId"] = json!(watch_id);
-        eprintln!("t3-watch: progress {p}");
-        let _ = progress_tx.send(p);
+        p["eventSeq"] = json!(next_seq());
+        p["emittedAt"] = json!(util::rfc3339_ms(util::now_ms()));
+        let event = p["event"].as_str().unwrap_or("progress").to_string();
+        // Persist first; the diagnostic line is best effort and comes last.
+        if let Some(prepared) = notify.prepare(&event, p.to_string().as_bytes()) {
+            match &progress_tx {
+                Some(tx) => {
+                    if let Err(mpsc::SendError(prepared)) = tx.send(prepared) {
+                        let _ = notify.send(prepared);
+                    }
+                }
+                None => {
+                    let _ = notify.send(prepared);
+                }
+            }
+        }
+        util::warn(&format!("t3-watch: progress {p}"));
     };
 
     // From here on the notification config is valid, so every failure,
@@ -676,14 +710,12 @@ fn cmd_wait(raw: &[String]) -> ! {
     if let Some(h) = heartbeat {
         h.stop();
     }
-    // Progress notifications go out before the final one.
-    drop(progress_tx);
-    if let Some(sender) = progress_sender {
-        let _ = sender.join();
-    }
 
     let mut code = outcome.exit_code();
     let event = outcome.event();
+    // The final event is prepared (with --durable: persisted) before
+    // waiting for any progress delivery still in flight.
+    let mut prepared = None;
     if let Some(v) = outcome.json_mut() {
         if let Some(daemon_elapsed) = v.get("elapsedMs").cloned() {
             if reconnects > 0 {
@@ -694,22 +726,31 @@ fn cmd_wait(raw: &[String]) -> ! {
         v["startedAt"] = json!(util::rfc3339_ms(started_ms));
         v["endedAt"] = json!(util::rfc3339_ms(util::now_ms()));
         v["watchId"] = json!(watch_id);
+        v["eventSeq"] = json!(next_seq());
         if reconnects > 0 {
             v["daemonReconnects"] = json!(reconnects);
         }
-        let body = v.to_string().into_bytes();
-        if let Some(summary) = notify.deliver(event, &body) {
-            if summary["delivered"] == false && code == engine::EXIT_COMPLETED {
-                code = EXIT_NOTIFY_FAILED;
-            }
-            if summary["queued"] == true && !no_daemon {
-                // The daemon sends queued notifications; make sure it runs.
-                if let Err(e) = daemon::ensure_running() {
-                    eprintln!("t3-watch: cannot start the daemon to send the queued notification: {e}");
-                }
-            }
-            v["notification"] = summary;
+        prepared = notify.prepare(event, v.to_string().as_bytes());
+    }
+    // Earlier progress goes out (or is queued) before the final event.
+    drop(progress_tx);
+    if let Some(sender) = progress_sender {
+        let _ = sender.join();
+    }
+    if let (Some(p), Some(v)) = (prepared, outcome.json_mut()) {
+        let summary = notify.send(p);
+        if summary["delivered"] == false && code == engine::EXIT_COMPLETED {
+            code = EXIT_NOTIFY_FAILED;
         }
+        if summary["queued"] == true && !no_daemon {
+            // The daemon sends queued notifications; make sure it runs.
+            if let Err(e) = daemon::ensure_running() {
+                util::warn(&format!(
+                    "t3-watch: cannot start the daemon to send the queued notification: {e}"
+                ));
+            }
+        }
+        v["notification"] = summary;
     }
     if let Some(v) = outcome.json() {
         print_json(v, pretty);
@@ -755,7 +796,7 @@ fn cmd_outbox(raw: &[String]) -> ! {
             }
             Err(e) => fail_json("outbox", &e),
         },
-        "run" => outbox::run_forever(&|line| eprintln!("t3-watch: {line}")),
+        "run" => outbox::run_forever(&|line| util::warn(&format!("t3-watch: {line}"))),
         "drop" => {
             let [id] = a.positional.as_slice() else {
                 usage_error("outbox drop needs one entry id")
@@ -882,7 +923,7 @@ fn main() {
                 .and_then(|s| util::parse_duration(&s).ok());
             let idle = parse_dur(&a, "idle-exit", env_idle.unwrap_or(daemon::DEFAULT_IDLE_EXIT));
             if let Err(e) = daemon::run(idle) {
-                eprintln!("t3-watch daemon: {e}");
+                util::warn(&format!("t3-watch daemon: {e}"));
                 exit(1)
             }
         }

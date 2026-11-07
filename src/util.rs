@@ -17,6 +17,16 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Writes a diagnostic line to stderr, best effort. `eprintln!` panics when
+/// stderr is a closed pipe; a diagnostic must never cost an event, a
+/// notification or an exit code.
+pub fn warn(msg: &str) {
+    let mut line = String::with_capacity(msg.len() + 1);
+    line.push_str(msg);
+    line.push('\n');
+    let _ = io::stderr().lock().write_all(line.as_bytes());
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

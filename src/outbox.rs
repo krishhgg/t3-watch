@@ -7,6 +7,9 @@
 //! daemon (or as `t3-watch outbox run`) and retries with exponential
 //! backoff, capped at five minutes, until a 2xx or the entry's expiry, when
 //! it moves to `outbox/dead/`. One sender at a time holds `outbox/sender.lock`.
+//! A server's `Retry-After` is a floor, not a suggestion: it is stored as the
+//! entry's `notBefore` (across the hand-off from the client to the sender
+//! too) and neither the backoff cap nor `outbox run --once` sends earlier.
 //!
 //! Every attempt for an entry carries the same `X-T3-Watch-Id` and
 //! `Idempotency-Key`, so a receiver that got a request but whose answer was
@@ -48,8 +51,18 @@ pub struct Entry {
     /// The sender's own retries, which set the backoff.
     pub retries: u32,
     pub next_attempt_ms: u64,
+    /// The receiver's `Retry-After`, as an absolute time. Never sent before.
+    pub not_before_ms: Option<u64>,
     pub last_error: Option<String>,
     pub last_status: Option<u16>,
+}
+
+/// What the client's inline attempts ended with.
+pub struct InlineFailure {
+    pub attempts: u32,
+    pub error: String,
+    pub status: Option<u16>,
+    pub not_before_ms: Option<u64>,
 }
 
 impl Entry {
@@ -67,6 +80,7 @@ impl Entry {
             "attempts": self.attempts,
             "retries": self.retries,
             "nextAttemptMs": self.next_attempt_ms,
+            "notBeforeMs": self.not_before_ms,
             "lastError": self.last_error,
             "lastStatus": self.last_status,
         })
@@ -93,6 +107,7 @@ impl Entry {
             attempts: n("attempts").unwrap_or(0) as u32,
             retries: n("retries").unwrap_or(0) as u32,
             next_attempt_ms: n("nextAttemptMs").unwrap_or(0),
+            not_before_ms: n("notBeforeMs"),
             last_error: s("lastError"),
             last_status: n("lastStatus").map(|s| s as u16),
         })
@@ -117,6 +132,7 @@ impl Entry {
             "attempts": self.attempts,
             "retries": self.retries,
             "nextAttemptAt": util::rfc3339_ms(self.next_attempt_ms),
+            "notBefore": self.not_before_ms.map(util::rfc3339_ms),
             "lastError": self.last_error,
             "lastStatus": self.last_status,
         })
@@ -167,18 +183,20 @@ pub fn enqueue(w: &Webhook, event: &str, id: &str, body: &[u8], max_age: Duratio
         attempts: 0,
         retries: 0,
         next_attempt_ms: now + INLINE_GRACE.as_millis() as u64,
+        not_before_ms: None,
         last_error: None,
         last_status: None,
     })
 }
 
 /// The inline attempts failed: hand the entry to the sender right away.
-pub fn after_inline_failure(id: &str, attempts: u32, error: &str, status: Option<u16>) -> Result<(), String> {
+pub fn after_inline_failure(id: &str, f: &InlineFailure) -> Result<(), String> {
     let mut e = load(id).ok_or("the outbox entry disappeared")?;
-    e.attempts += attempts;
-    e.last_error = Some(error.to_string());
-    e.last_status = status;
-    e.next_attempt_ms = util::now_ms() + BASE_DELAY.as_millis() as u64;
+    e.attempts += f.attempts;
+    e.last_error = Some(f.error.clone());
+    e.last_status = f.status;
+    e.not_before_ms = f.not_before_ms;
+    e.next_attempt_ms = (util::now_ms() + BASE_DELAY.as_millis() as u64).max(f.not_before_ms.unwrap_or(0));
     save(&e)
 }
 
@@ -228,9 +246,10 @@ fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
     jitter.backoff(attempts.saturating_sub(1), BASE_DELAY, MAX_DELAY)
 }
 
-/// One pass over the outbox: sends what is due (everything, with `force`),
-/// moves expired entries to `dead/`. Returns per-entry results. Holds the
-/// sender lock for the pass; if another sender has it, does nothing.
+/// One pass over the outbox: sends what is due (with `force`, everything
+/// the receiver has not asked to hold back with `Retry-After`), moves
+/// expired entries to `dead/`. Returns per-entry results. Holds the sender
+/// lock for the pass; if another sender has it, does nothing.
 pub fn pass(force: bool) -> Result<Vec<Value>, String> {
     if !dir().is_dir() {
         return Ok(Vec::new());
@@ -248,6 +267,11 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
         if now >= e.expires_ms {
             dead_letter(&e);
             results.push(json!({ "id": e.id, "deadLettered": true, "attempts": e.attempts }));
+            continue;
+        }
+        if let Some(t) = e.not_before_ms.filter(|t| now < *t) {
+            results.push(json!({ "id": e.id, "deferred": true, "notBefore": util::rfc3339_ms(t),
+                                 "reason": "the receiver asked for this delay (Retry-After)" }));
             continue;
         }
         if !force && now < e.next_attempt_ms {
@@ -272,11 +296,11 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
         }
         e.last_error = a.error;
         e.last_status = a.status;
-        let delay = a
-            .retry_after
-            .unwrap_or_else(|| backoff(e.retries, &mut jitter))
-            .min(MAX_DELAY);
-        e.next_attempt_ms = util::now_ms() + delay.as_millis() as u64;
+        // Only our own backoff is capped; the receiver's delay is a floor.
+        let now = util::now_ms();
+        e.not_before_ms = a.retry_after.map(|d| now + d.as_millis() as u64);
+        let own = now + backoff(e.retries, &mut jitter).min(MAX_DELAY).as_millis() as u64;
+        e.next_attempt_ms = own.max(e.not_before_ms.unwrap_or(0));
         let saved = save(&e);
         results.push(json!({
             "id": e.id,
@@ -297,7 +321,10 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
     loop {
         match pass(false) {
             Ok(results) => {
-                for r in results.iter().filter(|r| r.get("id").is_some()) {
+                for r in results
+                    .iter()
+                    .filter(|r| r.get("id").is_some() && r.get("deferred").is_none())
+                {
                     log(&format!("outbox: {r}"));
                 }
             }
@@ -334,6 +361,7 @@ mod tests {
             attempts: 3,
             retries: 1,
             next_attempt_ms: 4,
+            not_before_ms: Some(5),
             last_error: Some("host not found".into()),
             last_status: None,
         };

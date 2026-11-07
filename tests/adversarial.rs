@@ -112,8 +112,6 @@ fn a_childs_result_run_never_proves_a_newer_parent_run() {
 fn a_parent_proof_of_the_run_the_read_saw_settles() {
     for proof in [
         json!({"resultRun": {"runId": format!("run:thread:{P}:ordinal:2"), "status": "completed"}}),
-        // resultRun may name a later run of the same thread.
-        json!({"runId": format!("run:thread:{P}:ordinal:1"), "resultRun": {"runId": format!("run:thread:{P}:ordinal:3")}}),
         // Percent-encoded thread ids are the same identity.
         json!({"resultRun": {"runId": "run:thread:mcp%3Alaunch%3Aparent:ordinal:2", "status": "completed"}}),
     ] {
@@ -125,6 +123,26 @@ fn a_parent_proof_of_the_run_the_read_saw_settles() {
         assert_eq!(v["threads"][0]["delegatedSettled"], true);
         assert_eq!(v["until"], "workstream");
     }
+}
+
+#[test]
+fn a_proof_ahead_of_the_header_is_rechecked_not_settled() {
+    // resultRun names run 3 but the header read after it still shows run 2:
+    // the two answers disagree, so nothing is reported from either alone.
+    let mock = MockMcp::start();
+    mock.set_thread(P, "completed", 2);
+    mock.with(|s| {
+        s.wait_override.insert(
+            "resultRun".into(),
+            json!({"runId": format!("run:thread:{P}:ordinal:3"), "status": "completed"}),
+        );
+    });
+    let (code, v) = delegated(&mock, "1500ms");
+    assert_eq!(code, Some(3), "{v}");
+    assert!(v["threads"][0]["diagnostic"]
+        .as_str()
+        .unwrap()
+        .contains("still shows run 2"));
 }
 
 #[test]

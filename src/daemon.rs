@@ -44,7 +44,11 @@ const DEFAULT_MAX_CONNECTIONS: usize = 512;
 const CONTROL_HEADROOM: usize = 64;
 
 fn log(msg: &str) {
-    eprintln!("[{}] t3-watch daemon {}: {msg}", util::now_ms(), std::process::id());
+    util::warn(&format!(
+        "[{}] t3-watch daemon {}: {msg}",
+        util::now_ms(),
+        std::process::id()
+    ));
 }
 
 fn check_socket_path(sock: &Path) -> Result<(), String> {

@@ -178,9 +178,9 @@ fn a_late_child_completion_after_the_proof_is_waited_on() {
 
 #[test]
 fn an_earlier_result_run_settles_once_a_wait_covers_the_latest_run() {
-    // T3 may name an earlier run as holding the final answer. The first
-    // wait was sent before the watcher had seen run 5, so it proves nothing
-    // about run 5; the next one, sent after, does.
+    // T3 may name an earlier run as holding the final answer. A wait sent
+    // before the watcher had seen run 5 would prove nothing about run 5;
+    // one sent after does.
     let mock = MockMcp::start();
     mock.set_thread(P, "completed", 5);
     mock.with(|s| {
@@ -195,11 +195,9 @@ fn an_earlier_result_run_settles_once_a_wait_covers_the_latest_run() {
     let v = output_json(&out);
     assert_eq!(v["threads"][0]["resultRunId"], run_id(P, 4));
     assert_eq!(v["threads"][0]["runOrdinal"], 5);
-    assert_eq!(
-        mock.calls("t3_thread_wait"),
-        2,
-        "settles on the second wait, not the first"
-    );
+    // The watch reads the header before its first wait, so that wait was
+    // sent after run 5 was seen and is proof for it.
+    assert_eq!(mock.calls("t3_thread_wait"), 1);
 }
 
 #[test]

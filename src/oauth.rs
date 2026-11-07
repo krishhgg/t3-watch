@@ -377,7 +377,7 @@ pub fn recover_token(name: &str, origin: &str, used: &str) -> Recovery {
         // The refresh worked but saving it did not: keep using the new token
         // rather than ending the watch.
         Err(e) if fresh.is_some() => {
-            eprintln!("t3-watch: warning: refreshed token could not be saved: {e}");
+            util::warn(&format!("t3-watch: warning: refreshed token could not be saved: {e}"));
             Recovery::Token(fresh.unwrap())
         }
         Err(e) => Recovery::Retry(e),
@@ -413,10 +413,10 @@ fn store(name: &str, d: &Discovery, client_id: &str, token: Token, make_default:
         .map(util::sanitize_code)
         .collect();
     if !extra.is_empty() {
-        eprintln!(
+        util::warn(&format!(
             "warning: server granted more than {SCOPE} ({}); t3-watch only calls read tools",
             extra.join(" ")
-        );
+        ));
     }
     let machine = Machine {
         origin: d.origin.clone(),
@@ -502,7 +502,9 @@ pub fn login(
     let client_id = register(&d, &redirect_uri)?;
     let pkce = Pkce::new();
     let url = authorize_url(&d, &client_id, &redirect_uri, &pkce);
-    eprintln!("Approve read-only ({SCOPE}) access for t3-watch in your browser:\n\n  {url}\n");
+    util::warn(&format!(
+        "Approve read-only ({SCOPE}) access for t3-watch in your browser:\n\n  {url}\n"
+    ));
     if !no_browser {
         open_browser(&url);
     }

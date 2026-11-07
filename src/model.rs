@@ -210,14 +210,21 @@ pub struct ThreadState {
     /// Ids from `t3_pending_request list` (questions only; T3 does not list
     /// approvals there).
     pub pending_ids: Vec<String>,
-    /// `resultRun` from `t3_thread_wait` in workstream mode.
+    /// `resultRun` from `t3_thread_wait` in workstream mode, and the status
+    /// T3 gave for that run. The outcome of a proven workstream is that
+    /// run's, not the header's.
     pub result_run_id: Option<String>,
+    pub result_status: Option<String>,
     /// Workstream mode: a `t3_thread_wait` with `untilDelegatedWorkSettled`
     /// proved that the latest run, its delegated and background work and the
     /// runs delivering their completions have all settled.
     pub delegated_settled: bool,
     /// Why the workstream proof was not accepted, when it was not.
     pub proof_note: Option<String>,
+    /// A later response in the same cycle contradicted this observation (a
+    /// newer run, active work, a changed status): it may report input but
+    /// never completion or failure until a fresh cycle confirms it.
+    pub recheck: Option<String>,
     /// Turn mode: T3 reported delegated work still running when this turn
     /// ended. A hint for the caller, never a reason to keep waiting.
     pub delegated_pending_hint: Option<bool>,
@@ -254,8 +261,10 @@ impl ThreadState {
             requests: Vec::new(),
             pending_ids: Vec::new(),
             result_run_id: None,
+            result_status: None,
             delegated_settled: false,
             proof_note: None,
+            recheck: None,
             delegated_pending_hint: None,
             marker_seen: None,
             observed_at,
@@ -298,7 +307,13 @@ impl ThreadState {
     /// new ones. Built from request ids when known, else from the count, the
     /// status and the latest run.
     pub fn pending_key(&self) -> String {
-        let mut ids: Vec<&str> = self.requests.iter().map(|r| r.item_id.as_str()).collect();
+        // Request ids where known, so the timeline and `t3_pending_request
+        // list` name the same request the same way.
+        let mut ids: Vec<&str> = self
+            .requests
+            .iter()
+            .map(|r| r.request_id.as_deref().unwrap_or(&r.item_id))
+            .collect();
         ids.extend(self.pending_ids.iter().map(String::as_str));
         ids.sort_unstable();
         ids.dedup();
@@ -318,14 +333,27 @@ impl ThreadState {
 
     /// Whether the thread is far enough along for its terminal status to
     /// count: the right run, the workstream proven, the marker seen.
-    fn requirements_met(&self, p: &Predicate) -> bool {
-        if p.min_run_ordinal > 0 && self.ordinal().unwrap_or(0) < p.min_run_ordinal {
-            return false;
+    /// The status of the run whose result decides the outcome. In a proven
+    /// workstream that is `resultRun`'s status as T3 reported it; the
+    /// header's status stands in only when the header is about that same
+    /// run. `None`: unknown, so neither success nor failure.
+    pub fn deciding_status(&self) -> Option<&str> {
+        if !self.delegated_settled {
+            return self.status.as_deref();
         }
-        if p.until_delegated && !self.delegated_settled {
-            return false;
+        if let Some(s) = self.result_status.as_deref() {
+            return Some(s);
         }
-        p.final_marker.is_none() || self.marker_seen == Some(true)
+        let same_run = match (self.result_run_id.as_deref(), self.latest_run_id.as_deref()) {
+            (Some(r), Some(l)) => r == l || parse_run(r).is_some_and(|r| parse_run(l) == Some(r)),
+            (None, _) => true,
+            _ => false,
+        };
+        if same_run {
+            self.status.as_deref()
+        } else {
+            None
+        }
     }
 
     pub fn outcome(&self, p: &Predicate) -> ThreadOutcome {
@@ -338,27 +366,29 @@ impl ThreadState {
             }
             return ThreadOutcome::NeedsInput;
         }
-        if self.class() != StatusClass::Settled {
+        if self.recheck.is_some() || self.active_run_id.is_some() || self.class() != StatusClass::Settled {
             return ThreadOutcome::Pending;
         }
-        let success = self.status.as_deref().is_some_and(|s| SUCCESS_STATUSES.contains(&s));
-        if !success {
-            // A failure counts only for a run the caller waits for and, in
-            // workstream mode, once the delegated work it started has
-            // settled too (a child's completion may start a new run). It
-            // never needs the final marker: that confirms success.
-            if p.min_run_ordinal > 0 && self.ordinal().unwrap_or(0) < p.min_run_ordinal {
-                return ThreadOutcome::Pending;
-            }
-            if p.until_delegated && !self.delegated_settled {
-                return ThreadOutcome::Pending;
-            }
-            return ThreadOutcome::Failed;
-        }
-        if !self.requirements_met(p) {
+        if p.min_run_ordinal > 0 && self.ordinal().unwrap_or(0) < p.min_run_ordinal {
             return ThreadOutcome::Pending;
         }
-        ThreadOutcome::Completed
+        // In workstream mode nothing is final before the proof: a failed
+        // parent turn's delegated work may still start new runs.
+        if p.until_delegated && !self.delegated_settled {
+            return ThreadOutcome::Pending;
+        }
+        let success = |s: &str| SUCCESS_STATUSES.contains(&s);
+        let header_ok = self.status.as_deref().is_some_and(success);
+        match self.deciding_status() {
+            None => ThreadOutcome::Pending,
+            Some(s) if classify(s) != StatusClass::Settled => ThreadOutcome::Pending,
+            // A failed deciding run, or a failed latest run after a completed
+            // result run, is a failure: never reported as success. It does
+            // not need the final marker, which confirms success only.
+            Some(s) if !success(s) || !header_ok => ThreadOutcome::Failed,
+            Some(_) if p.final_marker.is_some() && self.marker_seen != Some(true) => ThreadOutcome::Pending,
+            Some(_) => ThreadOutcome::Completed,
+        }
     }
 
     /// The thread reached a terminal outcome (completed or failed).
@@ -379,6 +409,9 @@ impl ThreadState {
                     crate::util::sanitize_text(run, 120)
                 ));
             }
+        }
+        if let Some(note) = &self.recheck {
+            return Some(note.clone());
         }
         if let Some(note) = &self.proof_note {
             return Some(note.clone());
@@ -419,6 +452,9 @@ impl ThreadState {
         }
         if let Some(r) = &self.result_run_id {
             m.insert("resultRunId".into(), json!(r));
+        }
+        if let Some(r) = &self.result_status {
+            m.insert("resultRunStatus".into(), json!(r));
         }
         if let Some(h) = self.delegated_pending_hint {
             m.insert("delegatedWorkPending".into(), json!(h));
@@ -743,6 +779,49 @@ mod tests {
         failed.delegated_settled = true;
         assert_eq!(failed.outcome(&marked), ThreadOutcome::Failed);
         assert_eq!(state("failed", &run(T, 1)).outcome(&p()), ThreadOutcome::Failed);
+    }
+
+    #[test]
+    fn a_proven_workstream_takes_the_result_runs_status() {
+        let ws = Predicate {
+            until_delegated: true,
+            ..Default::default()
+        };
+        // The header says run 6 completed; T3 says the result run 4 failed.
+        let mut s = state("completed", &run(T, 6));
+        s.delegated_settled = true;
+        s.result_run_id = Some(run(T, 4));
+        for bad in ["failed", "interrupted", "cancelled"] {
+            s.result_status = Some(bad.into());
+            assert_eq!(s.outcome(&ws), ThreadOutcome::Failed, "{bad}");
+        }
+        s.result_status = Some("completed".into());
+        assert_eq!(s.outcome(&ws), ThreadOutcome::Completed);
+        // A failed latest run after a completed result run is no success.
+        s.status = Some("failed".into());
+        assert_eq!(s.outcome(&ws), ThreadOutcome::Failed);
+        // Without the result run's status, only the same run's header counts.
+        s.status = Some("completed".into());
+        s.result_status = None;
+        assert_eq!(s.outcome(&ws), ThreadOutcome::Pending);
+        s.result_run_id = Some(run(T, 6));
+        assert_eq!(s.outcome(&ws), ThreadOutcome::Completed);
+    }
+
+    #[test]
+    fn a_rechecked_observation_reports_input_but_never_an_end() {
+        let mut s = state("completed", &run(T, 2));
+        s.recheck = Some("the thread moved on to run 3".into());
+        assert_eq!(s.outcome(&p()), ThreadOutcome::Pending);
+        assert!(s.diagnostic().unwrap().contains("moved on"));
+        s.status = Some("failed".into());
+        assert_eq!(s.outcome(&p()), ThreadOutcome::Pending);
+        s.pending_requests = Some(1);
+        assert_eq!(s.outcome(&p()), ThreadOutcome::NeedsInput);
+        // A settled status with an active run is not settled either.
+        let mut active = state("completed", &run(T, 2));
+        active.active_run_id = Some(run(T, 3));
+        assert_eq!(active.outcome(&p()), ThreadOutcome::Pending);
     }
 
     #[test]
