@@ -438,3 +438,145 @@ fn results_and_the_trace_name_builds_and_delivery_timing() {
     let version = env.run(&["--version"]);
     assert!(String::from_utf8_lossy(&version.stdout).contains("engine 4"));
 }
+
+// ---- Sol ordinal 5, P1: an expired final event is not "delivered" -----------
+
+#[test]
+fn a_final_event_that_expires_unsent_is_reported_undelivered() {
+    // Sol's repro: --follow --durable --durable-max-age 1s, no hook. The
+    // run_failed webhook's answer takes 7 s; meanwhile the run completes and
+    // the final `settled` entry expires into dead letters, never sent.
+    let mock = MockMcp::start();
+    mock.set_thread(T, "failed", 5);
+    let hook = MockHook::start();
+    hook.state.lock().unwrap().delays.push_back(Duration::from_secs(7));
+    let env = mcp_env(&mock);
+    let child = env
+        .cmd(&[
+            "wait",
+            "--follow",
+            "--durable",
+            "--durable-max-age",
+            "1s",
+            "--expect-min-run-ordinal",
+            "5",
+            "--webhook-url",
+            &hook.url,
+            T,
+        ])
+        .spawn()
+        .unwrap();
+    eventually("the run_failed webhook", Duration::from_secs(10), || {
+        !hook.requests().is_empty()
+    });
+    mock.set_thread(T, "completed", 6);
+    let (code, out, err) = finish(child, Duration::from_secs(60));
+    let n = &out["notification"];
+    assert_eq!(n["delivered"], false, "{out} {err}");
+    assert_ne!(n["webhook"]["by"], "outbox sender", "absence taken as delivery: {n}");
+    assert_eq!(n["webhook"]["disposition"], "expired", "{n}");
+    assert_eq!(code, 4, "{out}");
+    assert_eq!(events(&hook), ["run_failed"], "the final event was never sent");
+    let dead = env
+        .home
+        .join("outbox-v2")
+        .join("dead")
+        .join(format!("{}.json", n["id"].as_str().unwrap()));
+    assert!(dead.exists(), "the expired entry is kept as a dead letter");
+    let receipt: Value = serde_json::from_str(
+        &fs::read_to_string(
+            env.home
+                .join("outbox-v2")
+                .join("receipts")
+                .join(format!("{}.json", n["id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["disposition"], "expired");
+}
+
+// ---- Sol ordinal 5, P2: no secret from a thread URL in the trace -----------
+
+#[test]
+fn the_trace_never_holds_a_thread_urls_query() {
+    let mock = MockMcp::start();
+    mock.set_thread(T, "completed", 1);
+    let env = mcp_env(&mock);
+    let url = format!(
+        "{}/env-mock/{}?token=TRACE_QUERY_CANARY#frag-TRACE_QUERY_CANARY",
+        mock.url,
+        T.replace(':', "%3A")
+    );
+    let out = env.run(&["wait", "--no-daemon", &url]);
+    assert_eq!(out.status.code(), Some(0));
+    // An unparseable one, with --notify-on all so its error goes everywhere.
+    let bad = format!("{}/?token=TRACE_QUERY_CANARY", mock.url);
+    let hook = MockHook::start();
+    let out2 = env.run(&[
+        "wait",
+        "--no-daemon",
+        "--notify-on",
+        "all",
+        "--webhook-url",
+        &hook.url,
+        &bad,
+    ]);
+    assert_eq!(out2.status.code(), Some(2));
+    let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+    assert!(!trace.contains("TRACE_QUERY_CANARY"), "{trace}");
+    assert!(trace.contains(&format!("\"threadId\":\"{T}\"")), "{trace}");
+    for o in [&out, &out2] {
+        assert!(!String::from_utf8_lossy(&o.stdout).contains("TRACE_QUERY_CANARY"));
+    }
+    assert!(hook
+        .requests()
+        .iter()
+        .all(|r| !String::from_utf8_lossy(&r.body).contains("TRACE_QUERY_CANARY")));
+}
+
+// ---- Sol ordinal 5, P2: a FIFO where a log goes never blocks a wait --------
+
+#[test]
+fn a_fifo_at_the_trace_or_hook_log_never_blocks_a_wait() {
+    for daemon in [false, true] {
+        let mock = MockMcp::start();
+        mock.set_thread(T, "completed", 1);
+        let hook = MockHook::start();
+        let env = mcp_env(&mock);
+        for name in ["trace.jsonl", "hooks.log", "daemon.log"] {
+            let st = std::process::Command::new("mkfifo")
+                .arg(env.home.join(name))
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let started = Instant::now();
+        let mut args = vec![
+            "wait",
+            "--timeout",
+            "1s",
+            "--webhook-url",
+            &hook.url,
+            "--on-settle",
+            "/bin/sh",
+            "--on-settle-arg",
+            "-c",
+            "--on-settle-arg",
+            "echo hook-ran",
+        ];
+        if !daemon {
+            args.insert(1, "--no-daemon");
+        }
+        args.push(T);
+        let child = env.cmd(&args).spawn().unwrap();
+        let code = exit_within(child, Duration::from_secs(10));
+        assert_eq!(code, 0, "daemon={daemon}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "blocked {:?}",
+            started.elapsed()
+        );
+        assert_eq!(events(&hook), ["settled"]);
+    }
+}

@@ -1508,6 +1508,7 @@ impl Watch {
                         );
                     }
                 }
+                self.trace_settlement(&state, false);
                 Ok(Cycle {
                     state,
                     next: Next::Interval,

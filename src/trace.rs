@@ -11,14 +11,15 @@
 //!
 //! Best effort: tracing never fails, blocks or changes anything else. Lines
 //! hold ids, statuses, timestamps and error categories only, never URLs,
-//! headers, secrets or message text. The file is rotated to
-//! `trace.jsonl.1` past 4 MiB.
+//! headers, secrets or message text: threads appear as parsed ids, never as
+//! the arguments given (a thread URL can carry a token in its query). The
+//! file is rotated to `trace.jsonl.1` past 4 MiB, and anything at its path
+//! that is not a regular file is left alone.
 
 use crate::{config, util, version};
 use serde_json::{json, Value};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 
 const MAX_BYTES: u64 = 4 << 20;
 
@@ -31,7 +32,7 @@ pub fn record(kind: &str, fields: Value) {
         return;
     }
     let path = config::trace_path();
-    if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() > MAX_BYTES) {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
         let _ = fs::rename(&path, old);
@@ -48,16 +49,9 @@ pub fn record(kind: &str, fields: Value) {
     }
     let mut text = line.to_string();
     text.push('\n');
-    if util::ensure_private_dir(&config::state_dir()).is_err() {
-        return;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path);
-    if let Ok(mut f) = file {
+    // Never blocks: a FIFO, device or symlink at the trace path is skipped
+    // (see `util::open_log`), so tracing cannot hold up a wait or delivery.
+    if let Ok(mut f) = util::open_log(&path) {
         // One write per line: appends of a few hundred bytes do not
         // interleave between processes.
         let _ = f.write_all(text.as_bytes());

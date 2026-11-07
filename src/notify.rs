@@ -17,7 +17,6 @@ use crate::util::{self, Jitter};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -541,10 +540,30 @@ fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option
             return r;
         }
     };
-    // Reread under the lease: the sender may already have delivered it, or
-    // own its schedule now.
-    let Some(entry) = outbox::load(id) else {
-        return json!({ "delivered": true, "attempts": 0, "by": "outbox sender" });
+    // Reread under the lease: the sender may already have finished it, or
+    // own its schedule now. Only a receipt says how an entry left; its
+    // absence never counts as delivery.
+    let entry = match outbox::entry_state(id) {
+        outbox::EntryState::Present(e) => e,
+        outbox::EntryState::Unreadable => {
+            return json!({ "delivered": false, "attempts": 0, "disposition": "unreadable", "outboxId": id,
+                           "error": "the outbox entry cannot be read; not counted as delivered" })
+        }
+        outbox::EntryState::Missing => {
+            return match outbox::receipt(id) {
+                Some(r) if r["disposition"] == "delivered" => json!({
+                    "delivered": true, "attempts": r["attempts"], "status": r["status"],
+                    "by": r["by"], "deliveredAt": r["at"], "disposition": "delivered" }),
+                Some(r) => json!({
+                    "delivered": false, "attempts": r["attempts"], "disposition": r["disposition"],
+                    "outboxId": id, "at": r["at"],
+                    "error": format!("the outbox {} this event before it was delivered",
+                                     if r["disposition"] == "expired" { "expired" } else { "dropped" }) }),
+                None => json!({
+                    "delivered": false, "attempts": 0, "disposition": "unknown", "outboxId": id,
+                    "error": "the outbox entry is gone and no receipt says why; not counted as delivered" }),
+            };
+        }
     };
     if !outbox::inline_allowed(&entry) {
         return json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
@@ -553,7 +572,14 @@ fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option
     }
     let mut r = post_webhook(w, event, id, body);
     if r["delivered"] == true {
-        outbox::remove(id);
+        let mut done = (*entry).clone();
+        done.attempts += r["attempts"].as_u64().unwrap_or(0) as u32;
+        outbox::finish(
+            &done,
+            outbox::Disposition::Delivered,
+            r["status"].as_u64().map(|s| s as u16),
+            "client",
+        );
     } else {
         let failure = outbox::InlineFailure {
             attempts: r["attempts"].as_u64().unwrap_or(0) as u32,
@@ -649,19 +675,11 @@ fn status_json(status: ExitStatus) -> Value {
 /// keep whoever reads our output (an agent harness) waiting long after
 /// t3-watch has exited.
 fn hook_log(path: &Path) -> Stdio {
-    if fs::metadata(path).is_ok_and(|m| m.len() > 1 << 20) {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > 1 << 20) {
         let _ = fs::remove_file(path);
     }
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let open = util::ensure_private_dir(dir).and_then(|_| {
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-    });
-    open.map(Stdio::from).unwrap_or_else(|_| Stdio::null())
+    // Never blocks and never writes into anything but a regular file.
+    util::open_log(path).map(Stdio::from).unwrap_or_else(|_| Stdio::null())
 }
 
 /// Runs the hook with the result JSON on stdin and its output going to

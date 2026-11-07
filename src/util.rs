@@ -437,6 +437,48 @@ pub fn flock_within(f: &File, timeout: Duration) -> io::Result<bool> {
 /// Writes a file readable only by the owner (0600), atomically: a fresh
 /// `O_EXCL` temp file next to it, fsync, rename, then fsync the directory, so
 /// a crash leaves either the old or the new file and never a partial one.
+/// An argument as it may be echoed in messages: a URL loses its userinfo,
+/// query and fragment (any of which can carry a credential).
+pub fn without_secrets(arg: &str) -> String {
+    let cut = arg.find(['?', '#']).map_or(arg, |i| &arg[..i]);
+    let shown = match cut.find("://") {
+        Some(i) => {
+            let rest = &cut[i + 3..];
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            match rest[..host_end].rfind('@') {
+                Some(at) => format!("{}{}", &cut[..i + 3], &rest[at + 1..]),
+                None => cut.to_string(),
+            }
+        }
+        None => cut.to_string(),
+    };
+    sanitize_text(&shown, 300)
+}
+
+/// Opens a log file for appending without ever blocking: `O_NONBLOCK` (a
+/// FIFO without a reader fails at once instead of waiting), `O_NOFOLLOW`,
+/// created 0600, and refused unless what was opened is a regular file owned
+/// by us. Logs are best effort: an error here must only lose log lines.
+pub fn open_log(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_private_dir(parent)?;
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != geteuid() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file owned by you",
+            path.display()
+        )));
+    }
+    Ok(f)
+}
+
 pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -726,6 +768,29 @@ mod tests {
         let d = std::env::temp_dir().join(format!("t3wu-{tag}-{}-{}", std::process::id(), hex(&random_bytes(4))));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn echoed_arguments_lose_userinfo_query_and_fragment() {
+        assert_eq!(
+            without_secrets("https://u:pw@relay.example/env/t?token=CANARY#frag"),
+            "https://relay.example/env/t"
+        );
+        assert_eq!(without_secrets("mcp:launch:abc?x=CANARY"), "mcp:launch:abc");
+        assert_eq!(without_secrets("t3-thread://v2/e/t"), "t3-thread://v2/e/t");
+    }
+
+    #[test]
+    fn logs_never_open_anything_but_a_regular_file() {
+        let d = tmpdir("log");
+        let fifo = d.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(open_log(&fifo).is_err(), "a FIFO must be refused");
+        assert!(started.elapsed() < Duration::from_secs(1), "opening must not block");
+        assert!(open_log(&d.join("ok.log")).is_ok());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

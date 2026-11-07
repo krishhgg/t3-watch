@@ -129,6 +129,9 @@ fn a_dns_failure_is_queued_privately_not_lost() {
     let dropped = env.run(&["outbox", "drop", &id]);
     assert_eq!(dropped.status.code(), Some(0));
     assert!(outbox_files(&env).is_empty());
+    // How it left is written down, never inferred.
+    let receipt = fs::read_to_string(env.home.join("outbox-v2").join("receipts").join(format!("{id}.json"))).unwrap();
+    assert!(receipt.contains("\"disposition\":\"dropped\""), "{receipt}");
 }
 
 #[test]

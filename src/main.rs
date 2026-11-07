@@ -276,15 +276,15 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
             [_version, env, thread @ ..] if !thread.is_empty() => {
                 (util::pct_decode(&thread.join("/"), false), Some(env.to_string()))
             }
-            _ => return Err(format!("cannot parse thread link {arg}")),
+            _ => return Err(format!("cannot parse thread link {}", util::without_secrets(arg))),
         }
     } else if let Some(u) = util::parse_url(arg) {
         let segs: Vec<&str> = u.path.split('/').filter(|s| !s.is_empty()).collect();
         let [env, thread @ ..] = segs.as_slice() else {
-            return Err(format!("URL has no thread id: {arg}"));
+            return Err(format!("URL has no thread id: {}", util::without_secrets(arg)));
         };
         if thread.is_empty() {
-            return Err(format!("URL has no thread id: {arg}"));
+            return Err(format!("URL has no thread id: {}", util::without_secrets(arg)));
         }
         origin = Some((u.origin.clone(), u.host.clone()));
         (util::pct_decode(&thread.join("/"), false), Some(env.to_string()))
@@ -595,7 +595,6 @@ fn cmd_wait(raw: &[String]) -> ! {
     let pretty = a.has("pretty");
     let no_daemon = a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some();
     let watch_id = util::hex(&util::random_bytes(8));
-    let threads: Vec<String> = a.positional.clone();
     let host = hostname();
 
     // Every event of this wait, progress and final, gets the next
@@ -665,13 +664,32 @@ fn cmd_wait(raw: &[String]) -> ! {
     let mut reconnects = 0;
     let mut daemon_build: Option<Value> = None;
     let mut heartbeat = None;
-    trace::record(
-        "wait.start",
-        json!({ "watchId": watch_id, "threads": threads, "noDaemon": no_daemon, "durable": a.has("durable") }),
-    );
+    // Threads are traced as parsed ids only: an argument can be a URL whose
+    // query or userinfo carries a credential.
     let mut outcome = match prepare_wait(&a) {
-        Err(e) => Outcome::Error(e),
+        Err(e) => {
+            trace::record(
+                "wait.start",
+                json!({ "watchId": watch_id, "argCount": a.positional.len(), "error": e["error"]["kind"] }),
+            );
+            Outcome::Error(e)
+        }
         Ok(req) => {
+            trace::record(
+                "wait.start",
+                json!({
+                    "watchId": watch_id,
+                    "targets": req.targets.iter().map(|t| json!({
+                        "machine": t.machine,
+                        "threadId": t.thread_id,
+                        "environmentId": t.environment_id,
+                        "transport": if t.transport == Transport::Local { "local" } else { "mcp" },
+                    })).collect::<Vec<_>>(),
+                    "until": if req.predicate.until_delegated { "workstream" } else { "turn" },
+                    "noDaemon": no_daemon,
+                    "durable": a.has("durable"),
+                }),
+            );
             let base = json!({
                 "watchId": watch_id,
                 "host": host,
@@ -683,8 +701,8 @@ fn cmd_wait(raw: &[String]) -> ! {
             if no_daemon {
                 let hub = Hub::new("direct");
                 if let Some(every) = heartbeat_every {
-                    let (h, ids) = (hub.clone(), threads.clone());
-                    let ids: Vec<String> = req.targets.iter().map(|t| t.thread_id.clone()).chain(ids).collect();
+                    let h = hub.clone();
+                    let ids: Vec<String> = req.targets.iter().map(|t| t.thread_id.clone()).collect();
                     heartbeat = Heartbeat::start(
                         notify.clone(),
                         every,
@@ -812,6 +830,7 @@ fn cmd_outbox(raw: &[String]) -> ! {
             print_json(
                 &json!({
                     "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
+                    "legacy": outbox::legacy_entries().iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
                     "unreadable": bad,
                     "dir": config::outbox_dir().display().to_string(),
                 }),
@@ -840,8 +859,13 @@ fn cmd_outbox(raw: &[String]) -> ! {
                 Ok(None) => fail_json("outbox", "that entry is being delivered right now; try again"),
                 Err(e) => fail_json("outbox", &e),
             };
-            let existed = outbox::load(id).is_some();
-            outbox::remove(id);
+            let existed = match outbox::load(id) {
+                Some(e) => {
+                    outbox::finish(&e, outbox::Disposition::Dropped, e.last_status, "outbox drop");
+                    true
+                }
+                None => false,
+            };
             drop(lease);
             print_json(&json!({ "ok": existed, "id": id }), pretty);
             exit(if existed { 0 } else { 2 })

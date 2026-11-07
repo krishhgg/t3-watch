@@ -797,6 +797,9 @@ pub struct HookState {
     pub mode: HookMode,
     /// Connections accepted and left hanging (Blackhole).
     pub held: Vec<TcpStream>,
+    /// Delays before answering, in order, one per request (after it is
+    /// recorded); then none.
+    pub delays: VecDeque<Duration>,
 }
 
 pub struct MockHook {
@@ -836,7 +839,12 @@ impl MockHook {
                             at: Instant::now(),
                         });
                         let (status, headers) = s.script.pop_front().unwrap_or((200, vec![]));
-                        (status, headers, s.mode)
+                        let delay = s.delays.pop_front();
+                        drop(s);
+                        if let Some(d) = delay {
+                            thread::sleep(d);
+                        }
+                        (status, headers, st.lock().unwrap().mode)
                     };
                     if mode == HookMode::DropAfterRecord {
                         let _ = conn.shutdown(std::net::Shutdown::Both);

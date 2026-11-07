@@ -28,9 +28,9 @@ use crate::trace;
 use crate::util;
 use crate::version;
 use serde_json::{json, Value};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -433,16 +433,15 @@ fn spawn_daemon() -> Result<(), String> {
     util::ensure_private_dir(&state).map_err(|e| format!("cannot create {}: {e}", state.display()))?;
     prepare_socket_dir(&config::socket_path())?;
     let log_path = state.join("daemon.log");
-    if fs::metadata(&log_path).is_ok_and(|m| m.len() > 1 << 20) {
+    if fs::symlink_metadata(&log_path).is_ok_and(|m| m.is_file() && m.len() > 1 << 20) {
         let _ = fs::remove_file(&log_path);
     }
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&log_path)
-        .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
+    // The daemon's stderr. Without a usable log file it runs without one:
+    // a log must never keep the daemon (and the waiting client) from
+    // starting.
+    let log_file = util::open_log(&log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
         .current_dir("/")

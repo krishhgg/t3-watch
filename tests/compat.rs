@@ -248,3 +248,53 @@ fn this_builds_entries_live_where_old_senders_never_look() {
         .collect();
     assert_eq!(v2.len(), 1);
 }
+
+#[test]
+fn a_young_entry_left_by_a_crashed_old_client_is_kept_pending_and_delivered() {
+    // Sol's repro: a valid legacy entry too young to migrate, no old client
+    // or sender alive. It must count as pending everywhere, keep the daemon
+    // up past its idle exit, and go out once eligible. Created 80 s ago so
+    // it becomes eligible 10 s into the test (the grace is 90 s).
+    let env = Env::new();
+    let hook = MockHook::start();
+    let legacy = private_dir(&env, "outbox");
+    let id = "00ee33ff";
+    fs::write(
+        legacy.join(format!("{id}.json")),
+        legacy_entry(id, &hook.url, now_ms() - 80_000).to_string(),
+    )
+    .unwrap();
+
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(4), "a deferred entry is not an empty outbox");
+    let r = output_json(&run);
+    assert!(r["pending"].as_u64().unwrap() >= 1, "{r}");
+    assert!(r["results"].to_string().contains("\"legacy\":true"), "{r}");
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(list["legacy"][0]["id"], id, "{list}");
+
+    // The daemon (idle exit 2 s in tests) stays up for it.
+    let mut daemon = env.spawn(&["daemon"]);
+    env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+    assert_eq!(env.status()["outbox"]["legacyPending"], 1);
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "the daemon left a legacy entry stranded"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while hook.requests().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "never delivered");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(hook.requests()[0].headers["x-t3-watch-id"], id);
+    // Delivered and nothing left: now it may idle out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while daemon.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "the daemon never idled out");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!legacy.join(format!("{id}.json")).exists());
+    let receipt = fs::read_to_string(env.home.join("outbox-v2").join("receipts").join(format!("{id}.json"))).unwrap();
+    assert!(receipt.contains("\"disposition\":\"delivered\""), "{receipt}");
+}

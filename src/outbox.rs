@@ -19,9 +19,18 @@
 //! the webhook is done, whatever a hook running beside it is doing. A
 //! process that dies drops its lease.
 //!
+//! How an entry leaves the outbox is written down, never inferred: before
+//! an entry is removed (delivered, dropped) or moved to `dead/` (expired), a
+//! receipt `receipts/<id>.json` records the disposition, under the entry's
+//! lease. A client that finds its entry gone reads the receipt; a missing
+//! entry without one is `unknown`, never "delivered".
+//!
 //! Builds before this format kept entries in `outbox/` and had no leases;
 //! their senders never look at `outbox-v2/`. Entries of theirs older than
 //! the inline grace are moved here under their own `outbox/sender.lock`.
+//! Younger ones wait (a client of that build may still be sending them),
+//! but count as pending everywhere: in `outbox list`, `status`, the exit
+//! code of `outbox run --once`, and the daemon's decision to stay up.
 //!
 //! Every attempt for an entry carries the same `X-T3-Watch-Id` and
 //! `Idempotency-Key`, so a receiver that got a request but whose answer was
@@ -272,12 +281,102 @@ pub fn after_inline_failure(id: &str, f: &InlineFailure) -> Result<Entry, String
     Ok(e)
 }
 
-/// Removes an entry and its lease file. Call with the lease held: the entry
-/// goes first, so a sender that gets a fresh lease file finds nothing.
-pub fn remove(id: &str) {
+/// Removes an entry and its lease file. Call with the lease held, after
+/// writing its receipt: the entry goes first, so a sender that gets a fresh
+/// lease file finds nothing.
+fn remove(id: &str) {
     if valid_id(id) {
         let _ = fs::remove_file(path_of(id));
         let _ = fs::remove_file(lock_of(id));
+    }
+}
+
+/// How an entry left the outbox.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Disposition {
+    Delivered,
+    Expired,
+    Dropped,
+}
+
+impl Disposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Disposition::Delivered => "delivered",
+            Disposition::Expired => "expired",
+            Disposition::Dropped => "dropped",
+        }
+    }
+}
+
+const RECEIPT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+fn receipt_path(id: &str) -> PathBuf {
+    dir().join("receipts").join(format!("{id}.json"))
+}
+
+/// Records how an entry left the outbox, then removes it (or, expired,
+/// moves it to `dead/`). Call with the lease held. The receipt is written
+/// (fsynced) first, so a crash in between leaves both, never neither.
+pub fn finish(e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
+    let receipt = json!({
+        "id": e.id,
+        "event": e.event,
+        "disposition": how.as_str(),
+        "at": util::rfc3339_ms(util::now_ms()),
+        "attempts": e.attempts,
+        "status": status,
+        "by": by,
+    });
+    let written = util::ensure_private_dir(&dir().join("receipts"))
+        .and_then(|_| util::write_private(&receipt_path(&e.id), receipt.to_string().as_bytes()));
+    if how == Disposition::Expired {
+        let dead = dir().join("dead");
+        if util::ensure_private_dir(&dead).is_ok() {
+            let _ = fs::rename(path_of(&e.id), dead.join(format!("{}.json", e.id)));
+        }
+        let _ = fs::remove_file(lock_of(&e.id));
+    } else {
+        remove(&e.id);
+    }
+    trace::record(
+        &format!("outbox.{}", how.as_str()),
+        json!({ "id": e.id, "attempts": e.attempts, "status": status, "by": by,
+                "receiptError": written.err().map(|err| err.to_string()) }),
+    );
+}
+
+/// The receipt of an entry that left the outbox, if one was written.
+pub fn receipt(id: &str) -> Option<Value> {
+    if !valid_id(id) {
+        return None;
+    }
+    serde_json::from_str(&fs::read_to_string(receipt_path(id)).ok()?).ok()
+}
+
+/// What is on disk for an entry right now.
+pub enum EntryState {
+    Present(Box<Entry>),
+    /// The file is there but cannot be read as an entry.
+    Unreadable,
+    Missing,
+}
+
+pub fn entry_state(id: &str) -> EntryState {
+    match load(id) {
+        Some(e) => EntryState::Present(Box::new(e)),
+        None if path_of(id).exists() => EntryState::Unreadable,
+        None => EntryState::Missing,
+    }
+}
+
+/// Removes receipts past their time to live.
+fn prune_receipts() {
+    let cutoff = std::time::SystemTime::now() - RECEIPT_TTL;
+    for f in fs::read_dir(dir().join("receipts")).into_iter().flatten().flatten() {
+        if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) {
+            let _ = fs::remove_file(f.path());
+        }
     }
 }
 
@@ -306,17 +405,37 @@ pub fn entries() -> (Vec<Entry>, Vec<String>) {
     (out, bad)
 }
 
-pub fn pending_count() -> usize {
-    entries().0.len()
+/// Valid entries an older build left in `outbox/`, not yet migrated.
+pub fn legacy_entries() -> Vec<Entry> {
+    let mut out: Vec<Entry> = fs::read_dir(config::legacy_outbox_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|f| {
+            let name = f.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.') && name.strip_suffix(".json").is_some_and(valid_id)
+        })
+        .filter_map(|f| {
+            fs::read_to_string(f.path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| Entry::from_json(&v))
+        })
+        .collect();
+    out.sort_by_key(|e| e.created_ms);
+    out
 }
 
-fn dead_letter(e: &Entry) {
-    let dead = dir().join("dead");
-    if util::ensure_private_dir(&dead).is_ok() {
-        let _ = fs::rename(path_of(&e.id), dead.join(format!("{}.json", e.id)));
-        let _ = fs::remove_file(lock_of(&e.id));
-    }
-    trace::record("outbox.dead", json!({ "id": e.id, "attempts": e.attempts }));
+/// Everything still to be sent: this outbox's entries and the legacy ones
+/// waiting for migration. The daemon stays up while this is not zero.
+pub fn pending_count() -> usize {
+    entries().0.len() + legacy_entries().len()
+}
+
+/// When a legacy entry may be migrated (no client of its build can still
+/// be sending it).
+fn legacy_eligible_ms(e: &Entry) -> u64 {
+    e.created_ms + INLINE_GRACE.as_millis() as u64
 }
 
 /// Moves entries an older build left in `outbox/` into this outbox, under
@@ -335,7 +454,7 @@ fn migrate_legacy() -> Vec<Value> {
     if !util::try_flock(&lock).unwrap_or(false) {
         return out;
     }
-    let cutoff = util::now_ms().saturating_sub(INLINE_GRACE.as_millis() as u64);
+    let now = util::now_ms();
     for f in rd.flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
         let Some(id) = name.strip_suffix(".json").filter(|id| valid_id(id)) else {
@@ -348,7 +467,10 @@ fn migrate_legacy() -> Vec<Value> {
         else {
             continue;
         };
-        if e.created_ms > cutoff {
+        if now < legacy_eligible_ms(&e) {
+            out.push(json!({ "id": id, "legacy": true, "deferred": true,
+                             "eligibleAt": util::rfc3339_ms(legacy_eligible_ms(&e)),
+                             "reason": "left by an older build less than 90 s ago; its client may still be sending it" }));
             continue;
         }
         if load(id).is_none() {
@@ -406,7 +528,7 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
         };
         let now = util::now_ms();
         if now >= e.expires_ms {
-            dead_letter(&e);
+            finish(&e, Disposition::Expired, e.last_status, "outbox sender");
             results.push(json!({ "id": e.id, "deadLettered": true, "attempts": e.attempts }));
             continue;
         }
@@ -438,8 +560,7 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
                     "error": a.error, "retryAfterMs": a.retry_after.map(|d| d.as_millis() as u64) }),
         );
         if a.delivered {
-            remove(&e.id);
-            trace::record("outbox.delivered", json!({ "id": e.id, "attempts": e.attempts }));
+            finish(&e, Disposition::Delivered, a.status, "outbox sender");
             results.push(json!({ "id": e.id, "delivered": true, "attempts": e.attempts, "status": a.status }));
             continue;
         }
@@ -460,6 +581,7 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
             "saveError": saved.err(),
         }));
     }
+    prune_receipts();
     // Lease files whose entry is gone (a crash between the two removals).
     for f in fs::read_dir(dir()).into_iter().flatten().flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
@@ -497,10 +619,13 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
 
 pub fn summary_json() -> Value {
     let (entries, bad) = entries();
+    let legacy = legacy_entries();
+    let oldest = entries.iter().chain(&legacy).map(|e| e.created_ms).min();
     json!({
-        "pending": entries.len(),
+        "pending": entries.len() + legacy.len(),
+        "legacyPending": legacy.len(),
         "unreadable": bad.len(),
-        "oldestCreatedAt": entries.first().map(|e| util::rfc3339_ms(e.created_ms)),
+        "oldestCreatedAt": oldest.map(util::rfc3339_ms),
     })
 }
 
