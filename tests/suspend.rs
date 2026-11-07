@@ -426,11 +426,14 @@ fn until(what: &str, ok: impl Fn() -> bool) {
 
 #[test]
 fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
-    // Sol's repro: a genuine daemon's completed-run-2 answer sat in a socket
-    // proxy while the host slept 5 s and the parent moved to run 3. Both
-    // `--timeout 1s` and `--timeout 60s` returned exit 0 with run 2 and sent
-    // `settled` (the 1 s wait reporting elapsedMs 5061).
-    for timeout in ["1s", "60s"] {
+    // Sol's repros: a genuine daemon's completed-run-2 answer sat in a socket
+    // proxy while the host slept 5 s and the parent moved to run 3. Read as
+    // the host woke (ordinal 8), both `--timeout 1s` and `--timeout 60s`
+    // returned exit 0 with run 2 and sent `settled`. Held 2.2 s more after
+    // the resume, while the client found the socket empty (ordinal 9),
+    // `--timeout 60s` still did: an empty read proves nothing about an
+    // answer on its way.
+    for (frozen, timeout) in [(false, "60s"), (false, "1s"), (true, "1s"), (true, "60s")] {
         let mock = MockMcp::start();
         mock.set_thread(W, "completed", 2);
         let hook = MockHook::start();
@@ -449,7 +452,7 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
         fs::set_permissions(&sdir, fs::Permissions::from_mode(0o700)).unwrap();
         let proxy_sock = sdir.join("proxy.sock");
         let proxy = holding_proxy(&proxy_sock, env.home.join(SOCK));
-        let mut child = env
+        let child = env
             .cmd(&[
                 "wait",
                 "--until",
@@ -464,20 +467,28 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
             .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
             .spawn()
             .unwrap();
-        let what = format!("timeout={timeout}");
+        let what = format!("frozen={frozen} timeout={timeout}");
         until("the daemon's answer", || proxy.held.load(Ordering::SeqCst));
-        // The host sleeps with the answer on its way: everything stops, the
-        // parent starts run 3, and the answer lands as the host wakes.
         let pid = child.id() as i32;
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-        mock.set_thread(W, "running", 3);
-        suspend(&clock, 5_000);
-        proxy.release.store(true, Ordering::SeqCst);
-        until("the answer to be forwarded", || proxy.forwarded.load(Ordering::SeqCst));
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        if frozen {
+            // The host sleeps with the answer on its way: everything stops,
+            // the parent starts run 3, and the answer lands as it wakes.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            mock.set_thread(W, "running", 3);
+            suspend(&clock, 5_000);
+            proxy.release.store(true, Ordering::SeqCst);
+            until("the answer to be forwarded", || proxy.forwarded.load(Ordering::SeqCst));
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        } else {
+            // The host wakes; the answer is still held for 2.2 s, while the
+            // client's reads find nothing.
+            mock.set_thread(W, "running", 3);
+            suspend(&clock, 5_000);
+            std::thread::sleep(Duration::from_millis(2_200));
+            proxy.release.store(true, Ordering::SeqCst);
+        }
         if timeout == "60s" {
-            until("a fresh registration", || proxy.connections.load(Ordering::SeqCst) >= 2);
-            still_running(&mut child, Duration::from_millis(800));
+            std::thread::sleep(Duration::from_millis(1_500));
             mock.set_thread(W, "completed", 3);
         }
         let (code, out, err) = finish(child, Duration::from_secs(30));
@@ -493,11 +504,13 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
             assert_eq!(code, 3, "{seen}; {err}");
             assert_eq!(out["outcome"], "timeout", "{seen}");
             assert_eq!(settled_hooks(&hook), 0, "{seen}");
-            assert!(trace.contains("\"kind\":\"daemon.late\""), "{what}: {trace}");
+            let kind = if frozen { "daemon.late" } else { "daemon.stale" };
+            assert!(trace.contains(&format!("\"kind\":\"{kind}\"")), "{what}: {trace}");
         } else {
             assert_eq!(code, 0, "{seen}; {err}");
             assert_eq!(out["threads"][0]["runOrdinal"], 3, "{seen}");
-            assert_eq!(out["daemonAnswersDiscarded"], 1, "{what}: {out}");
+            assert_eq!(out["daemonReregisteredAfterSuspend"], 1, "{what}: {out}");
+            assert!(proxy.connections.load(Ordering::SeqCst) >= 2, "{what}");
             assert_eq!(settled_hooks(&hook), 1, "{seen}");
             assert!(trace.contains("\"kind\":\"daemon.stale\""), "{what}: {trace}");
         }

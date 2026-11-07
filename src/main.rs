@@ -810,7 +810,7 @@ fn cmd_wait(raw: &[String]) -> ! {
             v["daemonReconnects"] = json!(reconnects);
         }
         if stale_answers > 0 {
-            v["daemonAnswersDiscarded"] = json!(stale_answers);
+            v["daemonReregisteredAfterSuspend"] = json!(stale_answers);
         }
         trace::record(
             "wait.outcome",
@@ -897,6 +897,7 @@ fn cmd_outbox(raw: &[String]) -> ! {
                     "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
                     "legacy": outbox::legacy_public_json(),
                     "retained": outbox::retained_public_json(),
+                    "incompatibleSenders": outbox::incompatible_senders(),
                     "unreadable": bad,
                     "dir": config::outbox_dir().display().to_string(),
                 }),

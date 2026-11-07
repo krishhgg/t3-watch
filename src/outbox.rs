@@ -48,13 +48,16 @@
 //!   `outbox-v3/` entry that expires or is dropped leaves as here. Engine-4
 //!   clients (`outbox-v2/`) read a missing entry as delivered, receipt or
 //!   not, so an `outbox-v2/` entry that leaves undelivered (expired,
-//!   dropped) stays where it is, marked as the sender's (a retry recorded;
-//!   a dropped one also held back until its expiry), beside its receipt.
-//!   Such a client then reports it queued. It goes only once the delivery
-//!   trace, which those builds write too, shows that client is done with
-//!   it: its `notify.result` for the entry, or the process that created the
-//!   entry gone. Without that evidence it stays (`outbox list`, under
-//!   `retained`); no age, absence or guess counts.
+//!   dropped) stays where it is (see `Store::retain`): a sender retry
+//!   recorded, so such a client reports it queued; not expired, and held
+//!   back until 2100, so no engine-4, engine-6 or engine-7 sender expires,
+//!   sends or removes it; and no receipt beside it until it leaves. It goes
+//!   only once the delivery trace, which those builds write too, shows that
+//!   client is done with it: its `notify.result` for the entry, or the
+//!   process that created the entry gone. Without that evidence it stays
+//!   (`outbox list`, under `retained`); no age, absence or guess counts.
+//!   An engine-5 sender moves such entries whatever their state; it is
+//!   reported (`incompatibleSenders`) when its daemon is found.
 //! - Builds before engine 4 used `outbox/`, without leases; their clients
 //!   never treat a missing entry as delivered. Their entries move here after
 //!   the 90 s inline grace, under their `outbox/sender.lock`.
@@ -116,6 +119,10 @@ pub struct Entry {
     pub last_error: Option<String>,
     pub last_status: Option<u16>,
     pub last_attempt_ms: Option<u64>,
+    /// An undelivered `outbox-v2/` entry kept for its engine-4 client (see
+    /// `Store::retain`): how it left, and its real expiry.
+    pub retained_as: Option<Disposition>,
+    pub retained_expires_ms: Option<u64>,
 }
 
 /// What the client's inline attempts ended with.
@@ -128,7 +135,7 @@ pub struct InlineFailure {
 
 impl Entry {
     fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "version": 1,
             "id": self.id,
             "event": self.event,
@@ -145,7 +152,12 @@ impl Entry {
             "lastError": self.last_error,
             "lastStatus": self.last_status,
             "lastAttemptMs": self.last_attempt_ms,
-        })
+        });
+        if let Some(how) = self.retained_as {
+            v["retainedAs"] = json!(how.as_str());
+            v["retainedExpiresMs"] = json!(self.retained_expires_ms);
+        }
+        v
     }
 
     fn from_json(v: &Value) -> Option<Entry> {
@@ -173,6 +185,8 @@ impl Entry {
             last_error: s("lastError"),
             last_status: n("lastStatus").map(|s| s as u16),
             last_attempt_ms: n("lastAttemptMs"),
+            retained_as: s("retainedAs").as_deref().and_then(Disposition::parse),
+            retained_expires_ms: n("retainedExpiresMs"),
         })
     }
 
@@ -196,7 +210,8 @@ impl Entry {
             "store": store.label,
             "destination": util::parse_url(&self.url).map(|u| u.origin),
             "createdAt": util::rfc3339_ms(self.created_ms),
-            "expiresAt": util::rfc3339_ms(self.expires_ms),
+            "expiresAt": util::rfc3339_ms(self.retained_expires_ms.unwrap_or(self.expires_ms)),
+            "retainedAs": self.retained_as.map(Disposition::as_str),
             "attempts": self.attempts,
             "retries": self.retries,
             "nextAttemptAt": util::rfc3339_ms(self.next_attempt_ms),
@@ -228,6 +243,15 @@ pub enum Disposition {
 }
 
 impl Disposition {
+    fn parse(s: &str) -> Option<Disposition> {
+        match s {
+            "delivered" => Some(Disposition::Delivered),
+            "expired" => Some(Disposition::Expired),
+            "dropped" => Some(Disposition::Dropped),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Disposition::Delivered => "delivered",
@@ -256,8 +280,14 @@ pub enum EntryState {
 }
 
 /// Why an undelivered `outbox-v2/` entry is still there.
-const RETAINED: &str = "an engine-4 client reads a missing entry as delivered; kept, marked as the \
-                        sender's, until the trace shows the client that made it is done with it";
+const RETAINED: &str = "an engine-4 client reads a missing entry as delivered; kept, held back from \
+                        engine-4, engine-6 and engine-7 senders (not engine 5's, see incompatibleSenders), \
+                        until the trace shows the client that made it is done with it";
+
+/// Where a retained entry's expiry and next attempt are set, so that no
+/// build reading `outbox-v2/` treats it as expired or due:
+/// 2100-01-01T00:00:00Z.
+const RETAINED_UNTIL_MS: u64 = 4_102_444_800_000;
 
 /// How often the supervised sender reads the trace again for retained
 /// entries (`outbox run --once` and `outbox drop` always do).
@@ -361,11 +391,13 @@ impl Store {
         if r.get("id").and_then(Value::as_str) != Some(id) {
             return ReceiptStatus::Invalid("the receipt names another entry, or none".into());
         }
-        match r.get("disposition").and_then(Value::as_str) {
-            Some("delivered") => ReceiptStatus::Valid(Disposition::Delivered, r),
-            Some("expired") => ReceiptStatus::Valid(Disposition::Expired, r),
-            Some("dropped") => ReceiptStatus::Valid(Disposition::Dropped, r),
-            _ => ReceiptStatus::Invalid("the receipt has no known disposition".into()),
+        match r
+            .get("disposition")
+            .and_then(Value::as_str)
+            .and_then(Disposition::parse)
+        {
+            Some(how) => ReceiptStatus::Valid(how, r),
+            None => ReceiptStatus::Invalid("the receipt has no known disposition".into()),
         }
     }
 
@@ -392,18 +424,31 @@ impl Store {
         })
     }
 
-    /// Keeps an undelivered entry where an engine-4 client looks, in the one
-    /// state such a client reads as not delivered: there, with a sender retry
-    /// recorded, so it reports the event queued and does not send it itself.
-    /// A dropped entry is also held back until its expiry, so an engine-4
-    /// sender still running does not send it either.
+    /// An undelivered entry leaving a store whose clients read absence as
+    /// delivery, while the client that made it may still look for it.
+    fn must_keep(&self, e: &Entry, how: Disposition) -> bool {
+        self.absence_is_delivery && how != Disposition::Delivered && !self.client_done(&e.id)
+    }
+
+    /// Keeps an undelivered entry where an engine-4 client looks, in a state
+    /// that client reads as not delivered and that every older sender
+    /// leaves alone. The client finds it there with a sender retry recorded,
+    /// so it reports the event queued and does not send it itself. It is
+    /// not expired and is held back (`notBefore`, next attempt) until 2100,
+    /// so engine-4 senders (which expire first, then honour `notBefore`,
+    /// even forced) and engine-6 and engine-7 senders neither dead-letter
+    /// nor send it. How it left, and its real expiry, are kept in the entry
+    /// (`retainedAs`, `retainedExpiresMs`), never as a receipt here: those
+    /// senders clean up an entry beside a receipt. Call with the lease held.
     fn retain(&self, e: &Entry, how: Disposition) {
         let mut kept = e.clone();
         kept.retries = kept.retries.max(1);
-        if how == Disposition::Dropped {
-            kept.not_before_ms = Some(kept.not_before_ms.unwrap_or(0).max(kept.expires_ms));
-        }
-        if kept.retries != e.retries || kept.not_before_ms != e.not_before_ms {
+        kept.retained_as = Some(e.retained_as.unwrap_or(how));
+        kept.retained_expires_ms = Some(e.retained_expires_ms.unwrap_or(e.expires_ms));
+        kept.expires_ms = RETAINED_UNTIL_MS;
+        kept.not_before_ms = Some(RETAINED_UNTIL_MS);
+        kept.next_attempt_ms = RETAINED_UNTIL_MS;
+        if kept != *e {
             let saved = self.save(&kept);
             trace::record(
                 "outbox.retained",
@@ -413,15 +458,22 @@ impl Store {
         }
     }
 
-    /// Removes an entry (expired: moves it to `dead/`) and its lease file,
-    /// and returns true. An undelivered entry in a store whose clients read
-    /// absence as delivery stays (see `retain`) until its client is done
-    /// with it; then this returns false.
-    fn cleanup(&self, e: &Entry, how: Disposition) -> bool {
-        if self.absence_is_delivery && how != Disposition::Delivered && !self.client_done(&e.id) {
-            self.retain(e, how);
-            return false;
-        }
+    /// A retained entry whose client is done with it leaves as it would
+    /// have: with its real expiry back, a receipt, and expired to `dead/` or
+    /// dropped removed. Call with the lease held.
+    fn retire(&self, e: &Entry, how: Disposition) {
+        let mut back = e.clone();
+        back.expires_ms = e.retained_expires_ms.unwrap_or(e.expires_ms);
+        back.next_attempt_ms = back.expires_ms;
+        back.not_before_ms = None;
+        back.retained_as = None;
+        back.retained_expires_ms = None;
+        let _ = self.save(&back);
+        self.finish(&back, how, back.last_status, "outbox sender");
+    }
+
+    /// Removes an entry (expired: moves it to `dead/`) and its lease file.
+    fn cleanup(&self, e: &Entry, how: Disposition) {
         if how == Disposition::Expired {
             let dead = self.dir.join("dead");
             if util::ensure_private_dir(&dead).is_ok() {
@@ -431,21 +483,39 @@ impl Store {
         } else {
             self.remove(&e.id);
         }
-        true
+    }
+
+    /// An entry beside a valid receipt that must stay for its engine-4
+    /// client: retained, and the receipt taken back until it leaves (an
+    /// engine-6 or engine-7 sender would remove the entry beside it).
+    fn retain_from_receipt(&self, e: &Entry, how: Disposition) {
+        self.retain(e, how);
+        let _ = fs::remove_file(self.receipt_path(&e.id));
     }
 
     /// Records how an entry left the store, then removes it (or, expired,
     /// moves it to `dead/`). Call with the lease held. The receipt is written
     /// (fsynced) first, so a crash in between leaves both, never neither. A
     /// valid receipt already there is final: cleanup follows it instead.
+    /// An undelivered entry an engine-4 client may still look for is
+    /// retained instead (see `retain`).
     fn finish(&self, e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
         if let ReceiptStatus::Valid(existing, _) = self.receipt_status(&e.id) {
-            let removed = self.cleanup(e, existing);
+            let keep = self.must_keep(e, existing);
+            if keep {
+                self.retain_from_receipt(e, existing);
+            } else {
+                self.cleanup(e, existing);
+            }
             trace::record(
                 "outbox.reconciled",
                 json!({ "id": e.id, "store": self.label, "disposition": existing.as_str(),
-                        "wanted": how.as_str(), "by": by, "retained": !removed }),
+                        "wanted": how.as_str(), "by": by, "retained": keep }),
             );
+            return;
+        }
+        if self.must_keep(e, how) {
+            self.retain(e, how);
             return;
         }
         let receipt = json!({
@@ -459,11 +529,11 @@ impl Store {
         });
         let written = util::ensure_private_dir(&self.dir.join("receipts"))
             .and_then(|_| util::write_private(&self.receipt_path(&e.id), receipt.to_string().as_bytes()));
-        let removed = self.cleanup(e, how);
+        self.cleanup(e, how);
         trace::record(
             &format!("outbox.{}", how.as_str()),
             json!({ "id": e.id, "store": self.label, "attempts": e.attempts, "status": status, "by": by,
-                    "retained": !removed, "receiptError": written.err().map(|err| err.to_string()) }),
+                    "receiptError": written.err().map(|err| err.to_string()) }),
         );
     }
 
@@ -475,13 +545,16 @@ impl Store {
         match self.receipt_status(&e.id) {
             ReceiptStatus::None => Ok(None),
             ReceiptStatus::Valid(how, _) => {
-                let removed = self.cleanup(e, how);
-                if removed {
-                    trace::record(
-                        "outbox.reconciled",
-                        json!({ "id": e.id, "store": self.label, "disposition": how.as_str() }),
-                    );
+                let keep = self.must_keep(e, how);
+                if keep {
+                    self.retain_from_receipt(e, how);
+                } else {
+                    self.cleanup(e, how);
                 }
+                trace::record(
+                    "outbox.reconciled",
+                    json!({ "id": e.id, "store": self.label, "disposition": how.as_str(), "retained": keep }),
+                );
                 Ok(Some(how))
             }
             ReceiptStatus::Invalid(why) => {
@@ -514,9 +587,13 @@ impl Store {
         matches!(self.receipt_status(id), ReceiptStatus::Valid(..))
     }
 
-    /// Entries still to be sent: all but finished ones.
+    /// Entries still to be sent: all but finished and retained ones.
     fn pending(&self) -> Vec<Entry> {
-        self.entries().0.into_iter().filter(|e| !self.finished(&e.id)).collect()
+        self.entries()
+            .0
+            .into_iter()
+            .filter(|e| e.retained_as.is_none() && !self.finished(&e.id))
+            .collect()
     }
 
     /// Undelivered entries kept in place for engine-4 clients, with how
@@ -528,10 +605,7 @@ impl Store {
         self.entries()
             .0
             .into_iter()
-            .filter_map(|e| match self.receipt_status(&e.id) {
-                ReceiptStatus::Valid(how, _) if how != Disposition::Delivered => Some((e, how)),
-                _ => None,
-            })
+            .filter_map(|e| e.retained_as.map(|how| (e, how)))
             .collect()
     }
 
@@ -584,6 +658,38 @@ impl Store {
                 drop(lease);
                 continue;
             };
+            // Held back as retained, without saying so: an older build
+            // rewrote it (engine 5 moves retained entries into its own
+            // store). Here it stays retained; anywhere else its engine-4
+            // client has lost it already, and it is finished as expired.
+            if e.retained_as.is_none() && e.not_before_ms == Some(RETAINED_UNTIL_MS) {
+                if self.absence_is_delivery {
+                    self.retain(&e, Disposition::Expired);
+                    e = self.load(&e.id).unwrap_or(e);
+                } else {
+                    let mut back = e.clone();
+                    back.not_before_ms = None;
+                    self.finish(
+                        &back,
+                        Disposition::Expired,
+                        e.last_status,
+                        "outbox sender (held entry moved here)",
+                    );
+                    results.push(json!({ "id": e.id, "store": self.label, "deadLettered": true,
+                                         "reason": "an entry held back for an engine-4 client, moved here by another build" }));
+                    continue;
+                }
+            }
+            if let Some(how) = e.retained_as {
+                if self.client_done(&e.id) {
+                    self.retire(&e, how);
+                    results.push(json!({ "id": e.id, "store": self.label, "retired": how.as_str() }));
+                } else {
+                    results.push(json!({ "id": e.id, "store": self.label, "retained": how.as_str(),
+                                         "reason": RETAINED }));
+                }
+                continue;
+            }
             match self.reconcile(&e) {
                 Ok(Some(how)) => {
                     results.push(if self.path_of(&e.id).exists() {
@@ -600,7 +706,7 @@ impl Store {
             let now = util::now_ms();
             if now >= e.expires_ms {
                 self.finish(&e, Disposition::Expired, e.last_status, "outbox sender");
-                results.push(if self.path_of(&e.id).exists() {
+                results.push(if self.load(&e.id).is_some_and(|k| k.retained_as.is_some()) {
                     json!({ "id": e.id, "store": self.label, "retained": "expired", "attempts": e.attempts,
                             "reason": RETAINED })
                 } else {
@@ -806,6 +912,8 @@ pub fn enqueue(w: &Webhook, event: &str, id: &str, body: &[u8], max_age: Duratio
         last_error: None,
         last_status: None,
         last_attempt_ms: None,
+        retained_as: None,
+        retained_expires_ms: None,
     })?;
     trace::record(
         "outbox.created",
@@ -1017,6 +1125,23 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
     }
 }
 
+/// Older senders that move `outbox-v2/` entries whatever their state,
+/// minding only the entry lease, so that no representation keeps a retained
+/// entry from them: engine 5 (`0.3.0`, never released). Found when its
+/// daemon answers at its default socket.
+pub fn incompatible_senders() -> Vec<Value> {
+    let sock = config::state_dir().join("daemon-e5.sock");
+    if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        return Vec::new();
+    }
+    vec![json!({
+        "engine": 5,
+        "socket": sock.display().to_string(),
+        "risk": "moves outbox-v2 entries an engine-4 client may still look for, so that client would report them delivered",
+        "action": "stop it with its own binary's `t3-watch stop`",
+    })]
+}
+
 pub fn summary_json() -> Value {
     let store = Store::current();
     // Both counts come from one inventory: entries written while this runs
@@ -1029,6 +1154,7 @@ pub fn summary_json() -> Value {
         "pending": pending.len() + legacy.len(),
         "legacyPending": legacy.len(),
         "legacyRetained": retained_public_json().len(),
+        "incompatibleSenders": incompatible_senders(),
         "finishedAwaitingCleanup": entries.len() - pending.len(),
         "unreadable": bad.len(),
         "oldestCreatedAt": oldest.map(util::rfc3339_ms),
@@ -1057,8 +1183,16 @@ mod tests {
             last_attempt_ms: Some(6),
             last_error: Some("host not found".into()),
             last_status: None,
+            retained_as: None,
+            retained_expires_ms: None,
         };
         assert_eq!(Entry::from_json(&e.to_json()), Some(e.clone()));
+        let kept = Entry {
+            retained_as: Some(Disposition::Dropped),
+            retained_expires_ms: Some(2),
+            ..e.clone()
+        };
+        assert_eq!(Entry::from_json(&kept.to_json()), Some(kept));
         let public = e.public_json().to_string();
         for secret in ["s3cr3t-path", "token=abc", "Bearer xyz", "signing-key"] {
             assert!(!public.contains(secret), "{public}");

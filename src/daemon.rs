@@ -529,7 +529,8 @@ pub fn request(op: &str) -> Result<Option<Value>, String> {
 /// What the client learned about the daemon that served a wait.
 pub struct DaemonInfo {
     pub reconnects: u32,
-    /// Answers thrown away because the host slept before they were read.
+    /// Registrations dropped and made again because the host slept during
+    /// them.
     pub stale: u32,
     /// The `accepted` line's pid, version, engine and rev.
     pub build: Option<Value>,
@@ -607,8 +608,8 @@ enum Answer {
     Outcome(Outcome),
     /// The connection dropped before an outcome arrived.
     Dropped,
-    /// The host slept after the socket was last seen empty, so the answer
-    /// may have been written, or its observation made, before the sleep.
+    /// The host slept while this registration was open: whatever it answers
+    /// may rest on an observation made before the sleep.
     Stale,
 }
 
@@ -618,13 +619,13 @@ enum Answer {
 /// cancels that daemon's wait. Reads time out every second so the wait's
 /// suspend-inclusive deadline is checked even while the daemon is silent.
 ///
-/// A final answer is checked when it is read, not only while it is
-/// awaited: after the deadline it never counts (the wait timed out), and
-/// one that may predate a suspend is `Stale`. Each read that times out on
-/// an empty socket (no part of a line pending) marks a point the answer
-/// must have been written after; more than `SUSPEND_GAP_MS` of suspended
-/// time since then means the host slept with the answer possibly already
-/// on its way.
+/// A sleep of the host while the registration is open voids it: more than
+/// `SUSPEND_GAP_MS` of suspended time since the request went out ends the
+/// read as `Stale` at the first look after the resume, whether that look
+/// finds a line or an empty socket. An empty socket proves nothing about
+/// an answer still on its way, or about when the daemon made the
+/// observation behind it. A final answer read after the deadline never
+/// counts (the wait timed out), even without a sleep.
 fn read_outcome(
     stream: &UnixStream,
     sw: &util::Stopwatch,
@@ -637,13 +638,27 @@ fn read_outcome(
     let mut reader = BufReader::new(stream);
     let mut accepted: Option<Value> = None;
     let mut partial = Vec::new();
-    let mut quiet_since = sw.suspended_ms();
+    let registered = sw.suspended_ms();
+    let stale = |pending: &str| {
+        let slept = sw.suspended_ms().saturating_sub(registered);
+        (slept > SUSPEND_GAP_MS).then(|| {
+            trace::record(
+                "daemon.stale",
+                json!({ "pending": pending, "sleptMs": slept, "elapsedMs": sw.elapsed_ms() }),
+            );
+            Answer::Stale
+        })
+    };
     loop {
         let line = match read_line_resumable(&mut reader, MAX_RESPONSE_LINE, &mut partial) {
             Ok(l) => l,
             Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if partial.is_empty() {
-                    quiet_since = sw.suspended_ms();
+                if let Some(a) = stale(if partial.is_empty() {
+                    "nothing read"
+                } else {
+                    "part of a line"
+                }) {
+                    return a;
                 }
                 if sw.elapsed_ms() >= deadline_ms + ANSWER_GRACE_MS {
                     return Answer::Outcome(client_timeout(sw, "the daemon did not answer before the timeout"));
@@ -659,6 +674,12 @@ fn read_outcome(
             return Answer::Dropped;
         };
         let is_accepted = v.get("event").and_then(Value::as_str) == Some("accepted");
+        let is_progress = v.get("progress").and_then(Value::as_bool) == Some(true);
+        if is_accepted || is_progress {
+            if let Some(a) = stale(if is_accepted { "accepted" } else { "progress" }) {
+                return a;
+            }
+        }
         if accepted.is_none() {
             let candidate = is_accepted.then_some(&v);
             if let Some(why) = incompatible(candidate, &v, sock) {
@@ -672,7 +693,7 @@ fn read_outcome(
                 continue;
             }
         }
-        if v.get("progress").and_then(Value::as_bool) == Some(true) {
+        if is_progress {
             progress(v);
             continue;
         }
@@ -680,6 +701,7 @@ fn read_outcome(
             continue;
         }
         let outcome = Outcome::from_json(v);
+        // The daemon timing the wait out is never a false completion.
         if matches!(outcome, Outcome::Timeout(_)) {
             return Answer::Outcome(outcome);
         }
@@ -695,13 +717,8 @@ fn read_outcome(
                 "the daemon's answer was read after the wait's time ran out (suspended time included); it was not used",
             ));
         }
-        let slept = sw.suspended_ms().saturating_sub(quiet_since);
-        if slept > SUSPEND_GAP_MS {
-            trace::record(
-                "daemon.stale",
-                json!({ "event": outcome.event(), "sleptMs": slept, "elapsedMs": elapsed }),
-            );
-            return Answer::Stale;
+        if let Some(a) = stale(outcome.event()) {
+            return a;
         }
         return Answer::Outcome(outcome);
     }
@@ -724,9 +741,9 @@ fn expired(sw: &util::Stopwatch, info: &DaemonInfo) -> Outcome {
 /// suspend-inclusive clock, kept across reconnects: if the daemon dies
 /// mid-wait (crash, upgrade, idle-exit race) the client reconnects and
 /// re-registers with what is left of it, and times out at once when nothing
-/// is. An answer that may predate a suspend is thrown away the same way:
-/// the client registers again, and the daemon answers the new registration
-/// only from observations made after it. The daemon's `elapsedMs` counts
+/// is. A registration the host slept through is dropped the same way,
+/// answer or not: the client registers again, and the daemon answers the
+/// new registration only from observations made after it. The daemon's `elapsedMs` counts
 /// from the last registration only.
 pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, DaemonInfo), String> {
     let sw = util::Stopwatch::start();
