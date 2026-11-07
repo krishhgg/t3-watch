@@ -1,8 +1,9 @@
 //! Local backend: asks T3's own CLI for a thread's state.
 //!
-//!   t3 thread show --base-dir <dir> --messages 0 --json <threadId>
+//!   t3 thread show --base-dir <dir> --messages <n> --json <threadId>
 //!
-//! Needs no OAuth because it runs as the same user as the T3 server.
+//! Needs no OAuth because it runs as the same user as the T3 server. Messages
+//! are only asked for when `--final-marker` needs the last one.
 
 use crate::cancel::Cancel;
 use crate::mcp::CallError;
@@ -30,12 +31,22 @@ fn transient(message: String) -> CallError {
     CallError::Transient { message, status: None }
 }
 
-pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str, cancel: &Cancel) -> Result<ThreadState, CallError> {
+/// Runs `t3 thread show` and returns the parsed state plus the raw JSON
+/// (which holds the `messages` when `messages` > 0).
+pub fn show(
+    t3_bin: &Path,
+    base_dir: &Path,
+    thread_id: &str,
+    messages: u32,
+    cancel: &Cancel,
+) -> Result<(ThreadState, serde_json::Value), CallError> {
     let observed_at = Instant::now();
     let mut child = Command::new(t3_bin)
         .args(["thread", "show", "--base-dir"])
         .arg(base_dir)
-        .args(["--messages", "0", "--json", thread_id])
+        .arg("--messages")
+        .arg(messages.to_string())
+        .args(["--json", thread_id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -138,7 +149,7 @@ pub fn show(t3_bin: &Path, base_dir: &Path, thread_id: &str, cancel: &Cancel) ->
     if state.status.is_none() {
         return Err(transient("t3 output has no thread status".into()));
     }
-    Ok(state)
+    Ok((state, v))
 }
 
 #[cfg(test)]
@@ -184,7 +195,7 @@ mod tests {
             c.cancel();
         });
         let started = Instant::now();
-        let err = show(&bin, Path::new("/tmp"), "t", &cancel).unwrap_err();
+        let err = show(&bin, Path::new("/tmp"), "t", 0, &cancel).unwrap_err();
         killer.join().unwrap();
         assert_eq!(err, CallError::Cancelled);
         assert!(
@@ -199,7 +210,7 @@ mod tests {
         let (bin, pidfile) = slow_script("wd");
         util::FAIL_SPAWNS.with(|c| c.set((0, 1)));
         let started = Instant::now();
-        let err = show(&bin, Path::new("/tmp"), "t", &Cancel::new()).unwrap_err();
+        let err = show(&bin, Path::new("/tmp"), "t", 0, &Cancel::new()).unwrap_err();
         assert!(err.message().contains("watchdog"), "{err:?}");
         assert!(matches!(err, CallError::Transient { .. }));
         assert!(started.elapsed() < Duration::from_secs(5), "child was not killed");
@@ -212,7 +223,7 @@ mod tests {
         // The watchdog spawns; the stderr reader does not.
         util::FAIL_SPAWNS.with(|c| c.set((1, 1)));
         let started = Instant::now();
-        let err = show(&bin, Path::new("/tmp"), "t", &Cancel::new()).unwrap_err();
+        let err = show(&bin, Path::new("/tmp"), "t", 0, &Cancel::new()).unwrap_err();
         assert!(err.message().contains("stderr"), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "child was not killed");
         assert_gone(&pidfile);

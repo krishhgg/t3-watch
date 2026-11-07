@@ -505,6 +505,177 @@ pub fn check_peer(s: &std::os::unix::net::UnixStream) -> io::Result<()> {
     Ok(())
 }
 
+/// `2026-11-07T02:47:06.298Z` for a Unix time in milliseconds (UTC).
+pub fn rfc3339_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60,
+        ms % 1000
+    )
+}
+
+/// Text that may leave this machine (a question shown to a bot): control
+/// characters become spaces, runs of whitespace collapse, the length is
+/// bounded in characters, and anything that looks like a credential is
+/// replaced. Unlike `sanitize_text` it keeps non-ASCII letters.
+pub fn safe_text(s: &str, max: usize) -> String {
+    let cleaned: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = redact_secrets(&joined);
+    if out.chars().count() > max {
+        out = out.chars().take(max.saturating_sub(1)).collect::<String>() + "…";
+    }
+    out
+}
+
+const REDACTED: &str = "[redacted]";
+const SECRET_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk_",
+    "rk_",
+    "pk_live",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "AKIA",
+    "ASIA",
+    "AIza",
+    "eyJ",
+    "npm_",
+    "pypi-",
+];
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "auth",
+    "authorization",
+    "credential",
+    "private_key",
+    "access_key",
+    "client_secret",
+    "session",
+    "cookie",
+];
+
+fn is_secret_key(word: &str) -> bool {
+    let w = word
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .to_ascii_lowercase();
+    !w.is_empty()
+        && SECRET_KEYS
+            .iter()
+            .any(|k| w == *k || w.ends_with(&format!("_{k}")) || w.ends_with(&format!("-{k}")))
+}
+
+fn looks_like_secret(piece: &str) -> bool {
+    let p = piece.trim_matches(|c: char| "\"'`()[]{}<>,;".contains(c));
+    if p.len() >= 12 && SECRET_PREFIXES.iter().any(|pre| p.starts_with(pre)) {
+        return true;
+    }
+    // A long run of token characters with letters and digits mixed: API
+    // keys, hex secrets, base64 blobs.
+    p.len() >= 32
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-+=".contains(&b))
+        && p.bytes().any(|b| b.is_ascii_digit())
+        && p.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Replaces likely credentials in free text: known key prefixes (`sk-`,
+/// `ghp_`, JWTs...), long mixed alphanumeric runs, the word after `Bearer`
+/// or `Basic`, values of `password=`/`token:`-style pairs, and URL userinfo.
+/// Errs on the side of hiding too much.
+pub fn redact_secrets(s: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in s.split(' ') {
+        if word.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        // `Authorization: Bearer x`: keep the scheme, hide what follows.
+        let lower = word.to_ascii_lowercase();
+        if lower == "bearer" || lower == "basic" {
+            redact_next = true;
+            out.push(word.into());
+            continue;
+        }
+        if redact_next {
+            redact_next = false;
+            out.push(REDACTED.into());
+            continue;
+        }
+        // `key=value`, `key:value` and `?a=b&token=c`.
+        let mut rebuilt = String::new();
+        let mut rest = word;
+        while !rest.is_empty() {
+            let cut = rest.find(['&', '?', ',', ';']).map_or(rest.len(), |i| i + 1);
+            let (part, tail) = rest.split_at(cut);
+            rest = tail;
+            let (body, delim) = match part.char_indices().last() {
+                Some((i, c)) if "&?,;".contains(c) => (&part[..i], &part[i..]),
+                _ => (part, ""),
+            };
+            let redacted = if let Some((k, v)) = body.split_once(['=', ':']).filter(|(k, _)| is_secret_key(k)) {
+                if v.trim_matches(|c: char| "\"' ".contains(c)).is_empty() {
+                    // `"password": "x"` with the value in the next word.
+                    redact_next = true;
+                    body.to_string()
+                } else {
+                    format!("{k}{}{REDACTED}", &body[k.len()..k.len() + 1])
+                }
+            } else if let Some(at) = body.find('@').filter(|_| body.contains("://")) {
+                // https://user:pass@host -> https://[redacted]@host
+                let scheme_end = body.find("://").unwrap() + 3;
+                if at > scheme_end {
+                    format!("{}{REDACTED}{}", &body[..scheme_end], &body[at..])
+                } else {
+                    body.to_string()
+                }
+            } else if looks_like_secret(body) {
+                REDACTED.to_string()
+            } else {
+                body.to_string()
+            };
+            rebuilt.push_str(&redacted);
+            rebuilt.push_str(delim);
+        }
+        if is_secret_key(word) && word.ends_with([':', '=']) {
+            redact_next = true;
+        }
+        out.push(rebuilt);
+    }
+    out.join(" ")
+}
+
 #[cfg(test)]
 thread_local! {
     /// `(skip, fail)`: let the next `skip` `spawn_thread` calls on this
@@ -545,6 +716,41 @@ mod tests {
         let d = std::env::temp_dir().join(format!("t3wu-{tag}-{}-{}", std::process::id(), hex(&random_bytes(4))));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_ms(1_793_933_226_298), "2026-11-06T02:47:06.298Z");
+        assert_eq!(rfc3339_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn secrets_are_redacted_from_free_text() {
+        let cases = [
+            ("use sk-live-ABCDEFGHIJKLMNOPQRST now", "sk-live"),
+            ("Authorization: Bearer abc.def.ghi please", "abc.def"),
+            ("set password=hunter2 then", "hunter2"),
+            ("\"api_key\": \"zzz-top-secret\"", "zzz-top"),
+            ("token:qwerty123", "qwerty123"),
+            ("https://u:p4ss@example.com/x", "p4ss"),
+            ("https://h.example/cb?code=1&token=abcd1234", "abcd1234"),
+            (
+                "key 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "9f86d081",
+            ),
+            ("jwt eyJhbGciOiJIUzI1NiJ9.e30.x", "eyJhbGci"),
+            ("ghp_abcdefghijklmnopqrstuvwxyz0123", "ghp_abc"),
+        ];
+        for (input, secret) in cases {
+            let out = redact_secrets(input);
+            assert!(!out.contains(secret), "{input:?} -> {out:?}");
+            assert!(out.contains("[redacted]"), "{input:?} -> {out:?}");
+        }
+        let plain = "Should I merge PR #3055 into main (Recommended)? Path /Users/krish/.t3/worktrees/x";
+        assert_eq!(redact_secrets(plain), plain);
+        assert_eq!(safe_text("a\nb\u{0}  c — é", 100), "a b c — é");
+        assert_eq!(safe_text("abcdef", 4), "abc…");
     }
 
     #[test]

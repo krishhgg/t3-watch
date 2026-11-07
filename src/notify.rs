@@ -1,5 +1,8 @@
 //! Wake notifications for a finished wait, run by the waiting client (never
-//! by the shared daemon): an HTTPS webhook and/or a local program.
+//! by the shared daemon): an HTTPS webhook and/or a local program. With
+//! `--durable`, a webhook that cannot be delivered within its inline budget
+//! is kept in the outbox and retried by the daemon until it gets a 2xx (see
+//! `outbox`).
 //!
 //! Secrets stay out of argv and out of output. The webhook URL, extra header
 //! values and the signing secret come from environment variables or files;
@@ -8,11 +11,12 @@
 //! Results report attempts, HTTP status and an error category only, never a
 //! URL, header, key or response body.
 
+use crate::outbox;
 use crate::util::{self, Jitter};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -26,31 +30,43 @@ const MAX_SECRET_FILE: u64 = 64 * 1024;
 const MAX_HEADER_VALUE: usize = 8 * 1024;
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum NotifyOn {
-    /// Only when the threads settled (default).
-    Settled,
-    /// Also on timeout and error, so an expired token cannot strand an
-    /// unattended bot without a wake-up.
-    All,
+/// Notification classes for `--notify-on`. Final results are `settled`
+/// (completed or failed), `needs_input`, `timeout` and `error`; progress is
+/// `run_failed` (`--follow`) and `upstream` (`--notify-unreachable`).
+pub const CLASSES: &[&str] = &["settled", "needs_input", "timeout", "error", "run_failed", "upstream"];
+/// Without `--notify-on`: everything except timeout and error.
+const DEFAULT_CLASSES: &[&str] = &["settled", "needs_input", "run_failed", "upstream"];
+
+/// The `--notify-on` class an event belongs to.
+fn class_of(event: &str) -> &str {
+    match event {
+        "upstream_unreachable" | "upstream_restored" => "upstream",
+        other => other,
+    }
 }
 
+#[derive(Clone)]
 pub struct Webhook {
-    url: String,
-    headers: Vec<(String, String)>,
-    secret: Option<Vec<u8>>,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub secret: Option<Vec<u8>>,
 }
 
 pub struct Hook {
     program: String,
     args: Vec<String>,
     timeout: Duration,
+    /// Where the hook's output goes (`hooks.log` in the state directory).
+    log: std::path::PathBuf,
 }
 
 pub struct Notify {
     webhook: Option<Webhook>,
     hook: Option<Hook>,
-    on: NotifyOn,
+    on: Vec<&'static str>,
+    /// Keep undelivered webhooks in the outbox until this long after they
+    /// were created. `None`: no outbox, inline attempts only.
+    durable: Option<Duration>,
 }
 
 /// The notification options as given on the command line.
@@ -66,6 +82,8 @@ pub struct NotifyArgs {
     pub on_settle_args: Vec<String>,
     pub on_settle_timeout: Option<Duration>,
     pub notify_on: Option<String>,
+    pub durable: bool,
+    pub durable_max_age: Option<Duration>,
 }
 
 fn read_env(var: &str, what: &str) -> Result<String, String> {
@@ -136,6 +154,7 @@ fn is_header_name(name: &str) -> bool {
 }
 
 const RESERVED_HEADERS: &[&str] = &[
+    "idempotency-key",
     "host",
     "content-length",
     "content-type",
@@ -151,10 +170,25 @@ fn header_value_ok(v: &str) -> bool {
 impl Notify {
     /// Validates the options and reads every referenced secret now.
     pub fn from_args(a: &NotifyArgs) -> Result<Notify, String> {
-        let on = match a.notify_on.as_deref() {
-            None | Some("settled") => NotifyOn::Settled,
-            Some("all") => NotifyOn::All,
-            Some(_) => return Err("--notify-on must be `settled` or `all`".into()),
+        let on: Vec<&'static str> = match a.notify_on.as_deref() {
+            None => DEFAULT_CLASSES.to_vec(),
+            Some("all") => CLASSES.to_vec(),
+            Some(list) => {
+                let mut on = Vec::new();
+                for c in list.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                    let Some(known) = CLASSES.iter().find(|k| **k == c) else {
+                        return Err(format!(
+                            "--notify-on takes `all` or a comma list of {}",
+                            CLASSES.join(", ")
+                        ));
+                    };
+                    on.push(*known);
+                }
+                if on.is_empty() {
+                    return Err("--notify-on needs at least one event class".into());
+                }
+                on
+            }
         };
         let sources = [&a.webhook_url, &a.webhook_url_env, &a.webhook_url_file]
             .iter()
@@ -226,6 +260,7 @@ impl Notify {
             program: program.clone(),
             args: a.on_settle_args.clone(),
             timeout: a.on_settle_timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT),
+            log: crate::config::state_dir().join("hooks.log"),
         });
         if hook
             .as_ref()
@@ -233,28 +268,47 @@ impl Notify {
         {
             return Err("--on-settle needs a program path".into());
         }
-        Ok(Notify { webhook, hook, on })
+        if a.durable && webhook.is_none() {
+            return Err("--durable keeps webhook deliveries; it needs a webhook URL".into());
+        }
+        if a.durable_max_age.is_some() && !a.durable {
+            return Err("--durable-max-age needs --durable".into());
+        }
+        let durable = a.durable.then(|| a.durable_max_age.unwrap_or(outbox::DEFAULT_MAX_AGE));
+        Ok(Notify {
+            webhook,
+            hook,
+            on,
+            durable,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.webhook.is_none() && self.hook.is_none()
     }
 
+    pub fn has_webhook(&self) -> bool {
+        self.webhook.is_some()
+    }
+
     pub fn applies_to(&self, event: &str) -> bool {
-        match self.on {
-            NotifyOn::Settled => event == "settled",
-            NotifyOn::All => matches!(event, "settled" | "timeout" | "error"),
-        }
+        self.on.contains(&class_of(event))
     }
 
     /// Delivers `body` (the result JSON) for `event`. Returns `None` when
     /// nothing was configured for this event; otherwise a JSON summary with
     /// an overall `delivered` flag. The webhook and the hook run in parallel.
+    /// With `--durable` the webhook is written to the outbox first, so a
+    /// crash during delivery loses nothing, and stays there until a 2xx.
     pub fn deliver(&self, event: &str, body: &[u8]) -> Option<Value> {
         if self.is_empty() || !self.applies_to(event) {
             return None;
         }
         let id = util::hex(&util::random_bytes(16));
+        let queued = match (&self.webhook, self.durable) {
+            (Some(w), Some(max_age)) => Some(outbox::enqueue(w, event, &id, body, max_age)),
+            _ => None,
+        };
         let (webhook, hook) = thread::scope(|scope| {
             let web = self.webhook.as_ref().map(|w| {
                 let id = id.as_str();
@@ -272,8 +326,30 @@ impl Notify {
             });
             (web, hook)
         });
+        let mut webhook = webhook;
+        if let (Some(queued), Some(w)) = (queued, webhook.as_mut()) {
+            match queued {
+                Ok(()) if w["delivered"] == true => outbox::remove(&id),
+                Ok(()) => {
+                    let attempts = w["attempts"].as_u64().unwrap_or(0) as u32;
+                    let error = w["error"].as_str().unwrap_or("not delivered").to_string();
+                    let status = w["status"].as_u64().map(|s| s as u16);
+                    match outbox::after_inline_failure(&id, attempts, &error, status) {
+                        Ok(()) => {
+                            w["queued"] = json!(true);
+                            w["outboxId"] = json!(id);
+                        }
+                        Err(e) => w["queueError"] = json!(e),
+                    }
+                }
+                Err(e) => w["queueError"] = json!(e),
+            }
+        }
         let ok = |v: &Option<Value>| v.as_ref().is_none_or(|v| v["delivered"] == true);
         let mut out = json!({ "delivered": ok(&webhook) && ok(&hook), "id": id });
+        if webhook.as_ref().is_some_and(|w| w["queued"] == true) {
+            out["queued"] = json!(true);
+        }
         if let Some(w) = webhook {
             out["webhook"] = w;
         }
@@ -281,6 +357,15 @@ impl Notify {
             out["onSettle"] = h;
         }
         Some(out)
+    }
+
+    /// One best-effort heartbeat POST (no retries, never queued): a missing
+    /// heartbeat is the signal a receiver-side monitor looks for.
+    pub fn heartbeat(&self, id: &str, body: &[u8]) -> bool {
+        let Some(w) = &self.webhook else {
+            return false;
+        };
+        post_once(&agent_for(w), w, "heartbeat", id, body, Duration::from_secs(10), 1).delivered
     }
 }
 
@@ -303,15 +388,91 @@ fn retry_after(resp: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
-    let https = w.url.starts_with("https://");
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+pub fn agent_for(w: &Webhook) -> ureq::Agent {
+    ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
-        .https_only(https)
+        .https_only(w.url.starts_with("https://"))
         .user_agent(concat!("t3-watch/", env!("CARGO_PKG_VERSION")))
         .build()
-        .into();
+        .into()
+}
+
+/// What one POST attempt got.
+pub struct Attempt {
+    pub delivered: bool,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+    pub retry_after: Option<Duration>,
+    /// Redirects and most 4xx answers will not change by retrying inline.
+    pub permanent: bool,
+}
+
+/// One signed POST. The same `id` goes out on every attempt as
+/// `X-T3-Watch-Id` and `Idempotency-Key`, so a receiver can drop
+/// duplicates (a retry after a lost response, or the outbox resending after
+/// a crash). The timestamp and signature are fresh for each attempt.
+pub fn post_once(
+    agent: &ureq::Agent,
+    w: &Webhook,
+    event: &str,
+    id: &str,
+    body: &[u8],
+    timeout: Duration,
+    attempt: u32,
+) -> Attempt {
+    let ts = util::now_ms() / 1000;
+    let mut req = agent
+        .post(&w.url)
+        .header("Content-Type", "application/json")
+        .header("X-T3-Watch-Event", event)
+        .header("X-T3-Watch-Id", id)
+        .header("Idempotency-Key", id)
+        .header("X-T3-Watch-Attempt", attempt.to_string());
+    if let Some(secret) = &w.secret {
+        req = req
+            .header("X-T3-Watch-Timestamp", ts.to_string())
+            .header("X-T3-Watch-Signature", signature(secret, ts, id, body));
+    }
+    for (k, v) in &w.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    match req.config().timeout_global(Some(timeout)).build().send(body) {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let retry_after = retry_after(&resp);
+            // Drain a little so the connection closes cleanly; never keep it.
+            let _ = resp
+                .into_body()
+                .into_reader()
+                .take(64 * 1024)
+                .read_to_end(&mut Vec::new());
+            let (delivered, permanent, error) = match status {
+                200..=299 => (true, false, None),
+                408 | 429 | 500..=599 => (false, false, Some(format!("HTTP {status}"))),
+                300..=399 => (false, true, Some(format!("HTTP {status}: redirects are not followed"))),
+                _ => (false, true, Some(format!("HTTP {status} (not retried inline)"))),
+            };
+            Attempt {
+                delivered,
+                status: Some(status),
+                error,
+                retry_after,
+                permanent,
+            }
+        }
+        Err(e) => Attempt {
+            delivered: false,
+            status: None,
+            error: Some(util::describe_ureq_error(&e)),
+            retry_after: None,
+            permanent: false,
+        },
+    }
+}
+
+fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
+    let agent = agent_for(w);
     let budget_end = Instant::now() + WEBHOOK_BUDGET;
     let mut jitter = Jitter::new();
     let mut attempts = 0;
@@ -323,62 +484,25 @@ fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
             break;
         }
         attempts += 1;
-        let ts = util::now_ms() / 1000;
-        let mut req = agent
-            .post(&w.url)
-            .header("Content-Type", "application/json")
-            .header("X-T3-Watch-Event", event)
-            .header("X-T3-Watch-Id", id);
-        if let Some(secret) = &w.secret {
-            req = req
-                .header("X-T3-Watch-Timestamp", ts.to_string())
-                .header("X-T3-Watch-Signature", signature(secret, ts, id, body));
+        let a = post_once(&agent, w, event, id, body, remaining.min(ATTEMPT_TIMEOUT), attempts);
+        last_status = a.status.or(last_status);
+        if a.delivered {
+            return json!({ "delivered": true, "attempts": attempts, "status": a.status });
         }
-        for (k, v) in &w.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let sent = req
-            .config()
-            .timeout_global(Some(remaining.min(ATTEMPT_TIMEOUT)))
-            .build()
-            .send(body);
-        let mut delay = jitter.backoff(attempts - 1, Duration::from_secs(1), Duration::from_secs(8));
-        match sent {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let wait_hint = retry_after(&resp);
-                // Drain a little so the connection closes cleanly; never keep it.
-                let _ = resp
-                    .into_body()
-                    .into_reader()
-                    .take(64 * 1024)
-                    .read_to_end(&mut Vec::new());
-                last_status = Some(status);
-                match status {
-                    200..=299 => {
-                        return json!({ "delivered": true, "attempts": attempts, "status": status });
-                    }
-                    408 | 429 | 500..=599 => {
-                        last_error = format!("HTTP {status}");
-                        if let Some(hint) = wait_hint {
-                            delay = hint;
-                        }
-                    }
-                    300..=399 => {
-                        return json!({ "delivered": false, "attempts": attempts, "status": status,
-                                       "error": format!("HTTP {status}: redirects are not followed") });
-                    }
-                    _ => {
-                        return json!({ "delivered": false, "attempts": attempts, "status": status,
-                                       "error": format!("HTTP {status} (not retried)") });
-                    }
-                }
+        last_error = a.error.unwrap_or_default();
+        if a.permanent {
+            let mut out = json!({ "delivered": false, "attempts": attempts, "error": last_error });
+            if let Some(s) = a.status {
+                out["status"] = json!(s);
             }
-            Err(e) => last_error = util::describe_ureq_error(&e),
+            return out;
         }
         if attempts >= WEBHOOK_ATTEMPTS {
             break;
         }
+        let delay = a
+            .retry_after
+            .unwrap_or_else(|| jitter.backoff(attempts - 1, Duration::from_secs(1), Duration::from_secs(8)));
         let remaining = budget_end.saturating_duration_since(Instant::now());
         if delay >= remaining {
             last_error = format!("{last_error}; the next retry would exceed the 60 s budget");
@@ -403,23 +527,37 @@ fn status_json(status: ExitStatus) -> Value {
     }
 }
 
-/// Runs the hook with the result JSON on stdin. Its stdout and stderr go to
-/// our stderr, never to the JSON on stdout. No shell is involved: `program`
-/// and its arguments are passed as they are.
+/// Where hook output goes: `hooks.log` in the state directory (0600),
+/// appended. Never our stdout (the result JSON) and never our stderr: a
+/// hook that leaves a background process holding an inherited pipe would
+/// keep whoever reads our output (an agent harness) waiting long after
+/// t3-watch has exited.
+fn hook_log(path: &Path) -> Stdio {
+    if fs::metadata(path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = fs::remove_file(path);
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let open = util::ensure_private_dir(dir).and_then(|_| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    });
+    open.map(Stdio::from).unwrap_or_else(|_| Stdio::null())
+}
+
+/// Runs the hook with the result JSON on stdin and its output going to
+/// `hooks.log`. No shell is involved: `program` and its arguments are
+/// passed as they are.
 fn run_hook(h: &Hook, event: &str, body: &[u8]) -> Value {
-    let to_stderr = || {
-        std::io::stderr()
-            .as_fd()
-            .try_clone_to_owned()
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null())
-    };
     let mut child = match Command::new(&h.program)
         .args(&h.args)
         .env("T3_WATCH_EVENT", event)
         .stdin(Stdio::piped())
-        .stdout(to_stderr())
-        .stderr(to_stderr())
+        .stdout(hook_log(&h.log))
+        .stderr(hook_log(&h.log))
         .process_group(0)
         .spawn()
     {
@@ -495,6 +633,8 @@ mod tests {
         assert!(Notify::from_args(&a).err().unwrap().contains("set by t3-watch"));
         a.header_envs = vec!["X-T3-Watch-Id=T3W_UNIT_H".into()];
         assert!(Notify::from_args(&a).is_err());
+        a.header_envs = vec!["Idempotency-Key=T3W_UNIT_H".into()];
+        assert!(Notify::from_args(&a).is_err());
         a.header_envs = vec!["Authorization=T3W_UNIT_UNSET".into()];
         assert!(Notify::from_args(&a).err().unwrap().contains("not set"));
         a.header_envs = vec![];
@@ -514,9 +654,20 @@ mod tests {
         assert!(Notify::from_args(&a).is_err());
         let mut a = args();
         a.on_settle = Some("/bin/true".into());
+        let n = Notify::from_args(&a).unwrap();
+        assert!(n.applies_to("settled") && n.applies_to("needs_input") && n.applies_to("run_failed"));
+        assert!(n.applies_to("upstream_unreachable") && !n.applies_to("timeout") && !n.applies_to("error"));
         a.notify_on = Some("all".into());
         let n = Notify::from_args(&a).unwrap();
         assert!(n.applies_to("timeout") && n.applies_to("error") && n.applies_to("settled"));
+        a.notify_on = Some("needs_input, error".into());
+        let n = Notify::from_args(&a).unwrap();
+        assert!(n.applies_to("needs_input") && n.applies_to("error") && !n.applies_to("settled"));
+        a.notify_on = Some(",".into());
+        assert!(Notify::from_args(&a).is_err());
+        let mut a = args();
+        a.durable = true;
+        assert!(Notify::from_args(&a).err().unwrap().contains("webhook URL"));
         let none = Notify::from_args(&args()).unwrap();
         assert!(none.is_empty());
         assert!(
@@ -538,6 +689,7 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), format!("cat > '{}'", out.display())],
             timeout: Duration::from_secs(5),
+            log: dir.join("hooks.log"),
         };
         assert_eq!(run_hook(&ok, "settled", b"{\"a\":1}")["delivered"], true);
         assert_eq!(fs::read_to_string(&out).unwrap(), "{\"a\":1}");
@@ -545,6 +697,7 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), "sleep 30".into()],
             timeout: Duration::from_millis(200),
+            log: dir.join("hooks.log"),
         };
         let started = Instant::now();
         let v = run_hook(&slow, "settled", b"{}");
@@ -552,14 +705,23 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let failing = Hook {
             program: "/bin/sh".into(),
-            args: vec!["-c".into(), "exit 7".into()],
+            args: vec!["-c".into(), "echo to-the-log; echo err-to-the-log >&2; exit 7".into()],
             timeout: Duration::from_secs(5),
+            log: dir.join("hooks.log"),
         };
         assert_eq!(run_hook(&failing, "settled", b"{}")["exitCode"], 7);
+        let log = fs::read_to_string(dir.join("hooks.log")).unwrap();
+        assert!(log.contains("to-the-log") && log.contains("err-to-the-log"), "{log}");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(dir.join("hooks.log")).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let missing = Hook {
             program: "/no/such/hook".into(),
             args: vec![],
             timeout: Duration::from_secs(5),
+            log: dir.join("hooks.log"),
         };
         assert_eq!(run_hook(&missing, "settled", b"{}")["delivered"], false);
         fs::remove_dir_all(dir).unwrap();

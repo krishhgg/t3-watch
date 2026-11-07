@@ -58,6 +58,9 @@ pub enum CallError {
     /// HTTP 401. `call_tool` tries to recover a token once, then reports
     /// `Auth` or `Transient`; it never reaches the engine.
     Unauthorized(String),
+    /// The server cannot give the proof the caller asked for (or t3-watch
+    /// refuses a read with side effects). Reported, never retried.
+    Unsupported(String),
     /// The operation was cancelled because nobody waits for it any more.
     Cancelled,
 }
@@ -66,7 +69,11 @@ impl CallError {
     pub fn message(&self) -> &str {
         match self {
             CallError::Transient { message, .. } | CallError::Session { message, .. } => message,
-            CallError::Auth(m) | CallError::NotFound(m) | CallError::Fatal(m) | CallError::Unauthorized(m) => m,
+            CallError::Auth(m)
+            | CallError::NotFound(m)
+            | CallError::Fatal(m)
+            | CallError::Unauthorized(m)
+            | CallError::Unsupported(m) => m,
             CallError::Cancelled => "cancelled",
         }
     }
@@ -77,6 +84,7 @@ impl CallError {
             CallError::Auth(_) | CallError::Unauthorized(_) => "auth",
             CallError::NotFound(_) => "not_found",
             CallError::Fatal(_) => "fatal",
+            CallError::Unsupported(_) => "unsupported",
             CallError::Cancelled => "cancelled",
         }
     }
@@ -110,6 +118,23 @@ pub struct Stats {
     pub token_recoveries: AtomicU64,
     pub cancellations: AtomicU64,
     pub server_requests: AtomicU64,
+    pub pending_request: AtomicU64,
+    pub delegated_probe: AtomicU64,
+}
+
+/// `timeoutMs` of the turn-mode probe that asks whether delegated work is
+/// still running. T3 answers at once either way.
+pub const PROBE_TIMEOUT_MS: u64 = 1;
+
+/// The tools t3-watch may call, and for `t3_pending_request` the actions:
+/// reading only. Answering a question or anything else that changes a
+/// thread is refused here, whatever the token would allow.
+pub fn tool_allowed(name: &str, args: &Value) -> bool {
+    match name {
+        "t3_thread_wait" | "t3_thread_read" => true,
+        "t3_pending_request" => matches!(args.get("action").and_then(Value::as_str), Some("list" | "read")),
+        _ => false,
+    }
 }
 
 /// What a token recovery found out.
@@ -269,12 +294,32 @@ impl McpClient {
         let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
         let new_session = header("mcp-session-id").filter(|s| !util::has_control_chars(s) && s.len() <= 1024);
         let content_type = header("content-type").unwrap_or_default().to_ascii_lowercase();
+        let challenge = header("www-authenticate");
         let mut body_reader = resp.into_body().into_reader();
 
         match status {
             200..=299 => {}
-            401 => return Err(CallError::Unauthorized(self.auth_message(status))),
-            403 => return Err(CallError::Auth(self.auth_message(status))),
+            401 | 403 => {
+                // Only a real token rejection may end a wait. A tunnel or proxy
+                // in front of the server also answers 401/403 while the origin
+                // is away ("Unauthorized: Tunnel not found"), without the
+                // RFC 6750 bearer challenge: that is an outage, so retry.
+                let snippet = read_snippet(&mut body_reader);
+                if !is_token_rejection(challenge.as_deref(), &snippet) {
+                    return Err(CallError::Transient {
+                        message: format!(
+                            "HTTP {status} without a bearer challenge, so not a token rejection \
+                             (relay or tunnel unavailable?): {snippet}"
+                        ),
+                        status: Some(status),
+                    });
+                }
+                return Err(if status == 401 {
+                    CallError::Unauthorized(self.auth_message(status))
+                } else {
+                    CallError::Auth(self.auth_message(status))
+                });
+            }
             404 | 400 if session_id.is_some() => {
                 // Most likely an expired or unknown Mcp-Session-Id.
                 let snippet = read_snippet(&mut body_reader);
@@ -500,10 +545,18 @@ impl McpClient {
         args: Value,
         timeout: Duration,
     ) -> Result<Value, CallError> {
+        if !tool_allowed(name, &args) {
+            return Err(CallError::Fatal(format!(
+                "refusing to call {}: t3-watch only reads threads",
+                util::sanitize_text(name, 64)
+            )));
+        }
+        let probe = args.get("timeoutMs").and_then(Value::as_u64) == Some(PROBE_TIMEOUT_MS);
         match name {
+            "t3_thread_wait" if probe => self.stats.delegated_probe.fetch_add(1, Ordering::Relaxed),
             "t3_thread_wait" => self.stats.thread_wait.fetch_add(1, Ordering::Relaxed),
             "t3_thread_read" => self.stats.thread_read.fetch_add(1, Ordering::Relaxed),
-            _ => 0,
+            _ => self.stats.pending_request.fetch_add(1, Ordering::Relaxed),
         };
         let mut session_retried = false;
         let mut auth_retried = false;
@@ -583,6 +636,21 @@ pub fn check_protocol_version(msg: &Value) -> Result<String, CallError> {
         ))),
         None => Err(CallError::Fatal("initialize result has no protocolVersion".into())),
     }
+}
+
+/// Whether a 401/403 is the resource server rejecting our token: it carries a
+/// `WWW-Authenticate: Bearer` challenge (RFC 6750 section 3) or an OAuth or
+/// T3 credential error code in its body.
+pub fn is_token_rejection(challenge: Option<&str>, body: &str) -> bool {
+    let bearer = challenge.is_some_and(|c| {
+        c.trim_start()
+            .get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+    });
+    bearer
+        || ["invalid_token", "insufficient_scope", "invalid_mcp_credential"]
+            .iter()
+            .any(|code| body.contains(code))
 }
 
 fn read_snippet(r: &mut impl Read) -> String {
@@ -814,6 +882,36 @@ mod tests {
         let mut seen = Vec::new();
         let r = read_sse_response(stream.as_bytes(), &id, limits, &mut |v| seen.push(v.clone()));
         (r, seen)
+    }
+
+    #[test]
+    fn only_bearer_challenges_and_credential_errors_are_token_rejections() {
+        assert!(is_token_rejection(Some("Bearer error=\"invalid_token\""), ""));
+        assert!(is_token_rejection(Some("bearer realm=\"t3\""), ""));
+        assert!(is_token_rejection(None, r#"{"error":"invalid_mcp_credential"}"#));
+        assert!(is_token_rejection(None, r#"{"error":"insufficient_scope"}"#));
+        // What a Cloudflare tunnel says while its origin is away.
+        assert!(!is_token_rejection(None, "Unauthorized: Tunnel not found"));
+        assert!(!is_token_rejection(Some("Basic realm=\"proxy\""), "Unauthorized"));
+        assert!(!is_token_rejection(Some(""), ""));
+    }
+
+    #[test]
+    fn only_read_tools_are_allowed() {
+        assert!(tool_allowed("t3_thread_wait", &json!({})));
+        assert!(tool_allowed("t3_thread_read", &json!({})));
+        assert!(tool_allowed("t3_pending_request", &json!({"action": "list"})));
+        assert!(tool_allowed("t3_pending_request", &json!({"action": "read"})));
+        assert!(!tool_allowed("t3_pending_request", &json!({"action": "respond"})));
+        assert!(!tool_allowed("t3_pending_request", &json!({})));
+        for t in [
+            "t3_thread_send",
+            "t3_thread_interrupt",
+            "t3_thread_update",
+            "delegate_task",
+        ] {
+            assert!(!tool_allowed(t, &json!({})), "{t}");
+        }
     }
 
     #[test]

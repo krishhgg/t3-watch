@@ -4,8 +4,10 @@
 //!   machines.json     saved machines and their read-only tokens (0600)
 //!   config.lock       held while machines.json is read, changed and written
 //!   pending/          in-progress headless OAuth logins (0600 files)
-//!   daemon.sock       the multiplexer socket (0600)
-//!   daemon.sock.lock  held by the running daemon
+//!   daemon-p2.sock    the multiplexer socket (0600)
+//!   daemon-p2.sock.lock held by the running daemon
+//!   outbox/           durable notifications not yet delivered (0700, entries 0600)
+//!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr
 
 use crate::util;
@@ -39,6 +41,13 @@ pub fn custom_socket() -> bool {
     env_path("T3_WATCH_SOCKET").is_some()
 }
 
+/// Socket file name. The number changes whenever the client/daemon protocol
+/// or the meaning of a result changes, so a daemon left running by an older
+/// t3-watch never answers a newer client (it would ignore options it does
+/// not know and report a failed run as success). Old and new daemons run
+/// side by side until the old one idles out.
+const SOCKET_NAME: &str = "daemon-p2.sock";
+
 /// The daemon socket. `$T3_WATCH_HOME` wins so tests and multiple users stay
 /// isolated; otherwise `$XDG_RUNTIME_DIR/t3-watch` when set (Linux), else the
 /// state directory.
@@ -48,10 +57,15 @@ pub fn socket_path() -> PathBuf {
     }
     if env_path("T3_WATCH_HOME").is_none() {
         if let Some(rt) = env_path("XDG_RUNTIME_DIR") {
-            return rt.join("t3-watch").join("daemon.sock");
+            return rt.join("t3-watch").join(SOCKET_NAME);
         }
     }
-    state_dir().join("daemon.sock")
+    state_dir().join(SOCKET_NAME)
+}
+
+/// Durable notifications waiting for delivery (`--durable`).
+pub fn outbox_dir() -> PathBuf {
+    state_dir().join("outbox")
 }
 
 /// T3 Code's data directory: `$T3CODE_HOME` or `~/.t3`. Client side only:

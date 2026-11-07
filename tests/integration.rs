@@ -28,6 +28,8 @@ fn json_response_settles_after_thread_completes() {
     let (code, out, err) = finish(child, SECS(10));
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(out["event"], "settled");
+    assert_eq!(out["outcome"], "completed");
+    assert_eq!(out["until"], "turn");
     assert_eq!(out["threads"][0]["status"], "completed");
     assert_eq!(out["threads"][0]["runOrdinal"], 1);
     assert_eq!(out["threads"][0]["link"], format!("t3-thread://v2/env-mock/{T}"));
@@ -36,7 +38,7 @@ fn json_response_settles_after_thread_completes() {
     assert_eq!(mock.calls("t3_thread_wait"), 1);
     assert_eq!(mock.calls("t3_thread_read"), 1);
     let args = &mock.state.0.lock().unwrap().wait_args[0];
-    assert_eq!(args["timeoutMs"], 240000);
+    assert_eq!(args["timeoutMs"], 60000);
     assert!(args.get("environmentId").is_none());
 }
 
@@ -50,8 +52,11 @@ fn sse_responses_are_parsed() {
     still_running(&mut child, Duration::from_millis(300));
     mock.set_thread(T, "waiting", 3);
     let (code, out, err) = finish(child, SECS(10));
-    assert_eq!(code, 0, "stderr: {err}");
+    // Waiting for input is its own outcome, never completion.
+    assert_eq!(code, 5, "stderr: {err}");
+    assert_eq!(out["event"], "needs_input");
     assert_eq!(out["threads"][0]["status"], "waiting");
+    assert_eq!(out["threads"][0]["outcome"], "needs_input");
     assert_eq!(out["threads"][0]["runOrdinal"], 3);
 }
 
@@ -176,7 +181,10 @@ fn mode_any_returns_on_first_settled_thread() {
     still_running(&mut child, Duration::from_millis(300));
     mock.set_thread("t-b", "failed", 1);
     let (code, out, _) = finish(child, SECS(10));
-    assert_eq!(code, 0);
+    // The first thread to finish failed: exit 6, not success.
+    assert_eq!(code, 6);
+    assert_eq!(out["event"], "settled");
+    assert_eq!(out["outcome"], "failed");
     let threads = out["threads"].as_array().unwrap();
     assert_eq!(threads[0]["settled"], false);
     assert_eq!(threads[1]["settled"], true);
@@ -195,7 +203,10 @@ fn mode_all_waits_for_every_thread() {
     still_running(&mut child, Duration::from_millis(500));
     mock.set_thread("t-b", "interrupted", 1);
     let (code, out, _) = finish(child, SECS(10));
-    assert_eq!(code, 0);
+    assert_eq!(code, 6, "one thread was interrupted: {out}");
+    assert_eq!(out["outcome"], "failed");
+    assert_eq!(out["threads"][0]["outcome"], "completed");
+    assert_eq!(out["threads"][1]["outcome"], "failed");
     assert_eq!(out["via"], "daemon");
     assert!(out["threads"].as_array().unwrap().iter().all(|t| t["settled"] == true));
 }
@@ -224,6 +235,7 @@ fn twenty_daemon_clients_share_one_upstream_long_poll() {
         env.status()
     );
     assert_eq!(mock.calls("t3_thread_read"), 1);
+    assert_eq!(mock.with(|s| s.probes), 1, "one delegated-work probe for all 20");
     assert_eq!(mock.calls("initialize"), 1, "one MCP session for the machine");
 }
 
@@ -244,7 +256,7 @@ fn killed_client_is_unsubscribed_and_daemon_idles_out() {
         assert!(Instant::now() < deadline, "daemon {pid} did not exit when idle");
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!env.home.join("daemon.sock").exists());
+    assert!(!env.home.join("daemon-p2.sock").exists());
 }
 
 #[test]
@@ -255,7 +267,7 @@ fn state_dir_and_socket_are_private() {
     let out = env.run(&["wait", T]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(mode(&env.home), 0o700);
-    assert_eq!(mode(&env.home.join("daemon.sock")) & 0o077, 0);
+    assert_eq!(mode(&env.home.join("daemon-p2.sock")) & 0o077, 0);
     assert_eq!(mode(&env.home.join("daemon.log")), 0o600);
 }
 

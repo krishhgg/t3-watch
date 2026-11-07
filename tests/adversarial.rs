@@ -111,11 +111,11 @@ fn a_childs_result_run_never_proves_a_newer_parent_run() {
 #[test]
 fn a_parent_proof_of_the_run_the_read_saw_settles() {
     for proof in [
-        json!({"runId": format!("run:thread:{P}:ordinal:2")}),
+        json!({"resultRun": {"runId": format!("run:thread:{P}:ordinal:2"), "status": "completed"}}),
         // resultRun may name a later run of the same thread.
         json!({"runId": format!("run:thread:{P}:ordinal:1"), "resultRun": {"runId": format!("run:thread:{P}:ordinal:3")}}),
         // Percent-encoded thread ids are the same identity.
-        json!({"runId": "run:thread:mcp%3Alaunch%3Aparent:ordinal:2"}),
+        json!({"resultRun": {"runId": "run:thread:mcp%3Alaunch%3Aparent:ordinal:2", "status": "completed"}}),
     ] {
         let mock = MockMcp::start();
         mock.set_thread(P, "completed", 2);
@@ -123,7 +123,23 @@ fn a_parent_proof_of_the_run_the_read_saw_settles() {
         let (code, v) = delegated(&mock, "5s");
         assert_eq!(code, Some(0), "{proof}: {v}");
         assert_eq!(v["threads"][0]["delegatedSettled"], true);
+        assert_eq!(v["until"], "workstream");
     }
+}
+
+#[test]
+fn a_settled_wait_without_result_run_fails_closed() {
+    // The wait's own runId is the turn, not the workstream: without T3's
+    // resultRun nothing proves the delegated work and its continuations
+    // have settled, so this is an error, never completion.
+    let mock = MockMcp::start();
+    mock.set_thread(P, "completed", 2);
+    mock.with(|s| s.omit_result_run = true);
+    let (code, v) = delegated(&mock, "5s");
+    assert_eq!(code, Some(2), "{v}");
+    assert_eq!(v["error"]["kind"], "unsupported");
+    assert_eq!(v["outcome"], "error");
+    assert!(v["error"]["message"].as_str().unwrap().contains("resultRun"));
 }
 
 #[test]
@@ -133,6 +149,10 @@ fn missing_run_identity_stays_unresolved() {
     mock.set_thread(P, "completed", 2);
     mock.with(|s| {
         s.wait_override.insert("runId".into(), json!("opaque-run-7"));
+        s.wait_override.insert(
+            "resultRun".into(),
+            json!({"runId": "opaque-run-7", "status": "completed"}),
+        );
     });
     assert_eq!(delegated(&mock, "1500ms").0, Some(3));
 

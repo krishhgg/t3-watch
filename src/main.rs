@@ -9,31 +9,36 @@ mod mcp;
 mod model;
 mod notify;
 mod oauth;
+mod outbox;
 mod util;
 
 use config::Config;
 use engine::{error_json, Hub, Outcome, TargetSpec, Transport, WaitRequest, LOCAL_MACHINE};
 use model::Predicate;
 use notify::{Notify, NotifyArgs};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
-/// The threads settled but a configured notification could not be delivered.
+/// The threads completed but a configured notification could not be
+/// delivered (or, with `--durable`, is queued for retry).
 const EXIT_NOTIFY_FAILED: i32 = 4;
 
 const USAGE: &str = "\
-t3-watch: wait for T3 Code threads to settle without spending AI tokens.
+t3-watch: wait for T3 Code threads to finish without spending AI tokens.
 
 USAGE
-  t3-watch wait [OPTIONS] <THREAD>...     block until threads leave active statuses
-  t3-watch status                         show the daemon's watches and sessions
+  t3-watch wait [OPTIONS] <THREAD>...     block until threads finish, fail or need input
+  t3-watch status                         show the daemon's watches, sessions and outbox
   t3-watch stop                           stop the daemon
   t3-watch daemon [--idle-exit 60s]       run the multiplexer in the foreground
+  t3-watch outbox list | run [--once] | drop <ID>
+                                          durable notifications not yet delivered
   t3-watch auth login <ORIGIN|URL>        pair with a T3 MCP server (browser on this machine)
   t3-watch auth oauth-start <ORIGIN|URL>  pair from a headless machine, step 1
   t3-watch auth oauth-finish <CALLBACK>   pair from a headless machine, step 2
@@ -49,29 +54,47 @@ WAIT OPTIONS
       --transport <auto|mcp|local>
       --env <ENV_ID>               environmentId for a peer-linked environment
       --mode <all|any>             wait for all threads (default) or the first
+      --until <turn|workstream>    turn (default): the latest run finished.
+                                   workstream (mcp only): the run, its delegated
+                                   work and the parent runs that deliver its
+                                   results all settled, proven by T3
+      --until-delegated-settled    same as --until workstream
       --expect-min-run-ordinal <N> ignore runs older than ordinal N
-      --until-delegated-settled    also wait for delegated work (mcp transport only;
-                                   rejected for local threads)
+      --after-run <RUN_ID>         ignore that run and older ones (one thread)
+      --final-marker <TEXT>        also require TEXT in the final assistant message
+                                   of the deciding run (not on delegated child threads)
+      --follow                     a failed run does not end the wait; report it as
+                                   progress and follow the next run of the thread
+      --acknowledge <PENDING_KEY>  keep waiting past the pending requests named by
+                                   this key (from a needs_input result)
       --timeout <DUR>              give up after DUR (default 4h)
       --interval <DUR>             local poll interval (default 5s)
-      --slice <DUR>                mcp long-poll length (default 240s, at most 10m)
+      --slice <DUR>                mcp long-poll length (default 60s, at most 10m)
       --base-dir <DIR>             T3 data dir for local (default $T3CODE_HOME or ~/.t3)
       --t3-bin <PATH>              T3 CLI for local (default: newest under base dir)
       --no-daemon                  watch in this process instead of the shared daemon
       --pretty                     indent the JSON output
 
-NOTIFICATIONS (run by this process when the wait ends)
+NOTIFICATIONS (sent by this process; the daemon only sends queued ones)
       --webhook-url-env <VAR>      POST the result JSON to the https URL in $VAR
       --webhook-url-file <PATH>    ... or to the URL stored in a file
       --webhook-url <URL>          ... or to this URL (visible in `ps`; prefer -env/-file)
       --webhook-header-env <H>=<VAR>  add header H with the value of $VAR (repeatable)
       --webhook-secret-env <VAR>   sign with HMAC-SHA256 using the secret in $VAR
       --webhook-secret-file <PATH> ... or the secret stored in a file
-      --on-settle <PROG>           run PROG (no shell) with the result JSON on stdin
+      --durable                    keep an undelivered webhook in the outbox and retry
+                                   it (from the daemon) until a 2xx
+      --durable-max-age <DUR>      give up on a queued webhook after DUR (default 7d)
+      --heartbeat <DUR>            POST a heartbeat every DUR while waiting, for a
+                                   receiver-side monitor (not retried, not queued)
+      --notify-unreachable <DUR>   report T3 unreachable from here for DUR, and back
+      --on-settle <PROG>           run PROG (no shell) with the result JSON on stdin;
+                                   its output goes to hooks.log in the state dir
       --on-settle-arg <ARG>        pass ARG to PROG (repeatable)
       --on-settle-timeout <DUR>    kill PROG after DUR (default 60s)
-      --notify-on <settled|all>    notify on settle only (default) or also on
-                                   timeout and error
+      --notify-on <CLASSES|all>    comma list of settled, needs_input, timeout, error,
+                                   run_failed, upstream (default: all but timeout
+                                   and error)
 
 AUTH OPTIONS
       --name <NAME>                machine name (default from the host)
@@ -81,8 +104,10 @@ AUTH OPTIONS
       --redirect-port <N>          callback port written into oauth-start (default 8976)
 
 EXIT CODES
-  0 settled   2 error (auth revoked, unknown thread, bad usage)   3 timed out
-  4 settled, but a notification could not be delivered
+  0 completed     5 needs input (question or approval)     6 failed run
+  3 timed out     2 error (auth revoked, unknown thread, unsupported, usage)
+  4 completed, but a notification was not delivered (or is only queued)
+  1 internal
   Output is one JSON object on stdout.
 ";
 
@@ -350,11 +375,18 @@ fn prepare_wait(a: &Args) -> Result<WaitRequest, Value> {
         Some("any") => true,
         Some(m) => return Err(usage(format!("unknown mode {m:?}"))),
     };
-    let min_run_ordinal = match a.get("expect-min-run-ordinal") {
+    let mut min_run_ordinal = match a.get("expect-min-run-ordinal") {
         Some(s) => s
             .parse::<u64>()
             .map_err(|_| usage("--expect-min-run-ordinal needs a whole number".into()))?,
         None => 0,
+    };
+    let until_delegated = match (a.get("until"), a.has("until-delegated-settled")) {
+        (None, flag) => flag,
+        (Some("workstream"), _) => true,
+        (Some("turn"), false) => false,
+        (Some("turn"), true) => return Err(usage("--until turn contradicts --until-delegated-settled".into())),
+        (Some(u), _) => return Err(usage(format!("--until takes turn or workstream, not {u:?}"))),
     };
     let cfg = Config::load().map_err(|e| error_json("config", &e))?;
     let (base_dir, t3_bin, explicit_bin) =
@@ -372,16 +404,39 @@ fn prepare_wait(a: &Args) -> Result<WaitRequest, Value> {
         .iter()
         .map(|t| resolve_target(t, &defaults, &cfg).map_err(usage))
         .collect::<Result<Vec<TargetSpec>, Value>>()?;
+    if let Some(run) = a.get("after-run") {
+        let [target] = targets.as_slice() else {
+            return Err(usage(
+                "--after-run names a run of one thread; pass exactly one thread".into(),
+            ));
+        };
+        let ordinal = model::run_ordinal_of(&target.thread_id, run).ok_or_else(|| {
+            usage(format!(
+                "--after-run {:?} is not a run of thread {}",
+                util::sanitize_text(run, 200),
+                target.thread_id
+            ))
+        })?;
+        min_run_ordinal = min_run_ordinal.max(ordinal + 1);
+    }
+    let notify_unreachable = match a.get("notify-unreachable") {
+        Some(_) => Some(dur("notify-unreachable", Duration::ZERO)?),
+        None => None,
+    };
     let req = WaitRequest {
         targets,
         any,
         predicate: Predicate {
             min_run_ordinal,
-            until_delegated: a.has("until-delegated-settled"),
+            until_delegated,
+            final_marker: a.get("final-marker").map(str::to_string),
+            acknowledged: a.get("acknowledge").map(str::to_string),
+            follow: a.has("follow"),
         },
         timeout: dur("timeout", Duration::from_secs(4 * 3600))?,
         interval: dur("interval", Duration::from_secs(5))?,
-        slice: dur("slice", Duration::from_secs(240))?,
+        slice: dur("slice", engine::DEFAULT_SLICE)?,
+        notify_unreachable,
     }
     .normalized();
     // Refuse up front what the daemon would refuse, such as delegated-work
@@ -390,7 +445,80 @@ fn prepare_wait(a: &Args) -> Result<WaitRequest, Value> {
     Ok(req)
 }
 
+/// Sends heartbeats from a background thread while the wait runs. A
+/// receiver that stops hearing them knows this watcher (process, host or
+/// network) is gone; a dead host cannot say so itself.
+struct Heartbeat {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::Thread,
+}
+
+impl Heartbeat {
+    fn start(
+        notify: Arc<Notify>,
+        every: Duration,
+        base: Value,
+        status: Box<dyn Fn() -> Option<Value> + Send>,
+    ) -> Option<Heartbeat> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let started = Instant::now();
+        let handle = util::spawn_thread("heartbeat", 128 * 1024, move || {
+            let mut seq: u64 = 0;
+            while !flag.load(Ordering::SeqCst) {
+                let mut body = base.clone();
+                body["event"] = json!("heartbeat");
+                body["seq"] = json!(seq);
+                body["sentAt"] = json!(util::rfc3339_ms(util::now_ms()));
+                body["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+                body["intervalMs"] = json!(every.as_millis() as u64);
+                body["upstream"] = status().unwrap_or(Value::Null);
+                let id = util::hex(&util::random_bytes(16));
+                notify.heartbeat(&id, body.to_string().as_bytes());
+                seq += 1;
+                let next = Instant::now() + every;
+                while !flag.load(Ordering::SeqCst) && Instant::now() < next {
+                    std::thread::park_timeout(next.saturating_duration_since(Instant::now()));
+                }
+            }
+        })
+        .ok()?;
+        Some(Heartbeat {
+            stop,
+            thread: handle.thread().clone(),
+        })
+    }
+
+    /// Stops sending without waiting for a POST in flight.
+    fn stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+/// The parts of a daemon or hub status that matter to a heartbeat: per
+/// watched thread, its last status and whether T3 is reachable from here.
+fn upstream_of(status: &Value, threads: &[String]) -> Value {
+    let watches: Vec<Value> = status["watches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["threadId"].as_str().is_some_and(|t| threads.iter().any(|x| x == t)))
+        .map(|w| {
+            json!({
+                "threadId": w["threadId"],
+                "status": w["status"],
+                "reachable": w.get("upstream").is_none(),
+                "upstream": w.get("upstream"),
+            })
+        })
+        .collect();
+    json!(watches)
+}
+
 fn cmd_wait(raw: &[String]) -> ! {
+    let started = Instant::now();
+    let started_ms = util::now_ms();
     let a = parse_args(
         raw,
         &[
@@ -398,7 +526,11 @@ fn cmd_wait(raw: &[String]) -> ! {
             "transport",
             "env",
             "mode",
+            "until",
             "expect-min-run-ordinal",
+            "after-run",
+            "final-marker",
+            "acknowledge",
             "timeout",
             "interval",
             "slice",
@@ -410,12 +542,15 @@ fn cmd_wait(raw: &[String]) -> ! {
             "webhook-header-env",
             "webhook-secret-env",
             "webhook-secret-file",
+            "durable-max-age",
+            "heartbeat",
+            "notify-unreachable",
             "on-settle",
             "on-settle-arg",
             "on-settle-timeout",
             "notify-on",
         ],
-        &["until-delegated-settled", "no-daemon", "pretty"],
+        &["until-delegated-settled", "follow", "durable", "no-daemon", "pretty"],
     )
     .unwrap_or_else(|e| usage_error(&e));
     if a.positional.is_empty() {
@@ -437,30 +572,141 @@ fn cmd_wait(raw: &[String]) -> ! {
             .get("on-settle-timeout")
             .map(|_| parse_dur(&a, "on-settle-timeout", notify::DEFAULT_HOOK_TIMEOUT)),
         notify_on: a.get("notify-on").map(str::to_string),
+        durable: a.has("durable"),
+        durable_max_age: a
+            .get("durable-max-age")
+            .map(|_| parse_dur(&a, "durable-max-age", outbox::DEFAULT_MAX_AGE)),
     })
     .unwrap_or_else(|e| fail_json("usage", &e));
+    let notify = Arc::new(notify);
+    let heartbeat_every = a
+        .get("heartbeat")
+        .map(|_| parse_dur(&a, "heartbeat", Duration::from_secs(60)));
+    if heartbeat_every.is_some_and(|d| d < Duration::from_secs(1)) {
+        fail_json("usage", "--heartbeat must be at least 1s");
+    }
+    if heartbeat_every.is_some() && !notify.has_webhook() {
+        fail_json("usage", "--heartbeat posts to the webhook; it needs a webhook URL");
+    }
 
     let pretty = a.has("pretty");
+    let no_daemon = a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some();
+    let watch_id = util::hex(&util::random_bytes(8));
+    let threads: Vec<String> = a.positional.clone();
+    let host = hostname();
+
+    // Progress notifications go out from their own thread, in order, so a
+    // slow receiver never stops this process from reading the daemon.
+    let (progress_tx, progress_rx) = mpsc::channel::<Value>();
+    let progress_sender = {
+        let notify = notify.clone();
+        util::spawn_thread("progress", 128 * 1024, move || {
+            for p in progress_rx {
+                let event = p["event"].as_str().unwrap_or("progress").to_string();
+                let _ = notify.deliver(&event, p.to_string().as_bytes());
+            }
+        })
+        .ok()
+    };
+    // A daemon reconnect re-registers the wait, which may report the same
+    // failed run again; pass each one on once.
+    let mut failed_seen = std::collections::HashSet::new();
+    let mut on_progress = |mut p: Value| {
+        if p["event"] == "run_failed" {
+            let key = p["threads"][0]["latestRunId"].to_string();
+            if !failed_seen.insert(key) {
+                return;
+            }
+        }
+        p["watchId"] = json!(watch_id);
+        eprintln!("t3-watch: progress {p}");
+        let _ = progress_tx.send(p);
+    };
+
     // From here on the notification config is valid, so every failure,
     // operational or not, becomes an outcome that goes through delivery: an
     // unattended bot with --notify-on all hears about a broken config too.
+    let mut reconnects = 0;
+    let mut heartbeat = None;
     let mut outcome = match prepare_wait(&a) {
         Err(e) => Outcome::Error(e),
-        Ok(req) if a.has("no-daemon") || std::env::var_os("T3_WATCH_NO_DAEMON").is_some() => {
-            let hub = Hub::new("direct");
-            let (tx, rx) = mpsc::channel();
-            hub.wait(&req, tx, rx)
+        Ok(req) => {
+            let base = json!({
+                "watchId": watch_id,
+                "host": host,
+                "pid": std::process::id(),
+                "startedAt": util::rfc3339_ms(started_ms),
+                "threadIds": req.targets.iter().map(|t| t.thread_id.clone()).collect::<Vec<_>>(),
+                "note": "liveness of this watcher only; if heartbeats stop, the watcher host, process or network is gone",
+            });
+            if no_daemon {
+                let hub = Hub::new("direct");
+                if let Some(every) = heartbeat_every {
+                    let (h, ids) = (hub.clone(), threads.clone());
+                    let ids: Vec<String> = req.targets.iter().map(|t| t.thread_id.clone()).chain(ids).collect();
+                    heartbeat = Heartbeat::start(
+                        notify.clone(),
+                        every,
+                        base,
+                        Box::new(move || Some(upstream_of(&h.status_json(), &ids))),
+                    );
+                }
+                let (tx, rx) = mpsc::channel();
+                hub.wait(&req, tx, rx, &mut on_progress)
+            } else {
+                if let Some(every) = heartbeat_every {
+                    let ids: Vec<String> = req.targets.iter().map(|t| t.thread_id.clone()).collect();
+                    heartbeat = Heartbeat::start(
+                        notify.clone(),
+                        every,
+                        base,
+                        Box::new(move || daemon::request("status").ok().flatten().map(|s| upstream_of(&s, &ids))),
+                    );
+                }
+                match daemon::wait(&req, &mut on_progress) {
+                    Ok((o, n)) => {
+                        reconnects = n;
+                        o
+                    }
+                    Err(e) => Outcome::Error(error_json("daemon", &e)),
+                }
+            }
         }
-        Ok(req) => daemon::wait(&req).unwrap_or_else(|e| Outcome::Error(error_json("daemon", &e))),
     };
+    if let Some(h) = heartbeat {
+        h.stop();
+    }
+    // Progress notifications go out before the final one.
+    drop(progress_tx);
+    if let Some(sender) = progress_sender {
+        let _ = sender.join();
+    }
 
     let mut code = outcome.exit_code();
     let event = outcome.event();
     if let Some(v) = outcome.json_mut() {
+        if let Some(daemon_elapsed) = v.get("elapsedMs").cloned() {
+            if reconnects > 0 {
+                v["registrationElapsedMs"] = daemon_elapsed;
+            }
+        }
+        v["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+        v["startedAt"] = json!(util::rfc3339_ms(started_ms));
+        v["endedAt"] = json!(util::rfc3339_ms(util::now_ms()));
+        v["watchId"] = json!(watch_id);
+        if reconnects > 0 {
+            v["daemonReconnects"] = json!(reconnects);
+        }
         let body = v.to_string().into_bytes();
         if let Some(summary) = notify.deliver(event, &body) {
-            if summary["delivered"] == false && code == 0 {
+            if summary["delivered"] == false && code == engine::EXIT_COMPLETED {
                 code = EXIT_NOTIFY_FAILED;
+            }
+            if summary["queued"] == true && !no_daemon {
+                // The daemon sends queued notifications; make sure it runs.
+                if let Err(e) = daemon::ensure_running() {
+                    eprintln!("t3-watch: cannot start the daemon to send the queued notification: {e}");
+                }
             }
             v["notification"] = summary;
         }
@@ -469,6 +715,61 @@ fn cmd_wait(raw: &[String]) -> ! {
         print_json(v, pretty);
     }
     exit(code)
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    if ok {
+        util::sanitize_text(&String::from_utf8_lossy(&buf[..end]), 255)
+    } else {
+        String::new()
+    }
+}
+
+fn cmd_outbox(raw: &[String]) -> ! {
+    let Some(sub) = raw.first() else {
+        usage_error("outbox needs a subcommand: list, run, drop")
+    };
+    let a = parse_args(&raw[1..], &[], &["once", "pretty"]).unwrap_or_else(|e| usage_error(&e));
+    let pretty = a.has("pretty");
+    match sub.as_str() {
+        "list" => {
+            let (entries, bad) = outbox::entries();
+            print_json(
+                &json!({
+                    "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
+                    "unreadable": bad,
+                    "dir": config::outbox_dir().display().to_string(),
+                }),
+                pretty,
+            );
+            exit(0)
+        }
+        "run" if a.has("once") => match outbox::pass(true) {
+            Ok(results) => {
+                let left = outbox::pending_count();
+                print_json(&json!({ "results": results, "pending": left }), pretty);
+                exit(if left == 0 { 0 } else { EXIT_NOTIFY_FAILED })
+            }
+            Err(e) => fail_json("outbox", &e),
+        },
+        "run" => outbox::run_forever(&|line| eprintln!("t3-watch: {line}")),
+        "drop" => {
+            let [id] = a.positional.as_slice() else {
+                usage_error("outbox drop needs one entry id")
+            };
+            if !outbox::valid_id(id) {
+                fail_json("usage", "not an outbox entry id");
+            }
+            let existed = config::outbox_dir().join(format!("{id}.json")).exists();
+            outbox::remove(id);
+            print_json(&json!({ "ok": existed, "id": id }), pretty);
+            exit(if existed { 0 } else { 2 })
+        }
+        other => usage_error(&format!("unknown outbox subcommand {other:?}")),
+    }
 }
 
 fn cmd_auth(raw: &[String]) -> ! {
@@ -572,6 +873,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("wait") => cmd_wait(rest),
         Some("auth") => cmd_auth(rest),
+        Some("outbox") => cmd_outbox(rest),
         Some(sub @ ("login" | "oauth-start" | "oauth-finish")) => run_auth(sub, rest),
         Some("daemon") => {
             let a = parse_args(rest, &["idle-exit"], &[]).unwrap_or_else(|e| usage_error(&e));

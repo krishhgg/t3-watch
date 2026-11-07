@@ -80,6 +80,24 @@ pub struct MockState {
     /// ("wait", request id) when a `t3_thread_wait` arrives and
     /// ("cancelled", request id) for each cancellation, in arrival order.
     pub events: Vec<(String, Value)>,
+    /// Arguments of every `t3_thread_read`, in order.
+    pub read_args: Vec<Value>,
+    /// Arguments of every `t3_pending_request`, in order.
+    pub pending_args: Vec<Value>,
+    /// threadId -> activity timeline items (`view: activity`).
+    pub activity: HashMap<String, Vec<Value>>,
+    /// threadId -> message items (`view: messages`, and `itemId` reads).
+    pub messages: HashMap<String, Vec<Value>>,
+    /// threadId -> ids `t3_pending_request list` returns.
+    pub pending_ids: HashMap<String, Vec<String>>,
+    /// threadId -> pendingRequestCount in reads.
+    pub pending_count: HashMap<String, u64>,
+    /// threadId -> parentThreadId in reads (a delegated child).
+    pub parent: HashMap<String, String>,
+    /// Leave `resultRun` out of settled delegated-work waits (an old T3).
+    pub omit_result_run: bool,
+    /// Turn-mode probes (`timeoutMs: 1` with `untilDelegatedWorkSettled`).
+    pub probes: usize,
 }
 
 impl Default for MockState {
@@ -119,6 +137,15 @@ impl Default for MockState {
             rotate_refresh: false,
             rotations: 0,
             events: Vec::new(),
+            read_args: Vec::new(),
+            pending_args: Vec::new(),
+            activity: HashMap::new(),
+            messages: HashMap::new(),
+            pending_ids: HashMap::new(),
+            pending_count: HashMap::new(),
+            parent: HashMap::new(),
+            omit_result_run: false,
+            probes: 0,
         }
     }
 }
@@ -419,7 +446,10 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
         respond(
             &mut stream,
             401,
-            &[("Content-Type", "application/json".into())],
+            &[
+                ("Content-Type", "application/json".into()),
+                ("WWW-Authenticate", r#"Bearer error="invalid_token""#.into()),
+            ],
             r#"{"error":"invalid_mcp_credential"}"#,
         );
         return;
@@ -481,7 +511,12 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
     }
     let tool = msg["params"]["name"].as_str().unwrap_or("").to_string();
     let args = msg["params"]["arguments"].clone();
-    *s.calls.entry(tool.clone()).or_default() += 1;
+    let probe = tool == "t3_thread_wait" && args["timeoutMs"] == 1 && args["untilDelegatedWorkSettled"] == true;
+    if probe {
+        s.probes += 1;
+    } else {
+        *s.calls.entry(tool.clone()).or_default() += 1;
+    }
     if let Some(n) = s.sse_flood {
         drop(s);
         let mut head = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
@@ -501,6 +536,18 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
     let sse = s.sse;
     let server_requests = s.server_requests.clone();
     let tool_result = match tool.as_str() {
+        "t3_thread_wait" if probe => match s.threads.get(&tid).cloned() {
+            None => Err(()),
+            Some((status, ord)) => {
+                let busy = is_active(&status) || s.delegated_pending.contains(&tid);
+                let mut v = json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"),
+                                    "status": status, "timedOut": busy });
+                if !busy {
+                    v["resultRun"] = json!({ "runId": format!("run:thread:{tid}:ordinal:{ord}"), "status": status });
+                }
+                Ok(v)
+            }
+        },
         "t3_thread_wait" => {
             s.wait_args.push(args.clone());
             s.events.push(("wait".into(), msg["id"].clone()));
@@ -516,6 +563,12 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                         if !busy || Instant::now() >= deadline {
                             let mut v = json!({ "threadId": tid, "runId": format!("run:thread:{tid}:ordinal:{ord}"),
                                                 "status": status, "timedOut": busy });
+                            // Like T3: a settled delegated-work wait names the
+                            // run holding the final answer.
+                            if delegated && !busy && !s.omit_result_run {
+                                v["resultRun"] =
+                                    json!({ "runId": format!("run:thread:{tid}:ordinal:{ord}"), "status": status });
+                            }
                             v = merged(v, &s.wait_override);
                             break Ok(v);
                         }
@@ -542,16 +595,81 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
             }
             answer
         }
-        "t3_thread_read" => match s.threads.get(&tid) {
-            None => Err(()),
-            Some((status, ord)) => {
-                let thread = json!({ "threadId": tid, "title": "mock thread", "status": status,
-                                     "latestRunId": format!("run:thread:{tid}:ordinal:{ord}"), "runCount": ord,
-                                     "link": format!("<t3-thread://v2/env-mock/{tid}>") });
-                Ok(json!({ "thread": merged(thread, &s.read_override),
-                           "recentRuns": [], "items": [], "hasMore": false }))
+        "t3_thread_read" => {
+            s.read_args.push(args.clone());
+            match s.threads.get(&tid).cloned() {
+                None => Err(()),
+                Some((status, ord)) => {
+                    let run = format!("run:thread:{tid}:ordinal:{ord}");
+                    let items: Vec<Value> = if let Some(item_id) = args["itemId"].as_str() {
+                        // One message, paged by textOffset.
+                        let max = args["maxCharsPerItem"].as_u64().unwrap_or(50_000) as usize;
+                        let offset = args["textOffset"].as_u64().unwrap_or(0) as usize;
+                        s.messages
+                            .get(&tid)
+                            .into_iter()
+                            .flatten()
+                            .filter(|m| m["itemId"] == item_id)
+                            .map(|m| {
+                                let text: Vec<char> = m["text"].as_str().unwrap_or("").chars().collect();
+                                let end = (offset + max).min(text.len());
+                                let mut m = m.clone();
+                                m["text"] = json!(text[offset.min(end)..end].iter().collect::<String>());
+                                m["textTruncated"] = json!(end < text.len());
+                                if end < text.len() {
+                                    m["nextTextOffset"] = json!(end);
+                                }
+                                m
+                            })
+                            .collect()
+                    } else {
+                        let after = args["afterPosition"].as_i64().unwrap_or(-1);
+                        let source = match args["view"].as_str() {
+                            Some("activity") => s.activity.get(&tid).cloned().unwrap_or_default(),
+                            _ => s.messages.get(&tid).cloned().unwrap_or_default(),
+                        };
+                        let max = args["maxCharsPerItem"].as_u64().unwrap_or(50_000) as usize;
+                        source
+                            .into_iter()
+                            .filter(|i| i["position"].as_i64().unwrap_or(0) > after)
+                            .take(args["limit"].as_u64().unwrap_or(20) as usize)
+                            .map(|mut i| {
+                                let text: String = i["text"].as_str().unwrap_or("").chars().take(max).collect();
+                                if text.chars().count() < i["text"].as_str().unwrap_or("").chars().count() {
+                                    i["textTruncated"] = json!(true);
+                                    i["nextTextOffset"] = json!(text.chars().count());
+                                }
+                                i["text"] = json!(text);
+                                i
+                            })
+                            .collect()
+                    };
+                    let item_count = s
+                        .activity
+                        .get(&tid)
+                        .map_or(0, Vec::len)
+                        .max(s.messages.get(&tid).map_or(0, Vec::len));
+                    let mut thread = json!({ "threadId": tid, "title": "mock thread", "status": status,
+                                             "latestRunId": run, "runCount": ord, "itemCount": item_count,
+                                             "activeRunId": if is_active(&status) { json!(run) } else { Value::Null },
+                                             "pendingRequestCount": s.pending_count.get(&tid).copied().unwrap_or(0),
+                                             "link": format!("<t3-thread://v2/env-mock/{tid}>") });
+                    if let Some(parent) = s.parent.get(&tid) {
+                        thread["parentThreadId"] = json!(parent);
+                        thread["relationshipToParent"] = json!("subagent");
+                    }
+                    Ok(json!({ "thread": merged(thread, &s.read_override),
+                               "recentRuns": [], "items": items, "hasMore": false }))
+                }
             }
-        },
+        }
+        "t3_pending_request" => {
+            s.pending_args.push(args.clone());
+            match args["action"].as_str() {
+                Some("list") => Ok(json!({ "requestIds": s.pending_ids.get(&tid).cloned().unwrap_or_default() })),
+                _ => Err(()),
+            }
+        }
         _ => Err(()),
     };
     drop(s);
@@ -620,45 +738,87 @@ pub struct HookReq {
     pub at: Instant,
 }
 
+/// How the receiver treats a request.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum HookMode {
+    /// Record it and answer from `script` (then 200).
+    #[default]
+    Normal,
+    /// Accept the connection and never read or answer: the request was
+    /// never processed.
+    Blackhole,
+    /// Record it, then close without answering: the receiver has the event
+    /// but the sender never learns that.
+    DropAfterRecord,
+}
+
 #[derive(Default)]
 pub struct HookState {
     pub requests: Vec<HookReq>,
     /// Responses to give, in order; then 200.
     pub script: VecDeque<(u16, Vec<(String, String)>)>,
+    pub mode: HookMode,
+    /// Connections accepted and left hanging (Blackhole).
+    pub held: Vec<TcpStream>,
 }
 
 pub struct MockHook {
     pub url: String,
+    pub port: u16,
     pub state: Arc<Mutex<HookState>>,
 }
 
 impl MockHook {
     pub fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://127.0.0.1:{}/hooks/secret-path-123",
-            listener.local_addr().unwrap().port()
-        );
+        Self::start_on(0)
+    }
+
+    /// A receiver on a given port (0: any), so a test can bring one up where
+    /// an earlier webhook URL pointed.
+    pub fn start_on(port: u16) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/hooks/secret-path-123");
         let state = Arc::new(Mutex::new(HookState::default()));
         let st = state.clone();
         thread::spawn(move || {
             for mut conn in listener.incoming().flatten() {
-                let Some(req) = read_request(&mut conn) else { continue };
-                let (status, headers) = {
-                    let mut s = st.lock().unwrap();
-                    s.requests.push(HookReq {
-                        path: req.path.clone(),
-                        headers: req.headers.clone(),
-                        body: req.body.clone(),
-                        at: Instant::now(),
-                    });
-                    s.script.pop_front().unwrap_or((200, vec![]))
-                };
-                let hs: Vec<(&str, String)> = headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                respond(&mut conn, status, &hs, "receiver body that must never be echoed");
+                let st = st.clone();
+                thread::spawn(move || {
+                    if st.lock().unwrap().mode == HookMode::Blackhole {
+                        st.lock().unwrap().held.push(conn);
+                        return;
+                    }
+                    let Some(req) = read_request(&mut conn) else { return };
+                    let (status, headers, mode) = {
+                        let mut s = st.lock().unwrap();
+                        s.requests.push(HookReq {
+                            path: req.path.clone(),
+                            headers: req.headers.clone(),
+                            body: req.body.clone(),
+                            at: Instant::now(),
+                        });
+                        let (status, headers) = s.script.pop_front().unwrap_or((200, vec![]));
+                        (status, headers, s.mode)
+                    };
+                    if mode == HookMode::DropAfterRecord {
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    let hs: Vec<(&str, String)> = headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                    respond(&mut conn, status, &hs, "receiver body that must never be echoed");
+                });
             }
         });
-        MockHook { url, state }
+        MockHook { url, port, state }
+    }
+
+    pub fn set_mode(&self, mode: HookMode) {
+        let mut s = self.state.lock().unwrap();
+        s.mode = mode;
+        if mode != HookMode::Blackhole {
+            s.held.clear();
+        }
     }
 
     pub fn push(&self, status: u16, headers: &[(&str, &str)]) {
@@ -819,7 +979,10 @@ for a; do last="$a"; done
 f='{d}/threads/'"$last"
 if [ ! -f "$f" ]; then echo "Thread $last is no longer available." >&2; exit 1; fi
 read status ord < "$f"
-printf '{{"thread":{{"threadId":"%s","title":"mock local","status":"%s","latestRunId":"run:thread:%s:ordinal:%s","pendingRequestCount":0}},"messages":[]}}\n' "$last" "$status" "$last" "$ord"
+m='{d}/messages/'"$last"
+msgs='[]'
+if [ -f "$m" ]; then msgs=$(cat "$m"); fi
+printf '{{"thread":{{"threadId":"%s","title":"mock local","status":"%s","latestRunId":"run:thread:%s:ordinal:%s","pendingRequestCount":0}},"messages":%s}}\n' "$last" "$status" "$last" "$ord" "$msgs"
 "#,
             d = dir.display()
         );
@@ -832,6 +995,12 @@ printf '{{"thread":{{"threadId":"%s","title":"mock local","status":"%s","latestR
         let tmp = self.dir.join("tmp");
         fs::write(&tmp, format!("{status} {ordinal}\n")).unwrap();
         fs::rename(tmp, self.dir.join("threads").join(id)).unwrap();
+    }
+
+    /// What `t3 thread show --messages` prints for this thread.
+    pub fn set_messages(&self, id: &str, messages: &Value) {
+        fs::create_dir_all(self.dir.join("messages")).unwrap();
+        fs::write(self.dir.join("messages").join(id), messages.to_string()).unwrap();
     }
 
     pub fn calls(&self) -> usize {

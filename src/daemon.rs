@@ -2,9 +2,13 @@
 //!
 //! Protocol: newline-delimited JSON over a Unix socket. The client sends one
 //! request line. For `wait` the daemon answers `{"event":"accepted"}` at
-//! once and the final outcome line when the wait ends. Every line must end in
-//! `\n` and is size-bounded; every read and write has a timeout except the
-//! long wait itself.
+//! once, any progress lines (`"progress": true`) as they happen, and the
+//! final outcome line when the wait ends. Every line must end in `\n` and is
+//! size-bounded; every read and write has a timeout except the long wait
+//! itself.
+//!
+//! The daemon also runs the durable-notification sender (`outbox`) and does
+//! not idle-exit while the outbox holds entries.
 //!
 //! Access control does not rely on file modes alone: the socket's directory
 //! and the socket must belong to us and be closed to group and others, lock
@@ -13,6 +17,7 @@
 
 use crate::config;
 use crate::engine::{error_json, Hub, Outcome, SubMsg, WaitRequest};
+use crate::outbox;
 use crate::util;
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
@@ -165,13 +170,18 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
         let (hub, connections, sock) = (hub.clone(), connections.clone(), sock.clone());
         util::spawn_thread("idle", 64 * 1024, move || loop {
             thread::sleep((idle_exit / 4).clamp(Duration::from_millis(50), Duration::from_secs(1)));
-            if connections.load(Ordering::SeqCst) == 0 && hub.idle_for().is_some_and(|d| d >= idle_exit) {
+            if connections.load(Ordering::SeqCst) == 0
+                && hub.idle_for().is_some_and(|d| d >= idle_exit)
+                && outbox::pending_count() == 0
+            {
                 log("idle; exiting");
                 shutdown(&sock);
             }
         })
         .map_err(|e| format!("cannot start idle thread: {e}"))?;
     }
+    util::spawn_thread("outbox", 256 * 1024, || outbox::run_forever(&log))
+        .map_err(|e| format!("cannot start the outbox sender: {e}"))?;
 
     for conn in listener.incoming() {
         let stream = match conn {
@@ -310,7 +320,11 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
     };
     match req.get("op").and_then(Value::as_str).unwrap_or("") {
         "ping" => write_line(&stream, &json!({ "ok": true, "pid": std::process::id() })),
-        "status" => write_line(&stream, &hub.status_json()),
+        "status" => {
+            let mut v = hub.status_json();
+            v["outbox"] = outbox::summary_json();
+            write_line(&stream, &v)
+        }
         "stop" => {
             write_line(&stream, &json!({ "ok": true, "pid": std::process::id() }))?;
             log("stop requested");
@@ -350,8 +364,13 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
                     &error_json("resource", &format!("cannot start a connection thread: {e}")),
                 );
             }
-            write_line(&stream, &json!({ "event": "accepted", "pid": std::process::id() }))?;
-            let outcome = hub.wait(&wreq, tx, rx);
+            write_line(
+                &stream,
+                &json!({ "event": "accepted", "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION") }),
+            )?;
+            let outcome = hub.wait(&wreq, tx, rx, &mut |p| {
+                let _ = write_line(&stream, &p);
+            });
             if let Some(v) = outcome.json() {
                 let _ = write_line(&stream, v);
             }
@@ -461,9 +480,10 @@ pub fn request(op: &str) -> Result<Option<Value>, String> {
     read_response(&stream).map(Some)
 }
 
-/// Reads the daemon's answer to a wait. `None` means the connection dropped
-/// before an outcome arrived.
-fn read_outcome(stream: &UnixStream, started: Instant) -> Option<Outcome> {
+/// Reads the daemon's answer to a wait, handing progress lines to
+/// `progress`. `None` means the connection dropped before an outcome
+/// arrived.
+fn read_outcome(stream: &UnixStream, started: Instant, progress: &mut dyn FnMut(Value)) -> Option<Outcome> {
     let mut reader = BufReader::new(stream);
     loop {
         let line = match read_line_bounded(&mut reader, MAX_RESPONSE_LINE) {
@@ -471,6 +491,7 @@ fn read_outcome(stream: &UnixStream, started: Instant) -> Option<Outcome> {
             Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                 return Some(Outcome::Timeout(json!({
                     "event": "timeout",
+                    "outcome": "timeout",
                     "elapsedMs": started.elapsed().as_millis() as u64,
                     "via": "daemon",
                     "threads": [],
@@ -481,16 +502,20 @@ fn read_outcome(stream: &UnixStream, started: Instant) -> Option<Outcome> {
             Err(_) => return None,
         };
         let v = serde_json::from_slice::<Value>(&line).ok()?;
-        if v.get("event").and_then(Value::as_str) != Some("accepted") {
+        if v.get("progress").and_then(Value::as_bool) == Some(true) {
+            progress(v);
+        } else if v.get("event").and_then(Value::as_str) != Some("accepted") {
             return Some(Outcome::from_json(v));
         }
     }
 }
 
-/// Runs a wait through the daemon. If the daemon dies mid-wait (crash,
+/// Runs a wait through the daemon and returns the outcome with the number of
+/// times the client had to reconnect. If the daemon dies mid-wait (crash,
 /// upgrade, idle-exit race) the client reconnects and re-registers with the
-/// remaining time.
-pub fn wait(req: &WaitRequest) -> Result<Outcome, String> {
+/// remaining time; the daemon's `elapsedMs` then counts from the last
+/// registration only.
+pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, u32), String> {
     let started = Instant::now();
     let mut reconnects = 0;
     loop {
@@ -505,15 +530,20 @@ pub fn wait(req: &WaitRequest) -> Result<Outcome, String> {
         // answer at all, the daemon exited after we connected (idle exit or
         // `stop`): reconnect like any other dropped connection.
         let _ = write_line(&stream, &r.to_json());
-        if let Some(outcome) = read_outcome(&stream, started) {
-            return Ok(outcome);
+        if let Some(outcome) = read_outcome(&stream, started, progress) {
+            return Ok((outcome, reconnects));
         }
         reconnects += 1;
         if reconnects > 5 {
             return Err("daemon kept closing the connection".into());
         }
-        thread::sleep(Duration::from_millis(50 * reconnects));
+        thread::sleep(Duration::from_millis(50 * reconnects as u64));
     }
+}
+
+/// Makes sure a daemon is running (it sends queued notifications).
+pub fn ensure_running() -> Result<(), String> {
+    connect_or_spawn().map(drop)
 }
 
 #[cfg(test)]

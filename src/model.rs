@@ -1,4 +1,10 @@
 //! Thread status rules shared by every backend.
+//!
+//! Each observation of a thread means one of four things to a caller: still
+//! pending, completed (a success status), failed (any other terminal status)
+//! or needs input (a question or approval waits on someone). Needs-input is
+//! checked first: a blocked thread never finishes by itself, and it is never
+//! reported as completion.
 
 use serde_json::{json, Map, Value};
 use std::time::Instant;
@@ -31,6 +37,10 @@ pub const SETTLED_STATUSES: &[&str] = &[
     "stopped",
     "rolled_back",
 ];
+
+/// The settled statuses that count as success. `waiting` means needs-input;
+/// every other settled status is a failure.
+pub const SUCCESS_STATUSES: &[&str] = &["completed", "idle"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusClass {
@@ -77,34 +87,103 @@ pub fn run_ordinal_of(thread_id: &str, run_id: &str) -> Option<u64> {
         .map(|r| r.ordinal)
 }
 
-/// Whether a `t3_thread_wait` that settled the `proven` runs (its `runId`
-/// and `resultRun`) covers the run `t3_thread_read` saw afterwards.
+/// Whether the workstream proof from `t3_thread_wait` with
+/// `untilDelegatedWorkSettled` covers what `t3_thread_read` saw afterwards.
 ///
-/// Coverage needs full identity: a proven run counts only if it is a run of
-/// the watched thread with an ordinal at least the latest one. A run of
-/// another thread (a delegated child's `resultRun`, say) never proves
-/// anything about the parent, whatever its ordinal. A missing latest run id
-/// is unresolved unless the read said outright that the thread has no runs.
-pub fn delegated_covered(thread_id: &str, proven: &[&str], latest: Option<&str>, run_count: Option<u64>) -> bool {
+/// `result_run` is the wait's `resultRun`: the run T3 names as holding the
+/// final answer once delegated work and the runs delivering its completions
+/// have settled. It must be a run of the watched thread itself, at least as
+/// new as the latest run the read saw. A run of another thread (a delegated
+/// child's) never proves anything about the parent, whatever its ordinal. A
+/// missing latest run id is unresolved unless the read said outright that
+/// there are no runs.
+pub fn workstream_covered(
+    thread_id: &str,
+    result_run: Option<&str>,
+    latest: Option<&str>,
+    run_count: Option<u64>,
+) -> bool {
     let Some(latest) = latest else {
         return run_count == Some(0);
     };
-    let Some(latest) = run_ordinal_of(thread_id, latest) else {
+    let (Some(latest), Some(result)) = (
+        run_ordinal_of(thread_id, latest),
+        result_run.and_then(|r| run_ordinal_of(thread_id, r)),
+    ) else {
         return false;
     };
-    proven
-        .iter()
-        .filter_map(|p| run_ordinal_of(thread_id, p))
-        .any(|ordinal| ordinal >= latest)
+    result >= latest
 }
 
 /// What the caller is waiting for on each thread.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Predicate {
-    /// The latest run must have at least this ordinal. 0 disables the check.
+    /// The deciding run must have at least this ordinal. 0 disables it.
     pub min_run_ordinal: u64,
-    /// Delegated and background work must have settled too (MCP only).
+    /// Workstream mode (MCP only): the run, its delegated and background
+    /// work, and the parent runs that deliver their completions must all
+    /// have settled. Off means turn mode: the latest run finished.
     pub until_delegated: bool,
+    /// The final assistant message of the deciding run must contain this.
+    pub final_marker: Option<String>,
+    /// A `pendingKey` the caller already knows about: that exact set of
+    /// pending requests does not wake it again.
+    pub acknowledged: Option<String>,
+    /// A failed run does not end the wait; a later run of the same thread
+    /// is followed instead (the failure is reported as progress).
+    pub follow: bool,
+}
+
+/// What one thread means for the caller right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadOutcome {
+    Pending,
+    Completed,
+    Failed,
+    NeedsInput,
+}
+
+impl ThreadOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadOutcome::Pending => "pending",
+            ThreadOutcome::Completed => "completed",
+            ThreadOutcome::Failed => "failed",
+            ThreadOutcome::NeedsInput => "needs_input",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ThreadOutcome::Completed | ThreadOutcome::Failed)
+    }
+}
+
+/// A question or approval waiting on a thread, holding only safe text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRequest {
+    /// `question`, `approval` or `request`.
+    pub kind: String,
+    pub item_id: String,
+    pub request_id: Option<String>,
+    /// `{header, question, options: [label...]}`, redacted and truncated.
+    pub questions: Vec<Value>,
+}
+
+impl PendingRequest {
+    pub fn to_json(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("kind".into(), json!(self.kind));
+        m.insert("itemId".into(), json!(self.item_id));
+        if let Some(r) = &self.request_id {
+            m.insert("requestId".into(), json!(r));
+        }
+        // Approvals are the user's to give; a bot must not try to answer.
+        m.insert("userOnly".into(), json!(self.kind != "question"));
+        if !self.questions.is_empty() {
+            m.insert("questions".into(), json!(self.questions));
+        }
+        Value::Object(m)
+    }
 }
 
 /// One observation of a thread, from either backend.
@@ -114,19 +193,37 @@ pub struct ThreadState {
     pub thread_id: String,
     pub status: Option<String>,
     pub latest_run_id: Option<String>,
+    /// The run in progress, if the server reported one.
+    pub active_run_id: Option<String>,
     /// `runCount`, when the server reported it.
     pub run_count: Option<u64>,
+    pub item_count: Option<u64>,
+    /// Set when this thread is a delegated child of another thread.
+    pub parent_thread_id: Option<String>,
     /// The server's response named a different thread than the one asked for.
     pub foreign_thread: bool,
     pub title: Option<String>,
     pub link: Option<String>,
     pub pending_requests: Option<u64>,
-    /// `resultRun` from `t3_thread_wait` when waiting on delegated work.
+    /// Details of pending requests, when the backend can read them.
+    pub requests: Vec<PendingRequest>,
+    /// Ids from `t3_pending_request list` (questions only; T3 does not list
+    /// approvals there).
+    pub pending_ids: Vec<String>,
+    /// `resultRun` from `t3_thread_wait` in workstream mode.
     pub result_run_id: Option<String>,
-    /// A `t3_thread_wait` with `untilDelegatedWorkSettled` proved that the
-    /// delegated work of `latest_run_id` (or a later run of the same thread)
-    /// has settled.
+    /// Workstream mode: a `t3_thread_wait` with `untilDelegatedWorkSettled`
+    /// proved that the latest run, its delegated and background work and the
+    /// runs delivering their completions have all settled.
     pub delegated_settled: bool,
+    /// Why the workstream proof was not accepted, when it was not.
+    pub proof_note: Option<String>,
+    /// Turn mode: T3 reported delegated work still running when this turn
+    /// ended. A hint for the caller, never a reason to keep waiting.
+    pub delegated_pending_hint: Option<bool>,
+    /// `--final-marker`: whether the deciding run's final assistant message
+    /// contains it. `None` when not checked (yet).
+    pub marker_seen: Option<bool>,
     /// When the request that produced this observation was sent. A new
     /// subscriber ignores anything older than its own registration, so a
     /// cached "completed" never wakes someone who just queued a new turn.
@@ -136,18 +233,31 @@ pub struct ThreadState {
 impl ThreadState {
     pub fn from_thread_json(v: &Value, thread_id: &str, observed_at: Instant) -> Self {
         let t = v.get("thread").filter(|t| t.is_object()).unwrap_or(v);
-        let s = |k: &str| t.get(k).and_then(Value::as_str).map(str::to_string);
+        let s = |k: &str| {
+            t.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
         ThreadState {
             thread_id: thread_id.to_string(),
-            status: s("status"),
-            latest_run_id: s("latestRunId").filter(|r| !r.is_empty()),
+            status: t.get("status").and_then(Value::as_str).map(str::to_string),
+            latest_run_id: s("latestRunId"),
+            active_run_id: s("activeRunId"),
             run_count: t.get("runCount").and_then(Value::as_u64),
+            item_count: t.get("itemCount").and_then(Value::as_u64),
+            parent_thread_id: s("parentThreadId"),
             foreign_thread: s("threadId").is_some_and(|id| id != thread_id),
             title: s("title"),
             link: s("link").map(|l| l.trim_start_matches('<').trim_end_matches('>').to_string()),
             pending_requests: t.get("pendingRequestCount").and_then(Value::as_u64),
+            requests: Vec::new(),
+            pending_ids: Vec::new(),
             result_run_id: None,
             delegated_settled: false,
+            proof_note: None,
+            delegated_pending_hint: None,
+            marker_seen: None,
             observed_at,
         }
     }
@@ -163,18 +273,101 @@ impl ThreadState {
             .and_then(|r| run_ordinal_of(&self.thread_id, r))
     }
 
-    pub fn satisfies(&self, p: &Predicate) -> bool {
-        if self.foreign_thread || self.class() != StatusClass::Settled {
-            return false;
+    /// The run whose result decides the outcome: the workstream's result run
+    /// once proven, otherwise the latest run.
+    pub fn deciding_run(&self) -> Option<&str> {
+        if self.delegated_settled {
+            self.result_run_id.as_deref().or(self.latest_run_id.as_deref())
+        } else {
+            self.latest_run_id.as_deref()
         }
+    }
+
+    /// A question or approval is waiting: status `waiting`, or a pending
+    /// request while the run still says `running` (an approval prompt blocks
+    /// a run without changing its status).
+    pub fn needs_input(&self) -> bool {
+        self.status.as_deref() == Some("waiting")
+            || self.pending_requests.unwrap_or(0) > 0
+            || !self.requests.is_empty()
+            || !self.pending_ids.is_empty()
+    }
+
+    /// A stable name for the current set of pending requests, so a caller
+    /// can say "I know about these" (`--acknowledge`) and be woken only for
+    /// new ones. Built from request ids when known, else from the count, the
+    /// status and the latest run.
+    pub fn pending_key(&self) -> String {
+        let mut ids: Vec<&str> = self.requests.iter().map(|r| r.item_id.as_str()).collect();
+        ids.extend(self.pending_ids.iter().map(String::as_str));
+        ids.sort_unstable();
+        ids.dedup();
+        let basis = if ids.is_empty() {
+            format!(
+                "count:{}:status:{}:run:{}",
+                self.pending_requests.unwrap_or(0),
+                self.status.as_deref().unwrap_or(""),
+                self.latest_run_id.as_deref().unwrap_or("")
+            )
+        } else {
+            format!("ids:{}", ids.join("\n"))
+        };
+        let digest = crate::util::sha256(format!("{}\n{basis}", self.thread_id).as_bytes());
+        format!("pk-{}", &crate::util::hex(&digest)[..16])
+    }
+
+    /// Whether the thread is far enough along for its terminal status to
+    /// count: the right run, the workstream proven, the marker seen.
+    fn requirements_met(&self, p: &Predicate) -> bool {
         if p.min_run_ordinal > 0 && self.ordinal().unwrap_or(0) < p.min_run_ordinal {
             return false;
         }
-        !p.until_delegated || self.delegated_settled
+        if p.until_delegated && !self.delegated_settled {
+            return false;
+        }
+        p.final_marker.is_none() || self.marker_seen == Some(true)
     }
 
-    /// Why an observation can never settle, when the server sent something
-    /// this version does not understand.
+    pub fn outcome(&self, p: &Predicate) -> ThreadOutcome {
+        if self.foreign_thread {
+            return ThreadOutcome::Pending;
+        }
+        if self.needs_input() {
+            if p.acknowledged.as_deref() == Some(self.pending_key().as_str()) {
+                return ThreadOutcome::Pending;
+            }
+            return ThreadOutcome::NeedsInput;
+        }
+        if self.class() != StatusClass::Settled {
+            return ThreadOutcome::Pending;
+        }
+        let success = self.status.as_deref().is_some_and(|s| SUCCESS_STATUSES.contains(&s));
+        if !success {
+            // A failure counts only for a run the caller waits for and, in
+            // workstream mode, once the delegated work it started has
+            // settled too (a child's completion may start a new run). It
+            // never needs the final marker: that confirms success.
+            if p.min_run_ordinal > 0 && self.ordinal().unwrap_or(0) < p.min_run_ordinal {
+                return ThreadOutcome::Pending;
+            }
+            if p.until_delegated && !self.delegated_settled {
+                return ThreadOutcome::Pending;
+            }
+            return ThreadOutcome::Failed;
+        }
+        if !self.requirements_met(p) {
+            return ThreadOutcome::Pending;
+        }
+        ThreadOutcome::Completed
+    }
+
+    /// The thread reached a terminal outcome (completed or failed).
+    #[cfg(test)]
+    pub fn satisfies(&self, p: &Predicate) -> bool {
+        self.outcome(p).is_terminal()
+    }
+
+    /// Why an observation is not (yet) what it looks like.
     pub fn diagnostic(&self) -> Option<String> {
         if self.foreign_thread {
             return Some("server answered for a different thread; treated as not settled".into());
@@ -187,6 +380,19 @@ impl ThreadState {
                 ));
             }
         }
+        if let Some(note) = &self.proof_note {
+            return Some(note.clone());
+        }
+        if self.marker_seen == Some(false) {
+            return Some("the final assistant message does not contain the final marker yet".into());
+        }
+        if self.delegated_pending_hint == Some(true) {
+            return Some(
+                "this turn finished, but T3 reports delegated work still running; \
+                 use --until workstream to wait for the whole workstream"
+                    .into(),
+            );
+        }
         match self.status.as_deref() {
             None | Some("") => Some("server reported no thread status".into()),
             Some(s) if classify(s) == StatusClass::Unknown => Some(format!(
@@ -198,22 +404,46 @@ impl ThreadState {
     }
 
     pub fn to_json(&self, p: &Predicate) -> Value {
+        let outcome = self.outcome(p);
         let mut m = Map::new();
         m.insert("status".into(), json!(self.status));
-        m.insert("settled".into(), json!(self.satisfies(p)));
+        m.insert("outcome".into(), json!(outcome.as_str()));
+        m.insert("settled".into(), json!(outcome.is_terminal()));
         m.insert("latestRunId".into(), json!(self.latest_run_id));
         m.insert("runOrdinal".into(), json!(self.ordinal()));
+        if self.active_run_id.is_some() {
+            m.insert("activeRunId".into(), json!(self.active_run_id));
+        }
         if p.until_delegated {
             m.insert("delegatedSettled".into(), json!(self.delegated_settled));
+        }
+        if let Some(r) = &self.result_run_id {
+            m.insert("resultRunId".into(), json!(r));
+        }
+        if let Some(h) = self.delegated_pending_hint {
+            m.insert("delegatedWorkPending".into(), json!(h));
+        }
+        if let Some(seen) = self.marker_seen {
+            m.insert("finalMarkerSeen".into(), json!(seen));
         }
         if let Some(t) = &self.title {
             m.insert("title".into(), json!(t));
         }
+        if let Some(parent) = &self.parent_thread_id {
+            m.insert("parentThreadId".into(), json!(parent));
+        }
         if let Some(n) = self.pending_requests.filter(|n| *n > 0) {
             m.insert("pendingRequestCount".into(), json!(n));
         }
-        if let Some(r) = &self.result_run_id {
-            m.insert("resultRunId".into(), json!(r));
+        if self.needs_input() {
+            m.insert("pendingKey".into(), json!(self.pending_key()));
+            m.insert(
+                "requests".into(),
+                Value::Array(self.requests.iter().map(PendingRequest::to_json).collect()),
+            );
+            if !self.pending_ids.is_empty() {
+                m.insert("pendingRequestIds".into(), json!(self.pending_ids));
+            }
         }
         if let Some(l) = &self.link {
             m.insert("link".into(), json!(l));
@@ -223,6 +453,87 @@ impl ThreadState {
         }
         Value::Object(m)
     }
+}
+
+/// Item statuses after which a request no longer waits on anyone.
+const RESOLVED: &[&str] = &[
+    "completed",
+    "cancelled",
+    "canceled",
+    "declined",
+    "denied",
+    "approved",
+    "rejected",
+    "failed",
+    "expired",
+    "resolved",
+    "answered",
+    "interrupted",
+];
+
+/// Unresolved requests among a thread's activity items: `user_input_request`
+/// items (questions), and approval or permission items. Question text is
+/// redacted and truncated; option descriptions are dropped.
+pub fn pending_from_activity(items: &[Value]) -> Vec<PendingRequest> {
+    let mut out = Vec::new();
+    for item in items {
+        let kind_raw = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let kind = if kind_raw == "user_input_request" {
+            "question"
+        } else if kind_raw.contains("approval") || kind_raw.contains("permission") {
+            "approval"
+        } else if kind_raw.ends_with("_request") {
+            "request"
+        } else {
+            continue;
+        };
+        let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+        if RESOLVED.contains(&status) {
+            continue;
+        }
+        let item_id = item.get("itemId").and_then(Value::as_str).unwrap_or("").to_string();
+        let request_id = item_id
+            .strip_prefix("turn-item:runtime-request:")
+            .map(|r| crate::util::pct_decode(r, false));
+        let mut questions = Vec::new();
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            match serde_json::from_str::<Value>(text) {
+                Ok(Value::Array(qs)) => {
+                    for q in qs.iter().take(5) {
+                        let field = |k: &str| q.get(k).and_then(Value::as_str).map(|t| crate::util::safe_text(t, 600));
+                        let options: Vec<String> = q
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .map(|o| {
+                                o.iter()
+                                    .take(8)
+                                    .filter_map(|x| x.get("label").and_then(Value::as_str))
+                                    .map(|l| crate::util::safe_text(l, 120))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        questions.push(json!({
+                            "header": field("header"),
+                            "question": field("question"),
+                            "options": options,
+                            "multiSelect": q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                        }));
+                    }
+                }
+                _ if !text.trim().is_empty() => {
+                    questions.push(json!({ "question": crate::util::safe_text(text, 600) }));
+                }
+                _ => {}
+            }
+        }
+        out.push(PendingRequest {
+            kind: kind.to_string(),
+            item_id,
+            request_id,
+            questions,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -241,6 +552,10 @@ mod tests {
             T,
             Instant::now(),
         )
+    }
+
+    fn p() -> Predicate {
+        Predicate::default()
     }
 
     #[test]
@@ -267,32 +582,89 @@ mod tests {
     }
 
     #[test]
-    fn known_statuses_are_classified() {
-        let p = Predicate::default();
+    fn success_failure_and_input_are_distinct_outcomes() {
         for s in ACTIVE_STATUSES {
             assert_eq!(classify(s), StatusClass::Active);
-            assert!(!state(s, &run(T, 1)).satisfies(&p), "{s}");
+            assert_eq!(state(s, &run(T, 1)).outcome(&p()), ThreadOutcome::Pending, "{s}");
         }
         for s in SETTLED_STATUSES {
             assert_eq!(classify(s), StatusClass::Settled);
-            assert!(state(s, &run(T, 1)).satisfies(&p), "{s}");
         }
+        for s in ["completed", "idle"] {
+            assert_eq!(state(s, &run(T, 1)).outcome(&p()), ThreadOutcome::Completed, "{s}");
+        }
+        for s in ["failed", "error", "interrupted", "cancelled", "stopped", "rolled_back"] {
+            let st = state(s, &run(T, 1));
+            assert_eq!(st.outcome(&p()), ThreadOutcome::Failed, "{s}");
+            assert_eq!(st.to_json(&p())["outcome"], "failed");
+        }
+        let waiting = state("waiting", &run(T, 1));
+        assert_eq!(waiting.outcome(&p()), ThreadOutcome::NeedsInput);
+        assert!(!waiting.satisfies(&p()));
+        assert_eq!(waiting.to_json(&p())["settled"], false);
+    }
+
+    #[test]
+    fn a_pending_request_while_running_needs_input() {
+        let mut st = state("running", &run(T, 1));
+        assert_eq!(st.outcome(&p()), ThreadOutcome::Pending);
+        st.pending_requests = Some(1);
+        assert_eq!(st.outcome(&p()), ThreadOutcome::NeedsInput);
+        // Whatever run the caller waits for: a blocked thread will not get there.
+        let later = Predicate {
+            min_run_ordinal: 9,
+            until_delegated: true,
+            ..Default::default()
+        };
+        assert_eq!(st.outcome(&later), ThreadOutcome::NeedsInput);
+        let j = st.to_json(&p());
+        assert_eq!(j["outcome"], "needs_input");
+        assert_eq!(j["pendingRequestCount"], 1);
+        assert!(j["pendingKey"].as_str().unwrap().starts_with("pk-"));
+    }
+
+    #[test]
+    fn acknowledged_input_waits_on_but_a_new_request_wakes() {
+        let mut st = state("running", &run(T, 1));
+        st.pending_requests = Some(1);
+        st.requests = vec![PendingRequest {
+            kind: "question".into(),
+            item_id: "turn-item:runtime-request:a".into(),
+            request_id: Some("a".into()),
+            questions: vec![],
+        }];
+        let key = st.pending_key();
+        assert_eq!(key, st.clone().pending_key(), "stable");
+        let ack = Predicate {
+            acknowledged: Some(key.clone()),
+            ..Default::default()
+        };
+        assert_eq!(st.outcome(&ack), ThreadOutcome::Pending);
+        st.requests.push(PendingRequest {
+            kind: "approval".into(),
+            item_id: "turn-item:runtime-request:b".into(),
+            request_id: Some("b".into()),
+            questions: vec![],
+        });
+        assert_ne!(st.pending_key(), key);
+        assert_eq!(st.outcome(&ack), ThreadOutcome::NeedsInput);
+        // Answered and finished: the acknowledgement no longer matters.
+        assert_eq!(state("completed", &run(T, 1)).outcome(&ack), ThreadOutcome::Completed);
     }
 
     #[test]
     fn unknown_and_empty_statuses_never_settle() {
-        let p = Predicate::default();
         for s in ["", "archived_v9", "COMPLETED", " completed"] {
             let st = state(s, &run(T, 1));
             assert_eq!(st.class(), StatusClass::Unknown, "{s:?}");
-            assert!(!st.satisfies(&p), "{s:?}");
+            assert_eq!(st.outcome(&p()), ThreadOutcome::Pending, "{s:?}");
             assert!(st.diagnostic().is_some(), "{s:?}");
-            assert_eq!(st.to_json(&p)["settled"], false);
+            assert_eq!(st.to_json(&p())["settled"], false);
         }
         let mut missing = state("completed", &run(T, 1));
         missing.status = None;
-        assert!(!missing.satisfies(&p));
-        assert!(missing.to_json(&p)["diagnostic"]
+        assert!(!missing.satisfies(&p()));
+        assert!(missing.to_json(&p())["diagnostic"]
             .as_str()
             .unwrap()
             .contains("no thread status"));
@@ -306,6 +678,10 @@ mod tests {
             ..Default::default()
         };
         assert!(!state("completed", &run(T, 1)).satisfies(&p));
+        assert!(
+            !state("failed", &run(T, 1)).satisfies(&p),
+            "an older failure is not ours"
+        );
         assert!(!state("running", &run(T, 2)).satisfies(&p));
         assert!(state("completed", &run(T, 2)).satisfies(&p));
         assert!(state("completed", &run(T, 3)).satisfies(&p));
@@ -316,16 +692,16 @@ mod tests {
 
     #[test]
     fn another_threads_run_never_counts_as_this_threads_ordinal() {
-        let p = Predicate {
+        let p2 = Predicate {
             min_run_ordinal: 2,
             ..Default::default()
         };
         let st = state("completed", &run("mcp:launch:child", 100));
         assert_eq!(st.ordinal(), None);
-        assert!(!st.satisfies(&p));
+        assert!(!st.satisfies(&p2));
         assert!(st.diagnostic().unwrap().contains("not a run of this thread"));
         // Without an ordinal requirement the status alone still settles.
-        assert!(st.satisfies(&Predicate::default()));
+        assert!(st.satisfies(&p()));
     }
 
     #[test]
@@ -335,51 +711,98 @@ mod tests {
             T,
             Instant::now(),
         );
-        assert!(!st.satisfies(&Predicate::default()));
+        assert!(!st.satisfies(&p()));
         assert!(st.diagnostic().unwrap().contains("different thread"));
     }
 
     #[test]
-    fn delegated_needs_a_proof() {
-        let p = Predicate {
+    fn workstream_needs_a_proof_and_a_marker_when_asked() {
+        let ws = Predicate {
             until_delegated: true,
             ..Default::default()
         };
         let mut s = state("completed", &run(T, 1));
-        assert!(!s.satisfies(&p));
+        assert!(!s.satisfies(&ws));
         s.delegated_settled = true;
-        assert!(s.satisfies(&p));
-        assert_eq!(s.to_json(&p)["delegatedSettled"], true);
+        assert!(s.satisfies(&ws));
+        assert_eq!(s.to_json(&ws)["delegatedSettled"], true);
+        let marked = Predicate {
+            final_marker: Some("FINAL".into()),
+            ..ws.clone()
+        };
+        assert!(!s.satisfies(&marked));
+        s.marker_seen = Some(false);
+        assert!(!s.satisfies(&marked));
+        assert!(s.diagnostic().unwrap().contains("final marker"));
+        s.marker_seen = Some(true);
+        assert!(s.satisfies(&marked));
+        // A failed parent turn waits for its delegated work like a
+        // completed one, but never needs the marker.
+        let mut failed = state("failed", &run(T, 1));
+        assert_eq!(failed.outcome(&marked), ThreadOutcome::Pending);
+        failed.delegated_settled = true;
+        assert_eq!(failed.outcome(&marked), ThreadOutcome::Failed);
+        assert_eq!(state("failed", &run(T, 1)).outcome(&p()), ThreadOutcome::Failed);
     }
 
     #[test]
-    fn delegated_proof_needs_the_same_thread_and_a_new_enough_run() {
-        let (p1, p2, p3) = (run(T, 1), run(T, 2), run(T, 3));
+    fn workstream_proof_needs_the_same_thread_and_a_new_enough_run() {
+        let (p1, p2, p3, p6) = (run(T, 1), run(T, 2), run(T, 3), run(T, 6));
         let child = run("mcp:launch:child", 100);
-        // Sol's repro: wait proved parent 1 and child 100; the read sees parent 2.
-        assert!(!delegated_covered(T, &[&p1, &child], Some(&p2), Some(2)));
-        // A child's run never covers the parent, whatever its ordinal.
-        assert!(!delegated_covered(T, &[&child], Some(&p1), Some(1)));
-        // The wait proved the run the read saw, or a later one of the same thread.
-        assert!(delegated_covered(T, &[&p2], Some(&p2), Some(2)));
-        assert!(delegated_covered(T, &[&p1, &p3], Some(&p2), Some(3)));
-        assert!(!delegated_covered(T, &[&p1], Some(&p2), Some(2)));
-        assert!(!delegated_covered(T, &[], Some(&p1), Some(1)));
+        // Sol's repro: the result run is a child's; the read sees parent run 2.
+        assert!(!workstream_covered(T, Some(&child), Some(&p2), Some(2)));
+        // The research incident: run 2 ended while children ran; the read
+        // already shows the synthesis run 6, so a proof for run 2 is stale.
+        assert!(!workstream_covered(T, Some(&p2), Some(&p6), Some(6)));
+        assert!(workstream_covered(T, Some(&p6), Some(&p6), Some(6)));
+        assert!(workstream_covered(T, Some(&p3), Some(&p2), Some(3)));
+        assert!(!workstream_covered(T, Some(&p1), Some(&p2), Some(2)));
+        assert!(!workstream_covered(T, None, Some(&p1), Some(1)));
         // Ids without a parseable identity never prove anything.
-        assert!(!delegated_covered(T, &["opaque-id"], Some("opaque-id"), None));
-        assert!(!delegated_covered(T, &[&p2], Some("opaque-id"), None));
+        assert!(!workstream_covered(T, Some("opaque-id"), Some("opaque-id"), None));
+        assert!(!workstream_covered(T, Some(&p2), Some("opaque-id"), None));
         // A missing latest run is unresolved unless the server said "no runs".
-        assert!(!delegated_covered(T, &[&p1], None, None));
-        assert!(!delegated_covered(T, &[&p1], None, Some(1)));
-        assert!(delegated_covered(T, &[], None, Some(0)));
+        assert!(!workstream_covered(T, Some(&p1), None, None));
+        assert!(!workstream_covered(T, Some(&p1), None, Some(1)));
+        assert!(workstream_covered(T, None, None, Some(0)));
+    }
+
+    #[test]
+    fn pending_requests_are_read_from_activity_items_safely() {
+        let question = json!([{
+            "id": "q1", "header": "Decode site",
+            "question": "Use token sk-live-ABCDEFGHIJKLMNOPQRSTUVWX1234 or not?",
+            "options": [{"label": "Yes (Recommended)", "description": "long text"}, {"label": "No"}],
+            "multiSelect": false
+        }]);
+        let items = vec![
+            json!({"type": "user_input_request", "status": "pending", "text": question.to_string(),
+                   "itemId": "turn-item:runtime-request:runtime-request%3Aabc"}),
+            json!({"type": "user_input_request", "status": "completed", "text": "[]", "itemId": "old"}),
+            json!({"type": "approval_request", "status": "in_progress", "text": "Run rm -rf build?", "itemId": "ap1"}),
+            json!({"type": "command_execution", "status": "running", "text": "$ ls", "itemId": "c"}),
+        ];
+        let found = pending_from_activity(&items);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].kind, "question");
+        assert_eq!(found[0].request_id.as_deref(), Some("runtime-request:abc"));
+        assert_eq!(found[0].to_json()["userOnly"], false);
+        let q = &found[0].questions[0];
+        assert_eq!(q["header"], "Decode site");
+        assert_eq!(q["options"], json!(["Yes (Recommended)", "No"]));
+        assert!(!q.to_string().contains("sk-live-ABCDEF"), "{q}");
+        assert!(!q.to_string().contains("long text"));
+        assert_eq!(found[1].kind, "approval");
+        assert_eq!(found[1].to_json()["userOnly"], true);
     }
 
     #[test]
     fn json_strips_link_brackets() {
-        let j = state("completed", &run(T, 4)).to_json(&Predicate::default());
+        let j = state("completed", &run(T, 4)).to_json(&p());
         assert_eq!(j["link"], "t3-thread://v2/e/t");
         assert_eq!(j["runOrdinal"], 4);
         assert_eq!(j["settled"], true);
+        assert_eq!(j["outcome"], "completed");
         assert!(j.get("diagnostic").is_none());
     }
 }
