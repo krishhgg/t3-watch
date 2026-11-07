@@ -19,9 +19,22 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ./t3-watch-<ver>-x86_64-unknown-linux-gnu/t3-watch --version
 ```
 
-A daemon left running by an older t3-watch listens on `daemon.sock`; this
-version uses `daemon-p2.sock`, so the two never mix. `t3-watch status` only
-shows the new one.
+`t3-watch --version` prints the version, the engine revision and the
+source revision, e.g. `t3-watch 0.2.0 (engine 4, rev 1a2b3c...)`; packaged
+binaries always carry the commit they were built from. A daemon left
+running by an older build listens on another socket (`daemon.sock`,
+`daemon-p2.sock`) and is never used; on a shared `T3_WATCH_SOCKET` the
+client refuses it (`incompatible_daemon`). Old daemons still running their
+outbox senders keep to `outbox/`; this build's entries live in
+`outbox-v2/`. To retire an old daemon at once, run its own binary's
+`t3-watch stop`; otherwise it idles out once its clients and outbox are
+empty (this build moves entries it left in `outbox/` into `outbox-v2/`).
+
+`<state>/trace.jsonl` records each wait, the daemon build that served it,
+the first proof or settled observation (with T3's `completedAt`), the
+payload, outbox entry and every HTTP attempt with its retry deadline, and
+the exit code. To locate a late or missing wake, line it up with the run's
+`completedAt` and the receiver's own log.
 
 ## 1. Local transport (no pairing), on the machine that runs T3
 

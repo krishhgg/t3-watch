@@ -132,6 +132,12 @@ Turn mode is unchanged for ordinary single turns. Over MCP it also asks T3,
 without waiting (`t3_thread_wait` with `timeoutMs: 1`), whether the finished
 turn left delegated work running, and reports `delegatedWorkPending: true`
 with a diagnostic when it did. That is a hint; it never changes the result.
+If the probe's answer names a newer run of the thread than the header did,
+in `runId` or in `resultRun`, the observation is discarded and the header
+read again: a turn is never reported from a header that T3 has already
+contradicted. The probe's aggregate status alone is not used for that,
+because a completed parent with children still running is exactly what the
+hint reports.
 
 Workstream mode settles only when all of these hold, checked on each cycle:
 
@@ -292,10 +298,11 @@ notification to a DNS failure (`Could not resolve host`) with no retry.
 With `--durable`, a webhook is never fire-and-forget:
 
 1. Before the first attempt, the event is written to
-   `<state>/outbox/<id>.json` (0600 in a 0700 directory, through an fsynced
-   temp file and a rename). A crash from here on loses nothing.
-2. The waiting client tries it inline (up to 4 attempts within 60 s). A 2xx
-   removes the entry.
+   `<state>/outbox-v2/<id>.json` (0600 in a 0700 directory, through an
+   fsynced temp file and a rename). A crash from here on loses nothing.
+2. The waiting client tries it inline (up to 4 attempts within 60 s) and
+   records the result the moment the webhook is done, even while an
+   `--on-settle` hook beside it is still running. A 2xx removes the entry.
 3. Otherwise the client exits (4 if the threads completed) with
    `notification.queued: true` and the outbox id, and makes sure the daemon
    runs. The daemon's sender retries every entry with exponential backoff
@@ -305,9 +312,19 @@ With `--durable`, a webhook is never fire-and-forget:
    from the client to the sender, the 5-minute cap never shortens it, and
    even `outbox run --once` waits for it. DNS failures, refused
    connections, 5xx and 4xx alike are retried; after `--durable-max-age`
-   (default 7 days) the entry moves to `outbox/dead/`.
+   (default 7 days) the entry moves to `outbox-v2/dead/`.
 4. The daemon does not idle-exit while the outbox holds entries. One sender
-   runs at a time (`outbox/sender.lock`).
+   runs at a time (`outbox-v2/sender.lock`).
+5. Each entry has a lease (an flock on `<id>.lock`). Whoever sends it, the
+   client inline or the sender, holds the lease for the attempt and for
+   recording its result, and rereads the entry first: the two never send
+   one entry at once, and neither writes over the other's newer state
+   (`outbox run --once` reports a leased entry as `inFlight`). A process
+   that dies drops its lease, so the sender takes over at once.
+6. Builds before this one kept entries in `outbox/` without leases or
+   `Retry-After` floors. Their senders never look at `outbox-v2/`. Entries
+   they left behind (older than the 90 s inline grace) are moved into
+   `outbox-v2/` under their own `outbox/sender.lock`.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -418,9 +435,29 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `outcome`,
 `finalMarkerSeen`, `upstream`, `lastError` and `diagnostic`.
 
 The top level also has `until`, `startedAt` and `endedAt` (UTC, from the
-waiting client), `elapsedMs` (the client's whole wait), `watchId`, and after
-a daemon restart mid-wait `daemonReconnects` and `registrationElapsedMs`
-(the daemon's time since the last re-registration).
+waiting client), `elapsedMs` (the client's whole wait), `watchId`, `build`
+(this binary's `version`, `engine` and `rev`), `daemon` (the same for the
+daemon that served the wait, with its pid), and after a daemon restart
+mid-wait `daemonReconnects` and `registrationElapsedMs` (the daemon's time
+since the last re-registration). Each thread also has `observedAt` (when the
+deciding observation was made) and, over MCP, `runCompletedAt` (T3's own
+completion time for the latest run).
+
+### Delivery trace
+
+Every wait, the daemon and the outbox sender append one JSON line per step
+to `<state>/trace.jsonl` (0600, rotated at 4 MiB): `wait.start`,
+`daemon.start`, `daemon.accepted` (or `daemon.incompatible`) with the
+daemon's build, `watch.settled` or `watch.proof` (the first time a watch
+saw the run settled or proven, next to T3's `completedAt`),
+`wait.outcome`, `notify.prepared`, `outbox.created`, every
+`notify.attempt` and `outbox.attempt` with its HTTP status, error category
+and `Retry-After`, `outbox.queued` with the next attempt time,
+`notify.result`, `outbox.delivered` and `wait.exit` with the exit code.
+Every line carries `at`, `pid`, `engine` and `rev`, and ids, statuses and
+times only: never a URL, header, secret or message text. When a wake comes
+late or never, the trace shows how far the watcher got and when, even if
+its stdout went nowhere.
 
 ## How it works
 
@@ -434,12 +471,21 @@ a daemon restart mid-wait `daemonReconnects` and `registrationElapsedMs`
 
 - The first `t3-watch wait` starts `t3-watch daemon` in its own session
   (`setsid`), with stdout on `/dev/null`, so the harness never waits on it.
-  The daemon listens on `daemon-p2.sock` in a 0700 directory
+  The daemon listens on `daemon-e<N>.sock` in a 0700 directory
   (`$T3_WATCH_HOME`, else `$XDG_RUNTIME_DIR/t3-watch`, else
-  `~/.config/t3-watch`). A lock file keeps it to one per socket. The number
-  in the name changes with the protocol, so a daemon left by an older
-  t3-watch (which would ignore new options and report a failed run as
-  success) never serves a newer client; the old one idles out on its own.
+  `~/.config/t3-watch`), where N is the engine revision. A lock file keeps
+  it to one per socket.
+- The engine revision (`t3-watch --version` prints it, with the version and
+  the source revision the binary was built from) names the result
+  semantics. Builds that report the same package version have shipped with
+  different semantics, so the version alone is not enough. A daemon from
+  another engine revision is never trusted: by default it listens on another
+  socket and is never reached, and on a shared `T3_WATCH_SOCKET` the client
+  checks the `accepted` line and refuses with `error.kind =
+  "incompatible_daemon"` (exit 2), dropping the connection so that daemon's
+  wait ends too. The daemon likewise refuses a request from another
+  revision (`incompatible_client`). An old daemon idles out on its own; stop
+  it sooner with its own binary's `t3-watch stop`.
 - Each client sends one request line and blocks in `read()`. It uses no CPU
   and no network until the answer arrives.
 - The daemon keeps one worker per watch key: (origin, pairing, thread,
@@ -764,11 +810,16 @@ or the turn probe; failed, interrupted and cancelled result runs ahead of,
 behind and equal to the header's run; input pending before the first
 long-poll with a 900 ms timeout; and a running child with pending input and
 an earlier final result, read without touching its timeline.
-`tests/delivery.rs` covers closed stdout and stderr together for
+`tests/compat.rs` covers daemons of other engine revisions (an old
+`accepted` line on a shared custom socket, no `accepted` line at all, an old
+daemon at the old default socket, this daemon refusing old requests) and
+old outbox senders (migration of their entries, this build's entries out of
+their reach). `tests/delivery.rs` covers closed stdout and stderr together for
 `run_failed`, outage progress, completion and needs-input (with the
 receiver up and down), `Retry-After` across the hand-off and past the
 sender's cap, and the final event persisted while a progress delivery
-hangs. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
+hangs, a 429 with `Retry-After` recorded while a slow hook still runs, the
+sender leaving a live inline delivery alone, and the trace and build fields. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
 parent run, missing run identity, foreign `latestRunId`s, cancelled
 long-polls checked on the wire (each cancelled before the next starts) and in
 the OS (threads, descriptors, TCP connections back to baseline), killed local
