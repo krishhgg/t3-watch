@@ -149,6 +149,11 @@ BOT_URL=https://bot.example/hooks/t3 BOT_SECRET=... \
     --webhook-url-env BOT_URL --webhook-secret-env BOT_SECRET &
 ```
 
+Keep `--notify-on all` for a bot: the default sends no `timeout` or
+`error` event, and `--timeout` counts time the host spends asleep, so after
+a long sleep the wait honestly ends in `timeout` and only `all` wakes the
+bot for it.
+
 The bot receives the same JSON in a POST, signed with
 `X-T3-Watch-Signature: sha256=HMAC(secret, "<X-T3-Watch-Timestamp>.<X-T3-Watch-Id>.<body>")`.
 `X-T3-Watch-Event` is `settled`, `needs_input`, `timeout`, `error`, or

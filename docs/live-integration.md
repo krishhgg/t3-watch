@@ -20,20 +20,23 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.3.0 (engine 5, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.4.0 (engine 6, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
-Upgrading over a running older build (for example `a92f977` or `fa10d88`,
-both engine 4): this build never talks to their daemons (socket
-`daemon-e4.sock` or older; on a shared `T3_WATCH_SOCKET` it refuses them,
-by engine and by missing capabilities) and keeps its entries in
-`outbox-v3/`, which their senders never read. Their daemons keep serving
-their own running clients and idle out afterwards; to retire one sooner,
-run its own binary's `t3-watch stop` once its clients are done. Entries
-they leave in `outbox/` or `outbox-v2/` are drained by this build's daemon
-once no client of theirs can still be sending them (see the README,
-"Durable delivery", item 7), and count as pending until then, so the
-daemon does not idle out with an event unsent.
+Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;
+`ac91a64` and other `0.3.0` builds, engine 5): this build never talks to
+their daemons (sockets `daemon-e4.sock` and `daemon-e5.sock`, or older; on
+a shared `T3_WATCH_SOCKET` it refuses them, by engine and by missing
+capabilities) and keeps its entries in `outbox-v4/`, which their senders
+never read. Their daemons keep serving their own running clients and idle
+out afterwards; to retire one sooner, run its own binary's `t3-watch stop`
+once its clients are done. Entries they leave in `outbox-v2/` or
+`outbox-v3/` are never moved: this build's daemon delivers them in place,
+under their leases and sender lock, so a client of theirs that is still
+running reports its event queued or delivered truthfully (see the README,
+"Durable delivery", item 7). Entries in `outbox/` (before engine 4) move
+over after the 90 s inline grace. All of them count as pending until
+delivered, so the daemon does not idle out with an event unsent.
 
 `<state>/trace.jsonl` records each wait, the daemon build that served it,
 the first proof or settled observation (with T3's `completedAt`), the
@@ -167,8 +170,10 @@ It prints each step (run `completedAt`, first proof or settled observation,
 payload end, outbox entry, every HTTP attempt and retry deadline, the 2xx,
 then the receipt and continuation you supply) with the time since
 completion, and a JSON summary to record. The acceptance event is the
-wait's final event (or `--id`); only its own 2xx counts, and progress
-events are listed apart. It verifies nothing by itself.
+notification of the wait's final outcome (or `--id`); only its own 2xx
+counts, and progress events are listed apart. If the final outcome had no
+notification (a timeout without `--notify-on all`), the summary says the
+acceptance event is missing. It verifies nothing by itself.
 
 The result's `startedAt`, `endedAt`, `exitAt`, `elapsedMs` (suspended time
 included), `elapsedAwakeMs`, `elapsedWallMs` and `suspendedMs` separate a
@@ -176,7 +181,9 @@ host that slept from a slow server or a slow receiver. Run them through
 the timeline for the box incidents (a `--timeout 10m` watch that ran 18.5
 minutes, a webhook 15.6 minutes after completion): a large `suspendedMs`
 or `watch.restart` lines point at a sleeping host; none, at the server,
-the network or the receiver.
+the network or the receiver. After a sleep longer than the budget the
+right outcome is `timeout`, not a late completion, so watchers that must
+wake a bot run with `--notify-on all`, as below.
 
 Per scenario:
 

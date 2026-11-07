@@ -286,6 +286,10 @@ t3-watch wait mcp:launch:abc123 \
   leave an unattended bot waiting forever. Once the notification options
   themselves are valid, this includes errors before the wait starts: an
   unreadable machines.json, an unknown machine, a bad `--mode` or duration.
+  A bot that relies on the webhook to wake it should run with `--notify-on
+  all`: after a long suspend the honest outcome can be `timeout` (the
+  budget counts suspended time), and under the default nothing would wake
+  it.
 - When the threads completed but a notification failed (or was only
   queued), the result adds `"notification":{"delivered":false,...}` and the
   exit code is 4. Exit codes 5 and 6 are kept as they are; check
@@ -298,7 +302,7 @@ notification to a DNS failure (`Could not resolve host`) with no retry.
 With `--durable`, a webhook is never fire-and-forget:
 
 1. Before the first attempt, the event is written to
-   `<state>/outbox-v3/<id>.json` (0600 in a 0700 directory, through an
+   `<state>/outbox-v4/<id>.json` (0600 in a 0700 directory, through an
    fsynced temp file and a rename). A crash from here on loses nothing.
 2. The waiting client tries it inline (up to 4 attempts within 60 s) and
    records the result the moment the webhook is done, even while an
@@ -312,9 +316,9 @@ With `--durable`, a webhook is never fire-and-forget:
    from the client to the sender, the 5-minute cap never shortens it, and
    even `outbox run --once` waits for it. DNS failures, refused
    connections, 5xx and 4xx alike are retried; after `--durable-max-age`
-   (default 7 days) the entry moves to `outbox-v3/dead/`.
+   (default 7 days) the entry moves to `outbox-v4/dead/`.
 4. The daemon does not idle-exit while the outbox holds entries. One sender
-   runs at a time (`outbox-v3/sender.lock`).
+   runs at a time (`outbox-v4/sender.lock`).
 5. Each entry has a lease (an flock on `<id>.lock`). Whoever sends it, the
    client inline or the sender, holds the lease for the attempt and for
    recording its result, and rereads the entry first: the two never send
@@ -323,7 +327,7 @@ With `--durable`, a webhook is never fire-and-forget:
    that dies drops its lease, so the sender takes over at once.
 6. How an entry leaves is written down, never inferred. Before an entry is
    removed (`delivered`, `dropped`) or moved to `dead/` (`expired`), a
-   receipt `outbox-v3/receipts/<id>.json` (kept 7 days) records the
+   receipt `outbox-v4/receipts/<id>.json` (kept 7 days) records the
    disposition, under the entry's lease. A client that finds its entry gone
    reports what the receipt says: only `delivered` counts as delivered; an
    expired, dropped, unreadable or receipt-less entry is
@@ -333,17 +337,29 @@ With `--durable`, a webhook is never fire-and-forget:
    and an entry that survived beside its receipt (a crash between the two
    writes) is only cleaned up as the receipt says, never sent, and the
    receipt is never rewritten.
+   A receipt counts only if it names the entry's id and a known
+   disposition. Anything else (`{}`, another id, an unknown disposition,
+   not JSON) is reported as `receiptError` and ignored: the entry stays
+   pending and is sent as usual, and its real outcome replaces the bad
+   receipt.
 7. Older builds keep their own outboxes, which this build's senders read
-   but theirs never see: builds before engine 4 in `outbox/` (no leases),
-   engine-4 builds (`0.2.0` up to `fa10d88`) in `outbox-v2/`. Their entries
-   are moved into `outbox-v3/` only once no client of theirs can still be
-   sending them: an `outbox/` entry after the 90 s inline grace, under that
-   build's `outbox/sender.lock`; an `outbox-v2/` entry under its own lease,
-   once it has been attempted or is 90 s old, and only if no receipt there
-   says it is finished (then it is cleaned up as the receipt says). Until
-   then they count as pending everywhere: `outbox list` (under `legacy`),
-   `status` (`legacyPending`), the exit code of `outbox run --once`, and the
-   daemon, which stays up until they are migrated and delivered.
+   but theirs never see. Engine-4 builds (`0.2.0` up to `fa10d88`) use
+   `outbox-v2/` and engine-5 builds (`0.3.0`) `outbox-v3/`. Their entries
+   are never moved: a client of theirs that found its entry gone would
+   report the event delivered, and no amount of age proves that client is
+   finished (a slow progress hook can hold it back for minutes). This
+   build delivers them where they are, as their own senders would: under
+   the entry's lease and that store's `sender.lock`, after its next attempt
+   time, counting each attempt as a sender retry. An old client that gets
+   back to its entry then finds it either still there with a retry recorded
+   (and reports it queued, not delivered) or gone after a real 2xx, with a
+   receipt in that store. Builds before engine 4 used `outbox/`, without
+   leases; their clients only report delivery on their own 2xx, so those
+   entries move here after the 90 s inline grace, under that build's
+   `outbox/sender.lock`. Until delivered, all of these count as pending
+   everywhere: `outbox list` (under `legacy`, with their store), `status`
+   (`legacyPending`), the exit code of `outbox run --once`, and the daemon,
+   which stays up until they are delivered.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -491,9 +507,12 @@ regular files owned by you, so a FIFO or device at one of those paths
 costs log lines, nothing else. When a wake comes late or never, the trace
 shows how far the watcher got and when, even if its stdout went nowhere.
 `e2e/timeline.py <trace.jsonl>` prints one wait's steps with the time since
-the run completed. It judges one acceptance event, the wait's final event
-(or `--id`), by that event's own 2xx; progress events are listed apart and
-never stand in for it.
+the run completed. It judges one acceptance event, the notification of the
+wait's final outcome (matched by the `wait.outcome` line's event and
+`eventSeq`), or `--id`, by that event's own 2xx; progress events are listed
+apart and never stand in for it. When the final outcome had no
+notification (a timeout under the default `--notify-on`), it reports the
+acceptance event as missing and not delivered.
 
 ### Suspend and resume
 
@@ -510,6 +529,24 @@ during a sleep is therefore seen within one fresh cycle after the resume.
 Each restart is traced as `watch.restart`, and `t3-watch status` counts
 them per watch.
 
+An answer is checked against the suspend before it is used, not only while
+it is awaited. An answer that is ready at the moment a suspend shows up
+may describe the thread from before the sleep (say run 2 completed, while
+run 3 has started since), so it is discarded and the call made again. The
+stopwatch for a call starts before the call does, so a suspend at any
+point counts. After a resume, a waiting client ignores observations made
+before it and checks its own budget before it accepts any completion: a
+budget that expired during the sleep ends the wait as `timeout`, never as
+a completion that arrived late.
+
+The budget also survives a lost daemon. The client keeps one deadline,
+suspended time included, for the whole wait. Each time it registers again
+with a new daemon it sends only what is left of that deadline, and once
+nothing is left it ends with `timeout` instead of registering again. It
+reads the daemon's answer in one-second steps against the same deadline
+(plus 30 s for the daemon's own answer), so a daemon that is alive but
+silent cannot hold it past its timeout either.
+
 Thread arguments are parsed as URIs: in a `t3-thread://` link and an
 `http(s)` thread URL only the path names the thread, the query and fragment
 are ignored, and a URL with credentials (`user:password@`) or another
@@ -520,7 +557,7 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e5.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e6.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -541,13 +578,15 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
   checks the `accepted` line and refuses with `error.kind =
   "incompatible_daemon"` (exit 2), dropping the connection so that daemon's
   wait ends too. The client also requires every capability it depends on
-  (`outbox-receipts`, `outbox-legacy-drain`, `suspend-aware`) in that line,
+  (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
+  `suspend-aware`, `suspend-invalidation`) in that line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 5 (this build) does not reach engine-4 daemons
-  (`0.2.0` up to `fa10d88`, socket `daemon-e4.sock`).
+  `t3-watch stop`. Engine 6 (this build) does not reach engine-5 daemons
+  (`0.3.0`, socket `daemon-e5.sock`) or engine-4 ones (`0.2.0` up to
+  `fa10d88`, socket `daemon-e4.sock`).
 - Each client sends one request line and blocks in `read()`. It uses no CPU
   and no network until the answer arrives.
 - The daemon keeps one worker per watch key: (origin, pairing, thread,
