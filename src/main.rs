@@ -269,28 +269,58 @@ fn resolve_local_paths(
 /// the thread id, and the environment id when the URL carries one.
 fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpec, String> {
     let arg = arg.trim().trim_start_matches('<').trim_end_matches('>');
+    // Every message below shows the argument without userinfo, query or
+    // fragment: any of them can carry a credential.
+    let shown = util::without_secrets(arg);
     let mut origin: Option<(String, String)> = None; // (origin, host)
-    let (thread_id, env) = if let Some(rest) = arg.strip_prefix("t3-thread://") {
-        let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        match segs.as_slice() {
-            [_version, env, thread @ ..] if !thread.is_empty() => {
+    let (thread_id, env) = if let Some((scheme, rest)) = arg.split_once("://") {
+        // A URL: only its path names the thread. The query and fragment
+        // are never part of it, and credentials in the authority are
+        // refused rather than sent anywhere or treated as a thread id.
+        let scheme = scheme.to_ascii_lowercase();
+        let rest = rest.split(['?', '#']).next().unwrap_or("");
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.contains('@') {
+            return Err(format!(
+                "thread URLs must not carry credentials (user:password@...): {shown}"
+            ));
+        }
+        match scheme.as_str() {
+            "t3-thread" => {
+                let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+                match segs.as_slice() {
+                    [_version, env, thread @ ..] if !thread.is_empty() => {
+                        (util::pct_decode(&thread.join("/"), false), Some(env.to_string()))
+                    }
+                    _ => return Err(format!("cannot parse thread link {shown}")),
+                }
+            }
+            "http" | "https" => {
+                let u = util::parse_url(arg).ok_or_else(|| format!("cannot parse thread URL {shown}"))?;
+                let segs: Vec<&str> = u.path.split('/').filter(|s| !s.is_empty()).collect();
+                let [env, thread @ ..] = segs.as_slice() else {
+                    return Err(format!("URL has no thread id: {shown}"));
+                };
+                if thread.is_empty() {
+                    return Err(format!("URL has no thread id: {shown}"));
+                }
+                origin = Some((u.origin.clone(), u.host.clone()));
                 (util::pct_decode(&thread.join("/"), false), Some(env.to_string()))
             }
-            _ => return Err(format!("cannot parse thread link {}", util::without_secrets(arg))),
+            _ => return Err(format!("unsupported thread URL scheme: {shown}")),
         }
-    } else if let Some(u) = util::parse_url(arg) {
-        let segs: Vec<&str> = u.path.split('/').filter(|s| !s.is_empty()).collect();
-        let [env, thread @ ..] = segs.as_slice() else {
-            return Err(format!("URL has no thread id: {}", util::without_secrets(arg)));
-        };
-        if thread.is_empty() {
-            return Err(format!("URL has no thread id: {}", util::without_secrets(arg)));
-        }
-        origin = Some((u.origin.clone(), u.host.clone()));
-        (util::pct_decode(&thread.join("/"), false), Some(env.to_string()))
     } else {
         (arg.to_string(), None)
     };
+    // Thread ids have none of these; one that does is a mangled URL or a
+    // pasted query, and is refused before it can be logged or sent.
+    if thread_id
+        .chars()
+        .any(|c| matches!(c, '?' | '#' | '@') || c.is_whitespace())
+    {
+        // Not echoed: what follows such a character may be a credential.
+        return Err("invalid thread id: it contains '?', '#', '@' or whitespace".into());
+    }
     if thread_id.is_empty() {
         return Err("empty thread id".into());
     }
@@ -465,7 +495,7 @@ impl Heartbeat {
     ) -> Option<Heartbeat> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let started = Instant::now();
+        let sw = util::Stopwatch::start();
         let handle = util::spawn_thread("heartbeat", 128 * 1024, move || {
             let mut seq: u64 = 0;
             while !flag.load(Ordering::SeqCst) {
@@ -473,7 +503,7 @@ impl Heartbeat {
                 body["event"] = json!("heartbeat");
                 body["seq"] = json!(seq);
                 body["sentAt"] = json!(util::rfc3339_ms(util::now_ms()));
-                body["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+                body["elapsedMs"] = json!(sw.elapsed_ms());
                 body["intervalMs"] = json!(every.as_millis() as u64);
                 body["upstream"] = status().unwrap_or(Value::Null);
                 let id = util::hex(&util::random_bytes(16));
@@ -520,8 +550,10 @@ fn upstream_of(status: &Value, threads: &[String]) -> Value {
 }
 
 fn cmd_wait(raw: &[String]) -> ! {
-    let started = Instant::now();
-    let started_ms = util::now_ms();
+    // Elapsed times are reported three ways: suspend-inclusive (`elapsedMs`,
+    // what `--timeout` counts), awake only, and by the wall clock.
+    let sw = util::Stopwatch::start();
+    let started_ms = sw.wall_ms;
     let a = parse_args(
         raw,
         &[
@@ -748,9 +780,24 @@ fn cmd_wait(raw: &[String]) -> ! {
                 v["registrationElapsedMs"] = daemon_elapsed;
             }
         }
-        v["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+        // The observation ended now; delivery and exit come after, and are
+        // reported separately (`notification.finishedAt`, `exitAt`).
+        let ended_ms = util::now_ms();
+        v["elapsedMs"] = json!(sw.elapsed_ms());
+        v["elapsedAwakeMs"] = json!(sw.awake_ms());
+        v["elapsedWallMs"] = json!(ended_ms.saturating_sub(started_ms));
         v["startedAt"] = json!(util::rfc3339_ms(started_ms));
-        v["endedAt"] = json!(util::rfc3339_ms(util::now_ms()));
+        v["endedAt"] = json!(util::rfc3339_ms(ended_ms));
+        v["observationEndedAt"] = json!(util::rfc3339_ms(ended_ms));
+        let suspended = sw.suspended_ms();
+        if suspended > 1_000 {
+            v["suspendedMs"] = json!(suspended);
+            v["clock"] = json!(format!(
+                "the host was suspended for about {} s during this wait; --timeout counts that time, \
+                 and calls in flight across it were restarted on resume",
+                suspended / 1000
+            ));
+        }
         v["watchId"] = json!(watch_id);
         v["eventSeq"] = json!(next_seq());
         v["build"] = version::json();
@@ -767,6 +814,10 @@ fn cmd_wait(raw: &[String]) -> ! {
                 "event": event,
                 "outcome": v["outcome"],
                 "endedAt": v["endedAt"],
+                "elapsedMs": v["elapsedMs"],
+                "elapsedAwakeMs": v["elapsedAwakeMs"],
+                "elapsedWallMs": v["elapsedWallMs"],
+                "suspendedMs": v.get("suspendedMs"),
                 "daemon": daemon_build,
                 "threads": v["threads"].as_array().map(|ts| ts.iter().map(|t| json!({
                     "threadId": t["threadId"],
@@ -786,7 +837,8 @@ fn cmd_wait(raw: &[String]) -> ! {
         let _ = sender.join();
     }
     if let (Some(p), Some(v)) = (prepared, outcome.json_mut()) {
-        let summary = notify.send(p);
+        let mut summary = notify.send(p);
+        summary["finishedAt"] = json!(util::rfc3339_ms(util::now_ms()));
         if summary["delivered"] == false && code == engine::EXIT_COMPLETED {
             code = EXIT_NOTIFY_FAILED;
         }
@@ -800,10 +852,17 @@ fn cmd_wait(raw: &[String]) -> ! {
         }
         v["notification"] = summary;
     }
+    let exit_ms = util::now_ms();
+    if let Some(v) = outcome.json_mut() {
+        v["exitAt"] = json!(util::rfc3339_ms(exit_ms));
+    }
     if let Some(v) = outcome.json() {
         print_json(v, pretty);
     }
-    trace::record("wait.exit", json!({ "watchId": watch_id, "code": code }));
+    trace::record(
+        "wait.exit",
+        json!({ "watchId": watch_id, "code": code, "elapsedMs": sw.elapsed_ms(), "suspendedMs": sw.suspended_ms() }),
+    );
     exit(code)
 }
 
@@ -1075,6 +1134,30 @@ mod tests {
         let t = resolve_target("mcp:launch:abc", &d, &cfg()).unwrap();
         assert_eq!(t.transport, Transport::Local);
         assert_eq!(t.base_dir.as_deref(), Some(std::path::Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn thread_arguments_never_keep_or_echo_credentials() {
+        // A t3-thread link: the query and fragment are not part of the id.
+        let t = resolve_target(
+            "t3-thread://v2/env1/mcp:launch:abc?token=QUERY_CANARY#FRAG_CANARY",
+            &defaults(),
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(t.thread_id, "mcp:launch:abc");
+        assert_eq!(t.environment_id.as_deref(), Some("env1"));
+        // Credentials in a URL: refused, and not echoed.
+        for bad in [
+            "https://user:PASS_CANARY@prod-1.t3coderelay.com/env/mcp%3Alaunch%3Aabc?token=QUERY_CANARY",
+            "t3-thread://user:PASS_CANARY@v2/env/x",
+            "ftp://prod-1.t3coderelay.com/env/x?token=QUERY_CANARY",
+            "mcp:launch:abc?token=QUERY_CANARY",
+            "https://prod-1.t3coderelay.com/env/mcp%3Alaunch%3Aabc%3Ftoken%3DQUERY_CANARY",
+        ] {
+            let e = resolve_target(bad, &defaults(), &cfg()).unwrap_err();
+            assert!(!e.contains("CANARY"), "{bad} -> {e}");
+        }
     }
 
     #[test]

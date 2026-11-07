@@ -6,9 +6,9 @@
 //!   pending/          in-progress headless OAuth logins (0600 files)
 //!   daemon-e<N>.sock  the multiplexer socket for engine revision N (0600)
 //!   daemon-e<N>.sock.lock held by the running daemon
-//!   outbox-v2/        durable notifications not yet delivered (0700, entries
-//!                     and their per-entry lease files 0600)
-//!   outbox/           entries of older builds, migrated into outbox-v2/
+//!   outbox-v3/        durable notifications not yet delivered (0700, entries,
+//!                     per-entry lease files and receipts 0600)
+//!   outbox/, outbox-v2/ entries of older builds, migrated into outbox-v3/
 //!   trace.jsonl       delivery trace: waits, proofs, events, HTTP attempts
 //!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr
@@ -68,16 +68,22 @@ pub fn socket_path() -> PathBuf {
     state_dir().join(socket_name())
 }
 
-/// Durable notifications waiting for delivery (`--durable`). Versioned: a
-/// sender from an older build (which shares the state directory but not
-/// this format's leases and `Retry-After` floors) never sees these entries.
+/// Durable notifications waiting for delivery (`--durable`). Versioned with
+/// the engine: a sender from an older build (which shares the state
+/// directory but not this format's receipts and pending rules) never sees
+/// these entries.
 pub fn outbox_dir() -> PathBuf {
-    state_dir().join("outbox-v2")
+    state_dir().join("outbox-v3")
 }
 
-/// Where builds before the versioned outbox kept their entries.
+/// Where builds before engine 4 kept their entries (no leases).
 pub fn legacy_outbox_dir() -> PathBuf {
     state_dir().join("outbox")
+}
+
+/// Where engine-4 builds keep theirs (per-entry leases).
+pub fn legacy_v2_outbox_dir() -> PathBuf {
+    state_dir().join("outbox-v2")
 }
 
 /// Append-only delivery trace (`trace.jsonl`, 0600).

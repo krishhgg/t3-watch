@@ -25,9 +25,12 @@ fn mcp_env(mock: &MockMcp) -> Env {
     env
 }
 
+/// The printed result minus what is only known after delivery
+/// (`notification`, `exitAt`): exactly what the webhook and hook received.
 fn without_notification(v: &Value) -> Value {
     let mut v = v.clone();
     v.as_object_mut().unwrap().remove("notification");
+    v.as_object_mut().unwrap().remove("exitAt");
     v
 }
 

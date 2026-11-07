@@ -19,7 +19,13 @@ tool proves nothing by itself about a bot: the receipt and continuation
 times must come from the bot's own records, per event, for completion,
 needs-input and durable replay separately.
 
-Usage: timeline.py TRACE [--watch WATCH_ID] [--receipt TS]
+The acceptance event is one notification: the one named by --id, else the
+wait's final event (its highest eventSeq). Only its delivery counts toward
+`completionTo2xxS`; progress events (run_failed, outages) are listed apart
+and never stand in for it. If the acceptance event was not delivered, the
+summary says so (`acceptanceDelivered: false`, `completionTo2xxS: null`).
+
+Usage: timeline.py TRACE [--watch WATCH_ID] [--id EVENT_ID] [--receipt TS]
                          [--continuation TS] [--bot NAME]
 """
 
@@ -39,6 +45,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
     ap.add_argument("--watch")
+    ap.add_argument("--id", help="the acceptance notification id (default: the wait's final event)")
     ap.add_argument("--receipt")
     ap.add_argument("--continuation")
     ap.add_argument("--bot")
@@ -58,7 +65,14 @@ def main():
     mine = [l for l in lines if l.get("watchId") == watch]
     if not mine:
         sys.exit(f"no lines for watch {watch}")
-    ids = {l["id"] for l in lines if l.get("kind") == "notify.prepared" and l.get("watchId") == watch}
+    prepared = [l for l in lines if l.get("kind") == "notify.prepared" and l.get("watchId") == watch]
+    ids = {l["id"] for l in prepared}
+    if a.id:
+        target = next((l for l in prepared if l["id"] == a.id), None)
+        if not target:
+            sys.exit(f"notification {a.id} is not an event of watch {watch}")
+    else:
+        target = max(prepared, key=lambda l: (l.get("eventSeq") or 0), default=None)
     outcome = next((l for l in mine if l.get("kind") == "wait.outcome"), {})
     threads = {t.get("threadId") for t in outcome.get("threads") or []}
     start_at = ts(mine[0]["at"])
@@ -108,10 +122,35 @@ def main():
     def is_2xx(d):
         return isinstance(d.get("status"), int) and 200 <= d["status"] < 300
 
-    delivered = next(
-        (at for at, k, d in marks if (k in ("notify.attempt", "outbox.attempt") and is_2xx(d)) or k == "outbox.delivered"),
-        None,
-    )
+    def delivered_at(event_id):
+        return next(
+            (
+                at
+                for at, k, d in marks
+                if d.get("id") == event_id
+                and ((k in ("notify.attempt", "outbox.attempt") and is_2xx(d)) or k == "outbox.delivered")
+            ),
+            None,
+        )
+
+    def disposition(event_id):
+        for at, k, d in reversed(marks):
+            if d.get("id") == event_id and k in ("outbox.expired", "outbox.dropped", "outbox.delivered"):
+                return k.split(".")[1]
+        return None
+
+    target_id = target["id"] if target else None
+    delivered = delivered_at(target_id) if target_id else None
+    progress = [
+        {
+            "id": l["id"],
+            "event": l.get("event"),
+            "eventSeq": l.get("eventSeq"),
+            "deliveredAt": (delivered_at(l["id"]).isoformat() if delivered_at(l["id"]) else None),
+        }
+        for l in prepared
+        if l["id"] != target_id
+    ]
     proof = first("watch.proof", "watch.settled")
 
     def secs(x, y):
@@ -120,6 +159,14 @@ def main():
     summary = {
         "watchId": watch,
         "eventIds": sorted(ids),
+        "acceptanceEvent": {
+            "id": target_id,
+            "event": target.get("event") if target else None,
+            "eventSeq": target.get("eventSeq") if target else None,
+        },
+        "acceptanceDelivered": delivered is not None,
+        "acceptanceDisposition": disposition(target_id) if target_id else None,
+        "progressEvents": progress,
         "exitCode": next((l.get("code") for l in mine if l.get("kind") == "wait.exit"), None),
         "runCompletedAt": completed.isoformat() if completed else None,
         "completionToProofS": secs(completed, proof),

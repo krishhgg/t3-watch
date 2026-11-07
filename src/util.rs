@@ -27,6 +27,67 @@ pub fn warn(msg: &str) {
     let _ = io::stderr().lock().write_all(line.as_bytes());
 }
 
+/// Milliseconds on a clock that keeps counting while the machine sleeps:
+/// `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on macOS (there it includes
+/// sleep, unlike the clock behind `Instant`). Deadlines use it, so a timeout
+/// counts suspended time; compared with `Instant`, it shows how long the
+/// host was suspended.
+pub fn boot_ms() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let clock = libc::CLOCK_BOOTTIME;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let clock = libc::CLOCK_MONOTONIC;
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000 + simulated_suspend_ms()
+}
+
+/// Test hook: with `T3_WATCH_TEST_SUSPEND_FILE` set, the number of
+/// milliseconds in that file is added to the suspend-inclusive clock, as if
+/// the host had slept that long. Unset (always, outside tests) it is zero.
+fn simulated_suspend_ms() -> u64 {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("T3_WATCH_TEST_SUSPEND_FILE").map(Into::into))
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Elapsed time three ways: suspend-inclusive (what deadlines use), awake
+/// only (`Instant`), and the wall clock at the start.
+#[derive(Clone, Copy, Debug)]
+pub struct Stopwatch {
+    boot: u64,
+    pub awake: Instant,
+    pub wall_ms: u64,
+}
+
+impl Stopwatch {
+    pub fn start() -> Self {
+        Stopwatch {
+            boot: boot_ms(),
+            awake: Instant::now(),
+            wall_ms: now_ms(),
+        }
+    }
+
+    /// Including any time the host was suspended.
+    pub fn elapsed_ms(&self) -> u64 {
+        boot_ms().saturating_sub(self.boot)
+    }
+
+    pub fn awake_ms(&self) -> u64 {
+        self.awake.elapsed().as_millis() as u64
+    }
+
+    /// How long the host was suspended since the start (the gap between
+    /// the two clocks).
+    pub fn suspended_ms(&self) -> u64 {
+        self.elapsed_ms().saturating_sub(self.awake_ms())
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

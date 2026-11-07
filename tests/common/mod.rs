@@ -18,8 +18,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_t3-watch");
-/// The daemon socket of this engine revision under `T3_WATCH_HOME`.
-pub const SOCK: &str = "daemon-e4.sock";
+/// This build's engine revision, its daemon socket under `T3_WATCH_HOME`,
+/// and its outbox directory.
+pub const ENGINE: u64 = 5;
+pub const SOCK: &str = "daemon-e5.sock";
+pub const OUTBOX: &str = "outbox-v3";
 pub const TOKEN: &str = "test-token-read-only";
 
 pub struct MockState {
@@ -113,6 +116,9 @@ pub struct MockState {
     pub probe_override: Map<String, Value>,
     /// `completedAt` of the latest run in header reads' `recentRuns`.
     pub completed_at: Option<String>,
+    /// The next this many long-polls never answer (a connection that died
+    /// while the host slept); they end only when the client hangs up.
+    pub hang_waits: usize,
 }
 
 impl Default for MockState {
@@ -166,6 +172,7 @@ impl Default for MockState {
             pending_reads: HashMap::new(),
             probe_override: Map::new(),
             completed_at: None,
+            hang_waits: 0,
         }
     }
 }
@@ -568,6 +575,16 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                 Ok(merged(v, &s.probe_override))
             }
         },
+        "t3_thread_wait" if s.hang_waits > 0 => {
+            s.hang_waits -= 1;
+            s.wait_args.push(args.clone());
+            *s.calls.entry("hung-wait".into()).or_default() += 1;
+            drop(s);
+            while !client_gone(&stream) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
         "t3_thread_wait" => {
             s.wait_args.push(args.clone());
             s.events.push(("wait".into(), msg["id"].clone()));

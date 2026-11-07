@@ -83,8 +83,11 @@ fn a_daemon_of_another_engine_on_a_custom_socket_is_refused() {
     let accepted_lines = [
         // 53d5956 and 6bd6c1e: no engine at all, version 0.1.0.
         json!({ "event": "accepted", "pid": 4242, "version": "0.1.0" }),
-        // A future or past engine.
-        json!({ "event": "accepted", "pid": 4242, "version": "0.2.0", "engine": 3, "rev": "old" }),
+        // A past engine.
+        json!({ "event": "accepted", "pid": 4242, "version": "0.2.0", "engine": 4, "rev": "a92f977" }),
+        // This engine number, without the capabilities this client needs.
+        json!({ "event": "accepted", "pid": 4242, "version": "0.2.0", "engine": ENGINE, "rev": "x",
+                "capabilities": ["outbox-receipts"] }),
     ];
     for accepted in accepted_lines {
         let mock = MockMcp::start();
@@ -150,8 +153,8 @@ fn an_old_daemon_at_the_old_default_socket_is_never_reached() {
     // This build's own daemon answered: the thread still runs.
     assert_eq!(out.status.code(), Some(3), "{}", both(&out));
     let v = output_json(&out);
-    assert_eq!(v["daemon"]["engine"], 4, "{v}");
-    assert_eq!(v["build"]["engine"], 4);
+    assert_eq!(v["daemon"]["engine"], ENGINE, "{v}");
+    assert_eq!(v["build"]["engine"], ENGINE);
     assert_eq!(served.load(Ordering::SeqCst), 0, "the old socket was contacted");
 }
 
@@ -160,13 +163,13 @@ fn this_daemon_refuses_a_request_from_another_engine() {
     let env = Env::new();
     let mut daemon = env.spawn(&["daemon", "--idle-exit", "30s"]);
     env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
-    assert_eq!(env.status()["build"]["engine"], 4);
+    assert_eq!(env.status()["build"]["engine"], ENGINE);
     // The request a 6bd6c1e client sends: no engine field.
     let old_request = json!({ "op": "wait", "targets": [{ "transport": "mcp", "machine": "m", "threadId": T }],
                               "mode": "all", "timeoutMs": 1000 });
     for req in [old_request.clone(), {
         let mut r = old_request.clone();
-        r["engine"] = json!(3);
+        r["engine"] = json!(4);
         r
     }] {
         let mut s = UnixStream::connect(env.home.join(SOCK)).unwrap();
@@ -241,7 +244,8 @@ fn this_builds_entries_live_where_old_senders_never_look() {
     let out = env.run(&["wait", "--no-daemon", "--durable", "--webhook-url", &url, T]);
     assert_eq!(out.status.code(), Some(4), "{}", both(&out));
     assert!(!env.home.join("outbox").exists(), "old senders read outbox/");
-    let v2: Vec<_> = fs::read_dir(env.home.join("outbox-v2"))
+    assert!(!env.home.join("outbox-v2").exists(), "engine-4 senders read outbox-v2/");
+    let v2: Vec<_> = fs::read_dir(env.home.join(OUTBOX))
         .unwrap()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
@@ -269,7 +273,7 @@ fn a_young_entry_left_by_a_crashed_old_client_is_kept_pending_and_delivered() {
     assert_eq!(run.status.code(), Some(4), "a deferred entry is not an empty outbox");
     let r = output_json(&run);
     assert!(r["pending"].as_u64().unwrap() >= 1, "{r}");
-    assert!(r["results"].to_string().contains("\"legacy\":true"), "{r}");
+    assert!(r["results"].to_string().contains("\"legacy\":\"outbox\""), "{r}");
     let list = output_json(&env.run(&["outbox", "list"]));
     assert_eq!(list["legacy"][0]["id"], id, "{list}");
 
@@ -295,6 +299,156 @@ fn a_young_entry_left_by_a_crashed_old_client_is_kept_pending_and_delivered() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(!legacy.join(format!("{id}.json")).exists());
-    let receipt = fs::read_to_string(env.home.join("outbox-v2").join("receipts").join(format!("{id}.json"))).unwrap();
+    let receipt = fs::read_to_string(env.home.join(OUTBOX).join("receipts").join(format!("{id}.json"))).unwrap();
     assert!(receipt.contains("\"disposition\":\"delivered\""), "{receipt}");
+}
+
+// ---- Sol ordinal 6, P1: the engine-4 upgrade boundary -----------------------
+
+#[test]
+fn an_engine_4_daemon_at_its_own_default_socket_is_never_reached() {
+    // a92f977 and fa10d88 both listen on daemon-e4.sock and call themselves
+    // engine 4; neither drains legacy entries the way this build must.
+    let mock = MockMcp::start();
+    mock.set_thread(T, "running", 3);
+    let env = mcp_env(&mock);
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let served = fake_daemon(
+        &env.home.join("daemon-e4.sock"),
+        completed_by_old_engine(json!({ "event": "accepted", "pid": 4242, "version": "0.2.0",
+                                        "engine": 4, "rev": "a92f977" })),
+    );
+    let out = env.run(&["wait", "--timeout", "1500ms", T]);
+    assert_eq!(out.status.code(), Some(3), "{}", both(&out));
+    let v = output_json(&out);
+    assert_eq!(v["daemon"]["engine"], ENGINE);
+    assert_eq!(served.load(Ordering::SeqCst), 0, "the engine-4 socket was contacted");
+    let caps = v["daemon"]["capabilities"].to_string();
+    for c in ["outbox-receipts", "outbox-legacy-drain", "suspend-aware"] {
+        assert!(caps.contains(c), "{c} missing from {caps}");
+    }
+}
+
+fn v2_entry(id: &str, url: &str, created_ms: u64, attempts: u32) -> Value {
+    let mut e = legacy_entry(id, url, created_ms);
+    e["attempts"] = json!(attempts);
+    e["retries"] = json!(0);
+    e
+}
+
+#[test]
+fn engine_4_entries_move_over_only_when_no_engine_4_process_can_own_them() {
+    let env = Env::new();
+    let hook = MockHook::start();
+    let v2 = private_dir(&env, "outbox-v2");
+    let now = now_ms();
+    // Attempted inline already, lease free: its client is done with it.
+    let (done, young, held, finished) = ("0a0a0a01", "0b0b0b02", "0c0c0c03", "0d0d0d04");
+    fs::write(
+        v2.join(format!("{done}.json")),
+        v2_entry(done, &hook.url, now, 4).to_string(),
+    )
+    .unwrap();
+    // Never attempted and just written: its client may be about to send it.
+    fs::write(
+        v2.join(format!("{young}.json")),
+        v2_entry(young, &hook.url, now, 0).to_string(),
+    )
+    .unwrap();
+    // Leased by a live engine-4 process right now.
+    fs::write(
+        v2.join(format!("{held}.json")),
+        v2_entry(held, &hook.url, now - 600_000, 4).to_string(),
+    )
+    .unwrap();
+    let lease = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(v2.join(format!("{held}.lock")))
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    // Already finished there (dropped), entry left behind by a crash.
+    fs::write(
+        v2.join(format!("{finished}.json")),
+        v2_entry(finished, &hook.url, now - 600_000, 1).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(v2.join("receipts")).unwrap();
+    fs::write(
+        v2.join("receipts").join(format!("{finished}.json")),
+        json!({ "id": finished, "disposition": "dropped" }).to_string(),
+    )
+    .unwrap();
+
+    let run = env.run(&["outbox", "run", "--once"]);
+    let r = output_json(&run);
+    assert_eq!(
+        run.status.code(),
+        Some(4),
+        "the young and the leased one are still pending: {r}"
+    );
+    let text = r["results"].to_string();
+    assert!(text.contains(done) && text.contains("\"migrated\":true"), "{r}");
+    let sent: Vec<String> = hook
+        .requests()
+        .iter()
+        .map(|q| q.headers["x-t3-watch-id"].clone())
+        .collect();
+    assert_eq!(sent, [done.to_string()], "only the finished-with entry is sent: {r}");
+    assert!(
+        v2.join(format!("{young}.json")).exists(),
+        "young entry kept for its client"
+    );
+    assert!(v2.join(format!("{held}.json")).exists(), "leased entry untouched");
+    assert!(
+        !v2.join(format!("{finished}.json")).exists(),
+        "finished entry cleaned up"
+    );
+    assert!(
+        fs::read_to_string(v2.join("receipts").join(format!("{finished}.json")))
+            .unwrap()
+            .contains("dropped"),
+        "its receipt is unchanged"
+    );
+    let status = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(status["legacy"].as_array().unwrap().len(), 2, "{status}");
+    drop(lease);
+}
+
+// ---- Sol ordinal 6, P2: a receipt next to a surviving entry is final -------
+
+#[test]
+fn an_entry_left_beside_its_receipt_is_never_sent() {
+    for disposition in ["dropped", "expired", "delivered"] {
+        let env = Env::new();
+        let hook = MockHook::start();
+        let dir = private_dir(&env, OUTBOX);
+        let id = "0e0e0e05";
+        let entry = v2_entry(id, &hook.url, now_ms() - 600_000, 1);
+        fs::write(dir.join(format!("{id}.json")), entry.to_string()).unwrap();
+        fs::create_dir_all(dir.join("receipts")).unwrap();
+        let receipt = json!({ "id": id, "disposition": disposition, "at": "2026-11-07T00:00:00.000Z",
+                              "attempts": 1, "by": "outbox drop" });
+        fs::write(dir.join("receipts").join(format!("{id}.json")), receipt.to_string()).unwrap();
+        let run = env.run(&["outbox", "run", "--once"]);
+        assert_eq!(run.status.code(), Some(0), "{disposition}: {}", both(&run));
+        assert!(hook.requests().is_empty(), "{disposition}: a finished entry was sent");
+        assert!(
+            !dir.join(format!("{id}.json")).exists(),
+            "{disposition}: entry left behind"
+        );
+        let kept: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("receipts").join(format!("{id}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(kept, receipt, "{disposition}: the receipt was rewritten");
+        assert_eq!(
+            dir.join("dead").join(format!("{id}.json")).exists(),
+            disposition == "expired"
+        );
+    }
 }

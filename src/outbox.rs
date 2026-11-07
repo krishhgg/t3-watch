@@ -1,7 +1,7 @@
 //! Durable webhook delivery (`--durable`).
 //!
 //! Before the first attempt, the notification is written to
-//! `<state>/outbox-v2/<id>.json` (0600 in a 0700 directory, fsynced, renamed
+//! `<state>/outbox-v3/<id>.json` (0600 in a 0700 directory, fsynced, renamed
 //! into place). The waiting client then tries it inline. A 2xx removes the
 //! entry; anything else leaves it for the sender, which runs inside the
 //! daemon (or as `t3-watch outbox run`) and retries with exponential
@@ -25,12 +25,21 @@
 //! lease. A client that finds its entry gone reads the receipt; a missing
 //! entry without one is `unknown`, never "delivered".
 //!
-//! Builds before this format kept entries in `outbox/` and had no leases;
-//! their senders never look at `outbox-v2/`. Entries of theirs older than
-//! the inline grace are moved here under their own `outbox/sender.lock`.
-//! Younger ones wait (a client of that build may still be sending them),
-//! but count as pending everywhere: in `outbox list`, `status`, the exit
-//! code of `outbox run --once`, and the daemon's decision to stay up.
+//! A receipt is final. Whoever holds an entry's lease checks for one before
+//! sending: an entry that still exists next to a receipt (a crash between
+//! the two writes) is only cleaned up as the receipt says, never sent, and
+//! its receipt is never rewritten.
+//!
+//! Older builds keep their entries elsewhere, and their senders never look
+//! here: builds before engine 4 in `outbox/` (no leases), engine-4 builds in
+//! `outbox-v2/` (leases, and in some builds no receipts). Their entries are
+//! moved here only once no client of theirs can still be sending them: an
+//! `outbox/` entry after the 90 s inline grace, under that build's
+//! `outbox/sender.lock`; an `outbox-v2/` entry under its own lease, once it
+//! has been attempted or is 90 s old, and only if it has no receipt there
+//! (one with a receipt is finished as its receipt says). Until then they
+//! count as pending everywhere: in `outbox list`, `status`, the exit code of
+//! `outbox run --once`, and the daemon's decision to stay up.
 //!
 //! Every attempt for an entry carries the same `X-T3-Watch-Id` and
 //! `Idempotency-Key`, so a receiver that got a request but whose answer was
@@ -319,6 +328,15 @@ fn receipt_path(id: &str) -> PathBuf {
 /// moves it to `dead/`). Call with the lease held. The receipt is written
 /// (fsynced) first, so a crash in between leaves both, never neither.
 pub fn finish(e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
+    // A receipt is final: if one is already there, clean up as it says.
+    if let Some(existing) = receipt(&e.id).and_then(|r| disposition_of(&r)) {
+        cleanup(e, existing);
+        trace::record(
+            "outbox.reconciled",
+            json!({ "id": e.id, "disposition": existing.as_str(), "wanted": how.as_str(), "by": by }),
+        );
+        return;
+    }
     let receipt = json!({
         "id": e.id,
         "event": e.event,
@@ -330,6 +348,16 @@ pub fn finish(e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
     });
     let written = util::ensure_private_dir(&dir().join("receipts"))
         .and_then(|_| util::write_private(&receipt_path(&e.id), receipt.to_string().as_bytes()));
+    cleanup(e, how);
+    trace::record(
+        &format!("outbox.{}", how.as_str()),
+        json!({ "id": e.id, "attempts": e.attempts, "status": status, "by": by,
+                "receiptError": written.err().map(|err| err.to_string()) }),
+    );
+}
+
+/// Removes an entry (expired: moves it to `dead/`) and its lease file.
+fn cleanup(e: &Entry, how: Disposition) {
     if how == Disposition::Expired {
         let dead = dir().join("dead");
         if util::ensure_private_dir(&dead).is_ok() {
@@ -339,11 +367,25 @@ pub fn finish(e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
     } else {
         remove(&e.id);
     }
-    trace::record(
-        &format!("outbox.{}", how.as_str()),
-        json!({ "id": e.id, "attempts": e.attempts, "status": status, "by": by,
-                "receiptError": written.err().map(|err| err.to_string()) }),
-    );
+}
+
+fn disposition_of(r: &Value) -> Option<Disposition> {
+    match r.get("disposition").and_then(Value::as_str)? {
+        "delivered" => Some(Disposition::Delivered),
+        "expired" => Some(Disposition::Expired),
+        "dropped" => Some(Disposition::Dropped),
+        _ => None,
+    }
+}
+
+/// Call with the entry's lease held, before sending it: if a receipt says
+/// it is finished, cleans up as the receipt says (without touching the
+/// receipt) and returns that disposition. Nothing may send such an entry.
+pub fn reconcile(e: &Entry) -> Option<Disposition> {
+    let how = receipt(&e.id).and_then(|r| disposition_of(&r))?;
+    cleanup(e, how);
+    trace::record("outbox.reconciled", json!({ "id": e.id, "disposition": how.as_str() }));
+    Some(how)
 }
 
 /// The receipt of an entry that left the outbox, if one was written.
@@ -405,23 +447,44 @@ pub fn entries() -> (Vec<Entry>, Vec<String>) {
     (out, bad)
 }
 
-/// Valid entries an older build left in `outbox/`, not yet migrated.
-pub fn legacy_entries() -> Vec<Entry> {
-    let mut out: Vec<Entry> = fs::read_dir(config::legacy_outbox_dir())
+fn read_entry(path: &std::path::Path) -> Option<Entry> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| Entry::from_json(&v))
+}
+
+/// Valid entry files in an older build's outbox directory.
+fn legacy_files(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
+    fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|f| {
-            let name = f.file_name().to_string_lossy().into_owned();
-            !name.starts_with('.') && name.strip_suffix(".json").is_some_and(valid_id)
-        })
         .filter_map(|f| {
-            fs::read_to_string(f.path())
-                .ok()
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                .and_then(|v| Entry::from_json(&v))
+            let name = f.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_suffix(".json")
+                .filter(|id| valid_id(id) && !name.starts_with('.'))?;
+            Some((id.to_string(), f.path()))
         })
-        .collect();
+        .collect()
+}
+
+fn v2_receipt(id: &str) -> Option<Value> {
+    let path = config::legacy_v2_outbox_dir()
+        .join("receipts")
+        .join(format!("{id}.json"));
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Entries older builds left in `outbox/` and `outbox-v2/` that are still
+/// to be sent (an `outbox-v2/` entry with a receipt there is finished).
+pub fn legacy_entries() -> Vec<Entry> {
+    let v1 = legacy_files(&config::legacy_outbox_dir());
+    let v2 = legacy_files(&config::legacy_v2_outbox_dir())
+        .into_iter()
+        .filter(|(id, _)| v2_receipt(id).is_none());
+    let mut out: Vec<Entry> = v1.into_iter().chain(v2).filter_map(|(_, p)| read_entry(&p)).collect();
     out.sort_by_key(|e| e.created_ms);
     out
 }
@@ -438,16 +501,17 @@ fn legacy_eligible_ms(e: &Entry) -> u64 {
     e.created_ms + INLINE_GRACE.as_millis() as u64
 }
 
-/// Moves entries an older build left in `outbox/` into this outbox, under
-/// that build's own sender lock so none of its senders is mid-pass. Only
-/// entries past the inline grace: a client of that build may still be
-/// sending a younger one.
-fn migrate_legacy() -> Vec<Value> {
+/// Moves entries builds before engine 4 left in `outbox/` into this outbox,
+/// under their own sender lock so none of their senders is mid-pass. Only
+/// entries past the inline grace: those builds had no leases, and one of
+/// their clients may still be sending a younger entry.
+fn migrate_v1() -> Vec<Value> {
     let legacy = config::legacy_outbox_dir();
     let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(&legacy) else {
+    let files = legacy_files(&legacy);
+    if files.is_empty() {
         return out;
-    };
+    }
     let Ok(lock) = util::open_lock_file(&legacy.join("sender.lock")) else {
         return out;
     };
@@ -455,35 +519,84 @@ fn migrate_legacy() -> Vec<Value> {
         return out;
     }
     let now = util::now_ms();
-    for f in rd.flatten() {
-        let name = f.file_name().to_string_lossy().into_owned();
-        let Some(id) = name.strip_suffix(".json").filter(|id| valid_id(id)) else {
-            continue;
-        };
-        let Some(mut e) = fs::read_to_string(f.path())
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| Entry::from_json(&v))
-        else {
+    for (id, path) in files {
+        let Some(e) = read_entry(&path) else {
             continue;
         };
         if now < legacy_eligible_ms(&e) {
-            out.push(json!({ "id": id, "legacy": true, "deferred": true,
+            out.push(json!({ "id": id, "legacy": "outbox", "deferred": true,
                              "eligibleAt": util::rfc3339_ms(legacy_eligible_ms(&e)),
                              "reason": "left by an older build less than 90 s ago; its client may still be sending it" }));
             continue;
         }
-        if load(id).is_none() {
-            e.next_attempt_ms = e.next_attempt_ms.min(util::now_ms());
-            if save(&e).is_err() {
-                continue;
-            }
-        }
-        let _ = fs::remove_file(f.path());
-        trace::record("outbox.migrated", json!({ "id": id }));
-        out.push(json!({ "id": id, "migrated": true }));
+        adopt(e, &path, &mut out, "outbox");
     }
     out
+}
+
+/// Moves entries engine-4 builds left in `outbox-v2/` into this outbox. Each
+/// only under its own lease (so no process of that build is working on it),
+/// and only once its client is done with it: attempted, or past the inline
+/// grace. An entry with a receipt there is finished as the receipt says.
+fn migrate_v2() -> Vec<Value> {
+    let legacy = config::legacy_v2_outbox_dir();
+    let mut out = Vec::new();
+    let now = util::now_ms();
+    for (id, path) in legacy_files(&legacy) {
+        let lock_path = legacy.join(format!("{id}.lock"));
+        let Ok(lock) = util::open_lock_file(&lock_path) else {
+            continue;
+        };
+        if !util::try_flock(&lock).unwrap_or(false) {
+            out.push(json!({ "id": id, "legacy": "outbox-v2", "inFlight": true,
+                             "reason": "a process of an older build is sending this entry now" }));
+            continue;
+        }
+        let Some(e) = read_entry(&path) else {
+            continue;
+        };
+        if let Some(r) = v2_receipt(&id) {
+            // Finished there: clean up as its receipt says, never resend.
+            if r.get("disposition").and_then(Value::as_str) == Some("expired") {
+                let dead = legacy.join("dead");
+                if util::ensure_private_dir(&dead).is_ok() {
+                    let _ = fs::rename(&path, dead.join(format!("{id}.json")));
+                }
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+            let _ = fs::remove_file(&lock_path);
+            trace::record(
+                "outbox.reconciled",
+                json!({ "id": id, "legacy": "outbox-v2",
+                                                      "disposition": r.get("disposition") }),
+            );
+            continue;
+        }
+        if e.attempts == 0 && e.retries == 0 && now < legacy_eligible_ms(&e) {
+            out.push(json!({ "id": id, "legacy": "outbox-v2", "deferred": true,
+                             "eligibleAt": util::rfc3339_ms(legacy_eligible_ms(&e)),
+                             "reason": "an older build's client may still be about to send it" }));
+            continue;
+        }
+        adopt(e, &path, &mut out, "outbox-v2");
+        let _ = fs::remove_file(&lock_path);
+    }
+    out
+}
+
+/// Takes over a legacy entry: saves it here (unless already here) and
+/// removes the old file.
+fn adopt(mut e: Entry, path: &std::path::Path, out: &mut Vec<Value>, from: &str) {
+    if load(&e.id).is_none() {
+        e.next_attempt_ms = e.next_attempt_ms.min(util::now_ms());
+        if save(&e).is_err() {
+            return;
+        }
+    }
+    let _ = fs::remove_file(path);
+    trace::record("outbox.migrated", json!({ "id": e.id, "from": from }));
+    out.push(json!({ "id": e.id, "migrated": true, "from": from }));
 }
 
 fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
@@ -496,7 +609,8 @@ fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
 /// someone else holds. Returns per-entry results. Holds the sender lock for
 /// the pass; if another sender has it, does nothing.
 pub fn pass(force: bool) -> Result<Vec<Value>, String> {
-    let mut results = migrate_legacy();
+    let mut results = migrate_v1();
+    results.extend(migrate_v2());
     if !dir().is_dir() {
         return Ok(results);
     }
@@ -526,6 +640,11 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
             drop(lease);
             continue;
         };
+        // Finished already (a crash left the entry beside its receipt).
+        if let Some(how) = reconcile(&e) {
+            results.push(json!({ "id": e.id, "reconciled": how.as_str() }));
+            continue;
+        }
         let now = util::now_ms();
         if now >= e.expires_ms {
             finish(&e, Disposition::Expired, e.last_status, "outbox sender");

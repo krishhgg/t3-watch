@@ -407,6 +407,7 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
                     "version": version::VERSION,
                     "engine": version::ENGINE,
                     "rev": version::REV,
+                    "capabilities": version::CAPABILITIES,
                 }),
             )?;
             let outcome = hub.wait(&wreq, tx, rx, &mut |p| {
@@ -538,7 +539,17 @@ fn incompatible(accepted: Option<&Value>, first: &Value, sock: &Path) -> Option<
         None if first.get("event").and_then(Value::as_str) == Some("error") => return None,
         None => None,
     };
-    if engine == Some(u64::from(version::ENGINE)) {
+    let missing: Vec<&str> = version::CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| {
+            !accepted
+                .and_then(|a| a.get("capabilities"))
+                .and_then(Value::as_array)
+                .is_some_and(|caps| caps.iter().any(|x| x == c))
+        })
+        .collect();
+    if engine == Some(u64::from(version::ENGINE)) && missing.is_empty() {
         return None;
     }
     let who = accepted.map_or_else(
@@ -553,10 +564,15 @@ fn incompatible(accepted: Option<&Value>, first: &Value, sock: &Path) -> Option<
             )
         },
     );
+    let lacking = if missing.is_empty() {
+        String::new()
+    } else {
+        format!(" (it lacks {})", missing.join(", "))
+    };
     Some(format!(
-        "the daemon at {} is {who}, but this client is {}: its results may mean something \
-         else, so none is trusted. Stop that daemon with its own t3-watch (`t3-watch stop`) or \
-         let it idle out, or point T3_WATCH_SOCKET elsewhere",
+        "the daemon at {} is {who}{lacking}, but this client is {}: its results may mean \
+         something else, so none is trusted. Stop that daemon with its own t3-watch \
+         (`t3-watch stop`) or let it idle out, or point T3_WATCH_SOCKET elsewhere",
         sock.display(),
         version::line()
     ))

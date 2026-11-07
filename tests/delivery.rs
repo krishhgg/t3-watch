@@ -12,7 +12,7 @@
 mod common;
 
 use common::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::net::TcpListener;
 use std::process::{Child, Stdio};
@@ -39,7 +39,7 @@ fn closed_port() -> u16 {
 }
 
 fn outbox(env: &Env) -> Vec<Value> {
-    let mut out: Vec<Value> = fs::read_dir(env.home.join("outbox-v2"))
+    let mut out: Vec<Value> = fs::read_dir(env.home.join(OUTBOX))
         .into_iter()
         .flatten()
         .flatten()
@@ -396,9 +396,9 @@ fn results_and_the_trace_name_builds_and_delivery_timing() {
     let out = env.run(&["wait", "--durable", "--webhook-url", &hook.url, T]);
     assert_eq!(out.status.code(), Some(0));
     let v = output_json(&out);
-    assert_eq!(v["build"]["engine"], 4);
+    assert_eq!(v["build"]["engine"], ENGINE);
     assert_eq!(v["build"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["daemon"]["engine"], 4);
+    assert_eq!(v["daemon"]["engine"], ENGINE);
     assert!(v["daemon"]["pid"].as_u64().is_some());
     let t = &v["threads"][0];
     assert_eq!(t["runCompletedAt"], "2026-11-07T07:00:11.387Z");
@@ -429,14 +429,16 @@ fn results_and_the_trace_name_builds_and_delivery_timing() {
     assert_eq!(settled["runCompletedAt"], "2026-11-07T07:00:11.387Z");
     assert_eq!(lines[pos("wait.outcome")]["watchId"], watch_id);
     assert_eq!(lines[pos("notify.prepared")]["watchId"], watch_id);
-    assert!(lines.iter().all(|l| l["engine"] == 4 && l["at"].as_str().is_some()));
+    assert!(lines
+        .iter()
+        .all(|l| l["engine"] == ENGINE && l["at"].as_str().is_some()));
     // Ids and statuses only: nothing that could carry a secret.
     assert!(
         !trace.contains("secret-path-123"),
         "the webhook URL leaked into the trace"
     );
     let version = env.run(&["--version"]);
-    assert!(String::from_utf8_lossy(&version.stdout).contains("engine 4"));
+    assert!(String::from_utf8_lossy(&version.stdout).contains(&format!("engine {ENGINE}")));
 }
 
 // ---- Sol ordinal 5, P1: an expired final event is not "delivered" -----------
@@ -479,14 +481,14 @@ fn a_final_event_that_expires_unsent_is_reported_undelivered() {
     assert_eq!(events(&hook), ["run_failed"], "the final event was never sent");
     let dead = env
         .home
-        .join("outbox-v2")
+        .join(OUTBOX)
         .join("dead")
         .join(format!("{}.json", n["id"].as_str().unwrap()));
     assert!(dead.exists(), "the expired entry is kept as a dead letter");
     let receipt: Value = serde_json::from_str(
         &fs::read_to_string(
             env.home
-                .join("outbox-v2")
+                .join(OUTBOX)
                 .join("receipts")
                 .join(format!("{}.json", n["id"].as_str().unwrap())),
         )
@@ -579,4 +581,154 @@ fn a_fifo_at_the_trace_or_hook_log_never_blocks_a_wait() {
         );
         assert_eq!(events(&hook), ["settled"]);
     }
+}
+
+// ---- Sol ordinal 6 ---------------------------------------------------------
+
+#[test]
+fn the_inline_path_never_sends_an_entry_that_has_a_receipt() {
+    // The final event's entry exists, but a receipt beside it says it was
+    // dropped (as after a crash between the two writes). The client must not
+    // send it, and must report the receipt's disposition.
+    let mock = MockMcp::start();
+    mock.set_thread(T, "failed", 5);
+    let hook = MockHook::start();
+    // The run_failed answer takes 5 s: the final entry waits meanwhile.
+    hook.state.lock().unwrap().delays.push_back(Duration::from_secs(5));
+    let env = mcp_env(&mock);
+    let child = env
+        .cmd(&[
+            "wait",
+            "--no-daemon",
+            "--follow",
+            "--durable",
+            "--expect-min-run-ordinal",
+            "5",
+            "--webhook-url",
+            &hook.url,
+            T,
+        ])
+        .spawn()
+        .unwrap();
+    eventually("the run_failed webhook", Duration::from_secs(10), || {
+        !hook.requests().is_empty()
+    });
+    mock.set_thread(T, "completed", 6);
+    let mut settled_id = None;
+    eventually("the settled entry", Duration::from_secs(10), || {
+        settled_id = outbox(&env)
+            .iter()
+            .find(|e| e["event"] == "settled")
+            .map(|e| e["id"].as_str().unwrap().to_string());
+        settled_id.is_some()
+    });
+    let id = settled_id.unwrap();
+    let receipts = env.home.join(OUTBOX).join("receipts");
+    fs::create_dir_all(&receipts).unwrap();
+    let receipt = json!({ "id": id, "disposition": "dropped", "at": "2026-11-07T00:00:00.000Z",
+                          "attempts": 0, "by": "outbox drop" });
+    fs::write(receipts.join(format!("{id}.json")), receipt.to_string()).unwrap();
+    let (code, out, err) = finish(child, Duration::from_secs(60));
+    assert_eq!(code, 4, "{out} {err}");
+    assert_eq!(out["notification"]["webhook"]["disposition"], "dropped", "{out}");
+    assert_eq!(events(&hook), ["run_failed"], "the dropped event was sent");
+    let kept: Value = serde_json::from_str(&fs::read_to_string(receipts.join(format!("{id}.json"))).unwrap()).unwrap();
+    assert_eq!(kept, receipt, "the receipt was rewritten");
+    assert!(outbox(&env).iter().all(|e| e["id"] != id.as_str()), "entry left behind");
+}
+
+#[test]
+fn credentials_in_thread_urls_never_reach_output_trace_or_webhook() {
+    let mock = MockMcp::start();
+    mock.set_thread("parent", "completed", 1);
+    let env = mcp_env(&mock);
+    // Name the mock as the default machine so a t3-thread link resolves.
+    let mut m = env.machines();
+    m["default"] = json!("mock");
+    fs::write(env.home.join("machines.json"), m.to_string()).unwrap();
+    let hook = MockHook::start();
+    for arg in [
+        "t3-thread://v2/env/parent?token=QUERY_CANARY#FRAG_CANARY",
+        "https://user:PASS_CANARY@relay.example/env/parent?token=QUERY_CANARY",
+    ] {
+        let out = env.run(&[
+            "wait",
+            "--no-daemon",
+            "--notify-on",
+            "all",
+            "--webhook-url",
+            &hook.url,
+            arg,
+        ]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for canary in ["QUERY_CANARY", "FRAG_CANARY", "PASS_CANARY"] {
+            assert!(!text.contains(canary), "{arg}: {text}");
+        }
+        if arg.starts_with("https") {
+            assert_eq!(out.status.code(), Some(2), "{text}");
+            assert!(text.contains("must not carry credentials"), "{text}");
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{text}");
+            assert_eq!(output_json(&out)["threads"][0]["threadId"], "parent");
+        }
+    }
+    let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+    for canary in ["QUERY_CANARY", "FRAG_CANARY", "PASS_CANARY"] {
+        assert!(!trace.contains(canary), "{trace}");
+        assert!(hook
+            .requests()
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains(canary)));
+    }
+}
+
+#[test]
+fn the_timeline_judges_the_final_event_not_an_earlier_progress_one() {
+    // Sol's case: the run_failed progress webhook gets a 200, the final
+    // settled one a 401. The acceptance event was not delivered.
+    let mock = MockMcp::start();
+    mock.set_thread(T, "failed", 5);
+    let hook = MockHook::start();
+    hook.push(200, &[]);
+    hook.push(401, &[]);
+    let env = mcp_env(&mock);
+    let child = env
+        .cmd(&[
+            "wait",
+            "--no-daemon",
+            "--follow",
+            "--expect-min-run-ordinal",
+            "5",
+            "--webhook-url",
+            &hook.url,
+            T,
+        ])
+        .spawn()
+        .unwrap();
+    eventually("the run_failed webhook", Duration::from_secs(10), || {
+        !hook.requests().is_empty()
+    });
+    mock.set_thread(T, "completed", 6);
+    let (code, out, _) = finish(child, Duration::from_secs(30));
+    assert_eq!(code, 4, "{out}");
+    let tl = std::process::Command::new("python3")
+        .args(["-I", concat!(env!("CARGO_MANIFEST_DIR"), "/e2e/timeline.py")])
+        .arg(env.home.join("trace.jsonl"))
+        .output()
+        .unwrap();
+    assert!(tl.status.success(), "{}", String::from_utf8_lossy(&tl.stderr));
+    let stdout = String::from_utf8_lossy(&tl.stdout);
+    let summary: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(summary["acceptanceEvent"]["event"], "settled", "{summary}");
+    assert_eq!(summary["acceptanceDelivered"], false, "{summary}");
+    assert_eq!(summary["completionTo2xxS"], Value::Null, "{summary}");
+    assert_eq!(summary["exitCode"], 4);
+    let progress = summary["progressEvents"].as_array().unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0]["event"], "run_failed");
+    assert!(progress[0]["deliveredAt"].as_str().is_some(), "{summary}");
 }

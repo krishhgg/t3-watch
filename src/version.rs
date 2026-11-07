@@ -7,6 +7,12 @@
 //! revision differs. The package version alone cannot do this: builds with
 //! different semantics have shipped under the same version.
 //!
+//! `CAPABILITIES` names what a daemon must do for this client's results and
+//! notifications to mean what they say. The client requires every one of
+//! them in the daemon's `accepted` line, on top of the matching engine, so a
+//! daemon that kept an engine number but lacks a behavior (as engine-4
+//! builds before receipts did) is refused rather than trusted.
+//!
 //! `REV` is the source revision the binary was built from, set at build time
 //! with `T3_WATCH_BUILD_REV=<git commit>` (release packages always set it);
 //! `dev` otherwise.
@@ -14,14 +20,23 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 4;
+pub const ENGINE: u32 = 5;
+pub const CAPABILITIES: &[&str] = &[
+    // Outbox entries leave only with a written receipt; absence is never
+    // delivery, and a receipt is never overwritten.
+    "outbox-receipts",
+    // Entries older builds left are pending until migrated and delivered.
+    "outbox-legacy-drain",
+    // Deadlines count suspended time; stalled polls restart on resume.
+    "suspend-aware",
+];
 pub const REV: &str = match option_env!("T3_WATCH_BUILD_REV") {
     Some(r) => r,
     None => "dev",
 };
 
 pub fn json() -> Value {
-    json!({ "version": VERSION, "engine": ENGINE, "rev": REV })
+    json!({ "version": VERSION, "engine": ENGINE, "rev": REV, "capabilities": CAPABILITIES })
 }
 
 pub fn line() -> String {

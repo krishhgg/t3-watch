@@ -514,6 +514,24 @@ pub fn post_once(
     }
 }
 
+/// What the receipt of a finished entry says, as a webhook result. Only a
+/// `delivered` receipt counts as delivery; no receipt is `unknown`.
+fn from_receipt(id: &str) -> Value {
+    match outbox::receipt(id) {
+        Some(r) if r["disposition"] == "delivered" => json!({
+            "delivered": true, "attempts": r["attempts"], "status": r["status"],
+            "by": r["by"], "deliveredAt": r["at"], "disposition": "delivered" }),
+        Some(r) => json!({
+            "delivered": false, "attempts": r["attempts"], "disposition": r["disposition"],
+            "outboxId": id, "at": r["at"],
+            "error": format!("the outbox entry was {} before it was delivered",
+                             r["disposition"].as_str().unwrap_or("finished")) }),
+        None => json!({
+            "delivered": false, "attempts": 0, "disposition": "unknown", "outboxId": id,
+            "error": "the outbox entry is gone and no receipt says why; not counted as delivered" }),
+    }
+}
+
 /// The webhook half of `send`. `durable` is `None` without `--durable`,
 /// `Some(None)` when the outbox entry was written, `Some(Some(error))` when
 /// writing it failed.
@@ -549,22 +567,13 @@ fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option
             return json!({ "delivered": false, "attempts": 0, "disposition": "unreadable", "outboxId": id,
                            "error": "the outbox entry cannot be read; not counted as delivered" })
         }
-        outbox::EntryState::Missing => {
-            return match outbox::receipt(id) {
-                Some(r) if r["disposition"] == "delivered" => json!({
-                    "delivered": true, "attempts": r["attempts"], "status": r["status"],
-                    "by": r["by"], "deliveredAt": r["at"], "disposition": "delivered" }),
-                Some(r) => json!({
-                    "delivered": false, "attempts": r["attempts"], "disposition": r["disposition"],
-                    "outboxId": id, "at": r["at"],
-                    "error": format!("the outbox {} this event before it was delivered",
-                                     if r["disposition"] == "expired" { "expired" } else { "dropped" }) }),
-                None => json!({
-                    "delivered": false, "attempts": 0, "disposition": "unknown", "outboxId": id,
-                    "error": "the outbox entry is gone and no receipt says why; not counted as delivered" }),
-            };
-        }
+        outbox::EntryState::Missing => return from_receipt(id),
     };
+    // Finished already (a crash left the entry beside its receipt): never
+    // send it, and report what the receipt says.
+    if outbox::reconcile(&entry).is_some() {
+        return from_receipt(id);
+    }
     if !outbox::inline_allowed(&entry) {
         return json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
                        "nextAttemptAt": util::rfc3339_ms(entry.next_attempt_ms),
