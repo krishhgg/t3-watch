@@ -357,6 +357,10 @@ struct HoldingProxy {
     release: Arc<AtomicBool>,
     forwarded: Arc<AtomicBool>,
     connections: Arc<AtomicUsize>,
+    /// When set, a released answer goes out one byte at a time, this many
+    /// ms apart; `dripped` counts the bytes sent.
+    drip_ms: Arc<AtomicUsize>,
+    dripped: Arc<AtomicUsize>,
 }
 
 fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
@@ -367,6 +371,8 @@ fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
         release: Arc::new(AtomicBool::new(false)),
         forwarded: Arc::new(AtomicBool::new(false)),
         connections: Arc::new(AtomicUsize::new(0)),
+        drip_ms: Arc::new(AtomicUsize::new(0)),
+        dripped: Arc::new(AtomicUsize::new(0)),
     };
     let (held, release, forwarded, connections) = (
         p.held.clone(),
@@ -374,6 +380,7 @@ fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
         p.forwarded.clone(),
         p.connections.clone(),
     );
+    let (drip_ms, dripped) = (p.drip_ms.clone(), p.dripped.clone());
     std::thread::spawn(move || {
         for client in listener.incoming().flatten() {
             let n = connections.fetch_add(1, Ordering::SeqCst);
@@ -386,6 +393,7 @@ fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
                 let _ = to_daemon.shutdown(Shutdown::Write);
             });
             let (held, release, forwarded) = (held.clone(), release.clone(), forwarded.clone());
+            let (drip_ms, dripped) = (drip_ms.clone(), dripped.clone());
             std::thread::spawn(move || {
                 let mut from_daemon = BufReader::new(up);
                 let mut to_client = client;
@@ -402,7 +410,21 @@ fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
-                    if to_client.write_all(line.as_bytes()).is_err() {
+                    let drip = drip_ms.load(Ordering::SeqCst) as u64;
+                    if hold && drip > 0 {
+                        let mut gone = false;
+                        for b in line.as_bytes() {
+                            if to_client.write_all(&[*b]).is_err() {
+                                gone = true;
+                                break;
+                            }
+                            dripped.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(drip));
+                        }
+                        if gone {
+                            break;
+                        }
+                    } else if to_client.write_all(line.as_bytes()).is_err() {
                         break;
                     }
                     if hold {
@@ -517,4 +539,57 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
         env.run(&["stop"]);
         let _ = daemon.wait();
     }
+}
+
+#[test]
+fn a_frame_trickling_in_never_holds_back_the_suspend_and_deadline_checks() {
+    // Sol ordinal 10: a genuine daemon's accepted line, then its answer one
+    // byte every 200 ms; the host sleeps 11 minutes into a 10-minute wait.
+    // The client read on while bytes kept coming and ended only when the
+    // frame was complete.
+    let mock = MockMcp::start();
+    mock.set_thread(W, "completed", 2);
+    let env = mcp_env(&mock);
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let clock = env.home.join("suspend");
+    suspend(&clock, 0);
+    let mut daemon = env
+        .cmd(&["daemon", "--idle-exit", "60s"])
+        .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+        .spawn()
+        .unwrap();
+    env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+    let sdir = env.home.join("s");
+    fs::create_dir_all(&sdir).unwrap();
+    fs::set_permissions(&sdir, fs::Permissions::from_mode(0o700)).unwrap();
+    let proxy_sock = sdir.join("proxy.sock");
+    let proxy = holding_proxy(&proxy_sock, env.home.join(SOCK));
+    proxy.drip_ms.store(200, Ordering::SeqCst);
+    let child = env
+        .cmd(&["wait", "--timeout", "10m", W])
+        .env("T3_WATCH_SOCKET", &proxy_sock)
+        .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+        .spawn()
+        .unwrap();
+    until("the daemon's answer", || proxy.held.load(Ordering::SeqCst));
+    proxy.release.store(true, Ordering::SeqCst);
+    until("the answer to start trickling", || {
+        proxy.dripped.load(Ordering::SeqCst) >= 3
+    });
+    let resumed = Instant::now();
+    suspend(&clock, 660_000);
+    let (code, out, err) = finish(child, Duration::from_secs(15));
+    let took = resumed.elapsed();
+    let sent = proxy.dripped.load(Ordering::SeqCst);
+    assert_eq!(
+        code, 3,
+        "exit {code} after {took:?}, {sent} bytes trickled: {out} {err}"
+    );
+    assert_eq!(out["outcome"], "timeout", "{out}");
+    assert!(
+        took < Duration::from_secs(3),
+        "the expired wait ended {took:?} after the resume, {sent} bytes into the frame"
+    );
+    env.run(&["stop"]);
+    let _ = daemon.wait();
 }

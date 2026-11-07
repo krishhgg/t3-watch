@@ -12,7 +12,9 @@
 //!   outbox-v2/, outbox-v3/ entries of engine-4 and engine-5 builds, delivered
 //!                     where they are, the way those builds' senders would;
 //!                     undelivered outbox-v2/ ones kept, held back from older
-//!                     senders, until their client is done
+//!                     senders, until their client is done (outbox-v2/
+//!                     sender.lock is a directory, a fence, while a receipt
+//!                     beside one is being taken back)
 //!   trace.jsonl       delivery trace: waits, proofs, events, HTTP attempts
 //!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr
@@ -48,28 +50,29 @@ pub fn custom_socket() -> bool {
     env_path("T3_WATCH_SOCKET").is_some()
 }
 
-/// Socket file name, derived from the engine revision, so a daemon left
-/// running by a build with other result semantics is never even reached by
-/// default (it would report results this build reads differently). Old and
-/// new daemons run side by side until the old one idles out. The handshake
-/// checks the revision as well, which is what protects a custom socket.
-fn socket_name() -> String {
-    format!("daemon-e{}.sock", crate::version::ENGINE)
+/// The daemon socket. `$T3_WATCH_SOCKET` names it outright; otherwise it
+/// is this engine's default (see `default_socket_path`).
+pub fn socket_path() -> PathBuf {
+    env_path("T3_WATCH_SOCKET").unwrap_or_else(|| default_socket_path(crate::version::ENGINE))
 }
 
-/// The daemon socket. `$T3_WATCH_HOME` wins so tests and multiple users stay
-/// isolated; otherwise `$XDG_RUNTIME_DIR/t3-watch` when set (Linux), else the
-/// state directory.
-pub fn socket_path() -> PathBuf {
-    if let Some(p) = env_path("T3_WATCH_SOCKET") {
-        return p;
-    }
+/// Where a daemon of engine revision `engine` listens by default, as every
+/// build since engine 4 resolves it: `$T3_WATCH_HOME` wins so tests and
+/// multiple users stay isolated; otherwise `$XDG_RUNTIME_DIR/t3-watch` when
+/// set (Linux), else the state directory. The file name carries the engine,
+/// so a daemon left running by a build with other result semantics is never
+/// even reached by default (it would report results this build reads
+/// differently); old and new daemons run side by side until the old one
+/// idles out. The handshake checks the revision as well, which is what
+/// protects a custom socket.
+pub fn default_socket_path(engine: u32) -> PathBuf {
+    let name = format!("daemon-e{engine}.sock");
     if env_path("T3_WATCH_HOME").is_none() {
         if let Some(rt) = env_path("XDG_RUNTIME_DIR") {
-            return rt.join("t3-watch").join(socket_name());
+            return rt.join("t3-watch").join(name);
         }
     }
-    state_dir().join(socket_name())
+    state_dir().join(name)
 }
 
 /// Durable notifications waiting for delivery (`--durable`). Versioned with

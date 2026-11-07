@@ -557,6 +557,14 @@ pub fn open_private_read(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// Exits with status 97 at a named point when `T3_WATCH_TEST_FAULT` names
+/// it: crash-recovery tests stop the process exactly there.
+pub fn test_fault(point: &str) {
+    if std::env::var_os("T3_WATCH_TEST_FAULT").is_some_and(|p| p == point) {
+        std::process::exit(97);
+    }
+}
+
 /// Whether a process with this pid exists. Unknown counts as running.
 pub fn process_running(pid: u64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {

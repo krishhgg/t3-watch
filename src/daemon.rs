@@ -261,34 +261,37 @@ enum LineError {
 
 /// Reads one `\n`-terminated line of at most `max` bytes (newline excluded).
 fn read_line_bounded(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, LineError> {
-    read_line_resumable(r, max, &mut Vec::new())
-}
-
-/// `read_line_bounded` that keeps what it read in `out` when the read times
-/// out, so the caller can check a deadline and carry on with the same line.
-fn read_line_resumable(r: &mut impl BufRead, max: usize, out: &mut Vec<u8>) -> Result<Vec<u8>, LineError> {
+    let mut out = Vec::new();
     loop {
-        let buf = match r.fill_buf() {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(LineError::Io(e)),
-        };
-        if buf.is_empty() {
-            return Err(LineError::Incomplete);
-        }
-        let (take, done) = match buf.iter().position(|b| *b == b'\n') {
-            Some(i) => (i, true),
-            None => (buf.len(), false),
-        };
-        if out.len() + take > max {
-            return Err(LineError::TooLong);
-        }
-        out.extend_from_slice(&buf[..take]);
-        r.consume(if done { take + 1 } else { take });
-        if done {
-            return Ok(std::mem::take(out));
+        match read_line_chunk(r, max, &mut out) {
+            Ok(Some(line)) => return Ok(line),
+            Ok(None) => {}
+            Err(LineError::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// One read toward a `\n`-terminated line of at most `max` bytes (newline
+/// excluded), kept in `out` across calls. `Ok(None)`: no newline yet. It
+/// returns after every read, so a caller can check its deadline between
+/// chunks however steadily bytes keep arriving; an interrupted read comes
+/// back as an error the same way.
+fn read_line_chunk(r: &mut impl BufRead, max: usize, out: &mut Vec<u8>) -> Result<Option<Vec<u8>>, LineError> {
+    let buf = r.fill_buf().map_err(LineError::Io)?;
+    if buf.is_empty() {
+        return Err(LineError::Incomplete);
+    }
+    let (take, done) = match buf.iter().position(|b| *b == b'\n') {
+        Some(i) => (i, true),
+        None => (buf.len(), false),
+    };
+    if out.len() + take > max {
+        return Err(LineError::TooLong);
+    }
+    out.extend_from_slice(&buf[..take]);
+    r.consume(if done { take + 1 } else { take });
+    Ok(done.then(|| std::mem::take(out)))
 }
 
 /// Counts waiting clients against `T3_WATCH_MAX_CONNECTIONS`. Control
@@ -650,25 +653,37 @@ fn read_outcome(
         })
     };
     loop {
-        let line = match read_line_resumable(&mut reader, MAX_RESPONSE_LINE, &mut partial) {
-            Ok(l) => l,
-            Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if let Some(a) = stale(if partial.is_empty() {
-                    "nothing read"
-                } else {
-                    "part of a line"
-                }) {
-                    return a;
-                }
-                if sw.elapsed_ms() >= deadline_ms + ANSWER_GRACE_MS {
-                    return Answer::Outcome(client_timeout(sw, "the daemon did not answer before the timeout"));
-                }
-                continue;
+        // Checked after every read: an empty socket, a timeout, an
+        // interrupted read, or part of a line (bytes trickling in steadily
+        // never hold these checks back).
+        let line = match read_line_chunk(&mut reader, MAX_RESPONSE_LINE, &mut partial) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => None,
+            Err(LineError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
+                None
             }
             Err(LineError::TooLong) => {
                 return Answer::Outcome(Outcome::Error(error_json("protocol", "daemon reply is too long")))
             }
             Err(_) => return Answer::Dropped,
+        };
+        let Some(line) = line else {
+            if let Some(a) = stale(if partial.is_empty() {
+                "nothing read"
+            } else {
+                "part of a line"
+            }) {
+                return a;
+            }
+            if sw.elapsed_ms() >= deadline_ms + ANSWER_GRACE_MS {
+                return Answer::Outcome(client_timeout(sw, "the daemon did not answer before the timeout"));
+            }
+            continue;
         };
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             return Answer::Dropped;
