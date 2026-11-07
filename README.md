@@ -141,10 +141,26 @@ Workstream mode settles only when all of these hold, checked on each cycle:
    (`run:thread:<this thread>:ordinal:N`) whose status, when given, is
    settled. A run of another thread (a child's) never counts.
 3. The header read afterwards shows a settled status, no `activeRunId`, and
-   a latest run no newer than `resultRun`, or the same latest run a read had
-   already seen before this wait was sent (a wait without `runId` covers the
-   latest run and its delegated work, so T3 may name an earlier run as the
-   one holding the answer).
+   either `resultRun` itself as the latest run, or the same latest run a read
+   had already seen before this wait was sent (a wait without `runId` covers
+   the latest run and its delegated work, so T3 may name an earlier run as
+   the one holding the answer). A `resultRun` newer than the header's latest
+   run, or a header that disagrees with the proof about whether the same run
+   succeeded, is re-checked, never settled from either side.
+4. Nothing else read in the same cycle contradicts the header. Every later
+   response (the delegated-work probe, the activity timeline, each
+   `--final-marker` listing and message page, and a final header read after
+   the marker check) is compared with it: a different latest run, a run that
+   became active, a changed status, or input that appeared voids the
+   observation. The cycle then reports the fresh header marked for
+   re-checking (it can still report input, never completion or failure) and
+   the next cycle starts over with a new wait and a new proof.
+
+The outcome of a proven workstream is the status of `resultRun`, the run
+T3 names as holding the final answer, as T3 reported it in the proof: a
+`failed`, `interrupted` or `cancelled` result run is a failure (exit 6) even
+if a later run completed, and a failed latest run after a completed result
+run is a failure too. Success needs both to have succeeded.
 
 If a newer run appears (a late child completion continuing the parent),
 t3-watch waits again on it. If T3 finishes the wait without `resultRun`,
@@ -178,9 +194,13 @@ says `running`). That is never reported as completion, and t3-watch never
 answers or approves anything: it can only call `t3_thread_wait`,
 `t3_thread_read` and `t3_pending_request` with `action` `list` or `read`.
 
-Over MCP each pending request is described from the end of the activity
-timeline and `t3_pending_request list` (which lists questions only, not
-approvals):
+Over MCP each pending request is described from `t3_pending_request list`
+(which lists questions only, not approvals) and the end of the activity
+timeline. For a delegated child thread the timeline is never read, because
+it can hold the final results of the child's earlier runs and T3 marks a
+child's final result delivered when it is read; questions there come from
+`t3_pending_request read`, and approvals show only as
+`pendingRequestCount`:
 
 ```json
 {"kind":"question","itemId":"turn-item:runtime-request:...","requestId":"runtime-request:...","userOnly":false,
@@ -200,15 +220,20 @@ approvals):
   requests; a different or additional request wakes it again.
 - The local transport sees `waiting` and `pendingRequestCount` but has no
   way to read the request itself, so `requests` is empty there.
-- A request that appears while the run still says `running` is noticed by
-  the read after each long-poll slice, so within `--slice` (default 60 s).
+- A watch reads the thread header before its first long-poll, so a thread
+  that is already blocked is reported at once, and then at least every 30 s
+  (no long-poll lasts longer, whatever `--slice` says), so a request that
+  appears while the run still says `running` is seen within about 30 s.
 
 ### Wake notifications
 
-An agent with a background terminal is woken by the process exiting. A bot
-without one can ask t3-watch to call it. The waiting client (never the
-shared daemon) delivers the notification after the wait ends and before it
-exits.
+An agent whose harness watches the background command on the same machine
+is woken by the process exiting. That is not universal: a background shell
+started on another machine through a remote tool (a remote `machineId`
+shell, for example) can exit without waking the bot that started it. In
+those setups, and for a bot without a background terminal at all, have
+t3-watch call the bot instead. The waiting client (never the shared daemon)
+delivers the notification after the wait ends and before it exits.
 
 ```sh
 export BOT_HOOK_URL='https://bot.example/hooks/t3'      # keep URLs and secrets out of argv
@@ -274,10 +299,13 @@ With `--durable`, a webhook is never fire-and-forget:
 3. Otherwise the client exits (4 if the threads completed) with
    `notification.queued: true` and the outbox id, and makes sure the daemon
    runs. The daemon's sender retries every entry with exponential backoff
-   (2 s doubling, with jitter, capped at 5 min, `Retry-After` honored) until
-   a 2xx, then removes it. DNS failures, refused connections, 5xx and 4xx
-   alike are retried; after `--durable-max-age` (default 7 days) the entry
-   moves to `outbox/dead/`.
+   (2 s doubling, with jitter, capped at 5 min) until a 2xx, then removes
+   it. A receiver's `Retry-After` (in seconds) is a floor, not part of the
+   backoff: it is saved with the entry as `notBefore`, across the hand-off
+   from the client to the sender, the 5-minute cap never shortens it, and
+   even `outbox run --once` waits for it. DNS failures, refused
+   connections, 5xx and 4xx alike are retried; after `--durable-max-age`
+   (default 7 days) the entry moves to `outbox/dead/`.
 4. The daemon does not idle-exit while the outbox holds entries. One sender
    runs at a time (`outbox/sender.lock`).
 
@@ -287,9 +315,17 @@ or a sender that crashed between the 2xx and removing the entry, produces a
 duplicate with the same id; receivers should drop repeats of an id they
 have seen.
 
+Events of one wait can arrive out of order (a queued progress event may be
+retried after the final event lands), so each body carries `eventSeq`
+(1, 2, ... per wait, progress and final alike) and `watchId`. Progress
+events are written to the outbox as they happen, before anything is logged,
+and the final event is written before the client waits for any progress
+delivery still in flight. Diagnostics on stderr are best effort: a closed
+stdout or stderr never changes the exit code or costs an event.
+
 ```sh
 t3-watch outbox list            # ids, events, destination origin, attempts, next attempt, last error
-t3-watch outbox run --once      # try every entry now (exit 4 while some remain)
+t3-watch outbox run --once      # try every entry now, Retry-After permitting (exit 4 while some remain)
 t3-watch outbox run             # the sender in the foreground, for launchd/systemd
 t3-watch outbox drop <id>
 ```
@@ -342,7 +378,7 @@ t3-watch separates what it can prove from what only someone else can:
 | `--acknowledge <pendingKey>` | Keep waiting past the pending requests this key names |
 | `--timeout <dur>` | Give up after this long (default `4h`) |
 | `--interval <dur>` | Local poll interval (default `5s`) |
-| `--slice <dur>` | MCP long-poll length (default `60s`, capped at `10m`) |
+| `--slice <dur>` | MCP long-poll length (default `30s`; no long-poll exceeds the 30 s attention interval) |
 | `--no-daemon` | Watch in this process instead of the shared daemon |
 | `--pretty` | Indent the JSON |
 | `--webhook-url-env`, `--webhook-url-file`, `--webhook-url` | Where to POST the result (see above) |
@@ -455,16 +491,19 @@ a daemon restart mid-wait `daemonReconnects` and `registrationElapsedMs`
 - Responses are size-bounded: 1 MiB per SSE line, 8 MiB per event, 16 MiB per
   response, comments included. A server that goes past that gets a retry,
   not the daemon's memory.
-- Each cycle calls `t3_thread_wait` (`timeoutMs` = the slice, plus
-  `untilDelegatedWorkSettled` in workstream mode and `environmentId` when
-  set), then always reads the thread header with `t3_thread_read`
+- A watch's first cycle reads the thread header before anything else. Each
+  cycle then calls `t3_thread_wait` (`timeoutMs` = the slice, at most 30 s,
+  plus `untilDelegatedWorkSettled` in workstream mode and `environmentId`
+  when set), then always reads the thread header with `t3_thread_read`
   (`afterPosition` past the end, so no timeline item is returned: reading a
   delegated child's final result would mark it delivered). Reading after
   every slice is how a pending request on a `running` thread is noticed.
-- Only when a thread needs input does a cycle read more: the last 40
-  activity items (not for a finished child thread) and
-  `t3_pending_request list`. `--final-marker` reads one message, as
-  described above. Answers are cached until the thread's header changes.
+- Only when a thread needs input does a cycle read more:
+  `t3_pending_request list`, and the last 40 activity items (for a
+  delegated child, `t3_pending_request read` per question instead).
+  `--final-marker` reads one message, as described above, and is followed by
+  one more header read. Answers are cached until the thread's header
+  changes.
 - The workstream proof is described in [Completion contracts](#completion-contracts).
   Missing `timedOut` or `status` fields never count as proof, and a missing
   `latestRunId` is unresolved unless the read reports `runCount: 0`.
@@ -629,7 +668,7 @@ Each of the 20 t3-watch clients reported 0.00 s of CPU for the whole window, whi
 
 ### Checked against the live T3 server on this Mac mini (completion-contract build)
 
-- `e2e/live.sh` (below), 36 checks, all passed on 2026-11-06 against T3
+- `e2e/live.sh` (below), 37 checks, all passed on 2026-11-06 (Pacific) against T3
   `0.1.7-nightly.20261102.4066`: completion with `outcome`, stale ordinals and
   `--after-run`, local refusal of `--until workstream`, a missing
   `--final-marker`, shared polling, cancellation back to baseline threads and
@@ -682,7 +721,7 @@ servers in `tests/`, whose responses copy the shapes the real
 ## Development
 
 ```sh
-cargo test                      # unit, integration, hardening, adversarial, workstream and outbox tests (about 30 s)
+cargo test                      # unit, integration, hardening, adversarial, workstream, outbox, consistency and delivery tests (about 40 s)
 cargo clippy --all-targets -- -D warnings
 python3 bench/run.py --thread <a running local thread id> --settled-thread <a settled one>
 ```
@@ -719,7 +758,17 @@ without a challenge, outages reported both ways and on timeout, `--follow`,
 delivery: a DNS failure kept privately, a receiver that comes back, a
 SIGKILL mid-delivery, an answer lost after the receiver accepted (duplicates
 with one id), dead letters, and the daemon retrying a needs-input wake
-while staying up. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
+while staying up. `tests/consistency.rs` covers a newer running parent
+seen by the marker listing, a message page, the post-marker header read
+or the turn probe; failed, interrupted and cancelled result runs ahead of,
+behind and equal to the header's run; input pending before the first
+long-poll with a 900 ms timeout; and a running child with pending input and
+an earlier final result, read without touching its timeline.
+`tests/delivery.rs` covers closed stdout and stderr together for
+`run_failed`, outage progress, completion and needs-input (with the
+receiver up and down), `Retry-After` across the hand-off and past the
+sender's cap, and the final event persisted while a progress delivery
+hangs. `tests/adversarial.rs` adds a delegated child's `resultRun` posing as a newer
 parent run, missing run identity, foreign `latestRunId`s, cancelled
 long-polls checked on the wire (each cancelled before the next starts) and in
 the OS (threads, descriptors, TCP connections back to baseline), killed local
@@ -761,8 +810,11 @@ must stay active for about two minutes.
   marker. Neither contract can know about work started after T3 reported the
   workstream settled.
 - Over MCP, a question or approval on a thread that still says `running` is
-  seen within one `--slice` (default 60 s), not instantly. The local
-  transport reports needs-input without the request text.
+  seen within about 30 s, not instantly. The local transport reports
+  needs-input without the request text, and on a delegated child thread an
+  approval shows only as a count. The shape of `t3_pending_request read`
+  answers was not observed live (no child was blocked on a question while
+  this was built); unknown shapes give the request id without its text.
 - The local transport costs one `t3 thread show` per watched thread per
   interval, about 0.4 s of CPU on this Mac mini. For many local threads, the
   local server's own MCP endpoint should give long-polling instead

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Live end-to-end checks against the T3 Code server on this machine, through
 # the real daemon and the local transport. Read-only on T3: it only runs
-# `t3 thread show`. Webhooks go to e2e/receiver.py on 127.0.0.1.
+# `t3 thread show`. Webhooks go to e2e/receiver.py on 127.0.0.1, an audit
+# fixture that enforces the signature and Authorization header; passing here
+# is not evidence that a production receiver got or acted on an event.
 #
 # Usage: e2e/live.sh <settled-thread-id> <running-thread-id> [t3-watch binary] [relay origin]
 #   settled-thread-id  a top-level thread that has completed
@@ -128,6 +130,9 @@ sys.exit(0 if e[:2] == ['settled', 'timeout'] and e[2:].count('heartbeat') >= 2 
 check "every signature, Authorization and Idempotency-Key verified" python3 -c "
 import json,sys; e=[json.loads(l) for l in open('$WORK/hooks.jsonl')]
 sys.exit(0 if e and all(x['signatureOk'] and x['authorizationOk'] and x['idempotencyOk'] for x in e) else 1)"
+# The fixture refuses a wrong Authorization header, and t3-watch says so.
+out=$(HOOK_AUTH="Bearer wrong" hook "$SETTLED"); code=$?
+check "a rejected webhook (401) exits 4 with delivered false" [ "$code/$(echo "$out" | j 'v["notification"]["webhook"].get("status")')" = 4/401 ]
 kill "$RECV" 2>/dev/null
 
 # 6b. Durable delivery: the receiver is down, the event is queued, then the

@@ -8,7 +8,8 @@ description: Wait for T3 Code threads to finish without spending tokens. Use aft
 `t3-watch wait` blocks in the operating system until the threads you name
 finish, fail, or stop to ask for input. It then prints one JSON object and
 exits with a code that says which. Your harness wakes you when the
-background command exits, so you spend no tokens while the thread works.
+background command exits (on the machine it watches; see Harness recipes),
+so you spend no tokens while the thread works.
 
 ## When to use it
 
@@ -115,6 +116,12 @@ the watcher can never send messages, answer questions or run anything.
 
 ## Harness recipes
 
+The exit of a background command wakes you only when your harness watches
+that process on the machine it runs on. A background shell started on
+another machine through a remote tool (a remote `machineId` shell) can exit
+without waking you; there, and anywhere you are unsure, use a webhook (see
+below) as the wake-up and treat the exit as a backup.
+
 Claude Code: run it with the Bash tool and `run_in_background: true`, then end
 the turn. You get a notification when it exits.
 
@@ -147,8 +154,10 @@ The bot receives the same JSON in a POST, signed with
 `X-T3-Watch-Event` is `settled`, `needs_input`, `timeout`, `error`, or
 progress (`run_failed`, `upstream_unreachable`, `upstream_restored`,
 `heartbeat`). With `--durable`, an undelivered event is kept on disk and the
-daemon retries it until a 2xx; drop repeats of an `X-T3-Watch-Id` (also sent
-as `Idempotency-Key`) you have already handled. With `--heartbeat`, a
+daemon retries it until a 2xx (never before a `Retry-After` you sent); drop
+repeats of an `X-T3-Watch-Id` (also sent as `Idempotency-Key`) you have
+already handled, and order a wait's events by `eventSeq`, since a retried
+event can arrive after a later one. With `--heartbeat`, a
 receiver that stops getting heartbeats for about two intervals (and got no
 final event) should assume the watcher or its host is gone: a dead host
 cannot notify anyone. `--on-settle <program> --on-settle-arg <arg>` runs a

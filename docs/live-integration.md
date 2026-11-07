@@ -34,10 +34,15 @@ WAITING_THREAD=<thread blocked on input> e2e/live.sh ...   # adds the needs-inpu
 This checks completion, stale ordinals, `--after-run`, the local refusal of
 `--until workstream`, a missing `--final-marker`, poller sharing,
 cancellation and resource accounting, signed webhooks with Authorization and
-Idempotency-Key, heartbeats, a durable delivery that succeeds after the
-receiver comes back, hook output going to `hooks.log`, and strict OAuth
-discovery. Result on the Mac mini (2026-11-06, this build): all 36 checks
-passed.
+Idempotency-Key, a webhook the receiver rejects (401, exit 4), heartbeats, a
+durable delivery that succeeds after the receiver comes back, hook output
+going to `hooks.log`, and strict OAuth discovery. Result on the Mac mini
+(2026-11-06 Pacific, after the ordinal-3 review fixes): all 37 checks passed.
+
+`e2e/receiver.py` is an audit fixture: it answers 200 only to correctly
+signed and authorized requests (401 otherwise) and logs what it saw. A pass
+shows what t3-watch sent; it is not evidence that a production receiver got
+an event or acted on it (step 4).
 
 ## 2. Pair each remote machine (parent, once per machine)
 
@@ -107,9 +112,23 @@ d. Outage behavior, observed rather than induced: during a tunnel outage,
 The parent verifies that the bot acted on the `settled` or `needs_input`
 event (for example, a reply in the bot's channel naming the thread), and
 reports that separately from the watcher's exit code. A receiver should
-drop repeats of an `X-T3-Watch-Id` it has handled, and a receiver-side
-monitor should alert when a watch's heartbeats stop for about two intervals
-without a final event.
+drop repeats of an `X-T3-Watch-Id` it has handled, order a wait's events by
+`eventSeq`, and a receiver-side monitor should alert when a watch's
+heartbeats stop for about two intervals without a final event.
+
+Do not rely on the exit of a background shell on another machine to wake a
+bot: a remote (`machineId`) background shell can exit without waking the bot
+that started it. The webhook to the bot's routine, or the exit of a process
+the bot's own harness watches on its own machine, is the wake-up.
+
+Status as reported by the parent (not re-verified from this worktree):
+
+| Acceptance | Result |
+| --- | --- |
+| Real webhook from a box daemon to the bot's T3 Watch Wake routine, `settled` | Passed: watchId `c2366ae100a095fb` (Sol review run, ordinal 3), `endedAt` 2026-11-07T06:40:20.657Z, woke the correct bot with no user ping |
+| `needs_input` wake through the same routine | Pending |
+| Replay of a queued event after receiver downtime (`--durable`) | Pending |
+| Native Linux run of the x86_64 / aarch64 archives | Pending |
 
 ## Investigation notes (2026-11-06)
 

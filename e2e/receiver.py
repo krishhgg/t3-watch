@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""A controlled webhook receiver for e2e/live.sh. Listens on 127.0.0.1 only,
-verifies the X-T3-Watch-Signature HMAC with the secret in SECRET_FILE, checks
-an expected Authorization header, and appends one JSON line per request to
-LOG_FILE. Writes its port to PORT_FILE. Never prints secrets.
+"""Audit fixture for e2e/live.sh, not a production receiver.
+
+A controlled webhook receiver on 127.0.0.1 only. It verifies the
+X-T3-Watch-Signature HMAC with the secret in SECRET_FILE and the expected
+Authorization header, appends one JSON line per request to LOG_FILE (accepted
+or not), and answers 200 only when both check out; otherwise 401, so a
+misconfigured sender fails here as it would against a real receiver. Writes
+its port to PORT_FILE. Never prints secrets.
+
+What a pass here shows: t3-watch sent a correctly signed, authorized event to
+this fixture. It is not evidence that a production receiver (a bot's webhook
+routine) received the event or acted on it; that is checked separately at the
+receiver.
 
 Usage: receiver.py SECRET_FILE EXPECTED_AUTH LOG_FILE PORT_FILE [PORT]
 """
@@ -42,12 +51,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "threadStatus": next(iter(t.get("status") for t in payload.get("threads") or [] if isinstance(t, dict)), None),
             "bytes": len(body),
         }
+        accepted = entry["signatureOk"] and entry["authorizationOk"] and entry["idempotencyOk"]
+        entry["accepted"] = accepted
         with open(LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        self.send_response(200)
-        self.send_header("Content-Length", "2")
+        reply = b"ok" if accepted else b"rejected"
+        self.send_response(200 if accepted else 401)
+        self.send_header("Content-Length", str(len(reply)))
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(reply)
 
     def log_message(self, *args):
         pass
