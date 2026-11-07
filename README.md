@@ -298,7 +298,7 @@ notification to a DNS failure (`Could not resolve host`) with no retry.
 With `--durable`, a webhook is never fire-and-forget:
 
 1. Before the first attempt, the event is written to
-   `<state>/outbox-v2/<id>.json` (0600 in a 0700 directory, through an
+   `<state>/outbox-v3/<id>.json` (0600 in a 0700 directory, through an
    fsynced temp file and a rename). A crash from here on loses nothing.
 2. The waiting client tries it inline (up to 4 attempts within 60 s) and
    records the result the moment the webhook is done, even while an
@@ -312,9 +312,9 @@ With `--durable`, a webhook is never fire-and-forget:
    from the client to the sender, the 5-minute cap never shortens it, and
    even `outbox run --once` waits for it. DNS failures, refused
    connections, 5xx and 4xx alike are retried; after `--durable-max-age`
-   (default 7 days) the entry moves to `outbox-v2/dead/`.
+   (default 7 days) the entry moves to `outbox-v3/dead/`.
 4. The daemon does not idle-exit while the outbox holds entries. One sender
-   runs at a time (`outbox-v2/sender.lock`).
+   runs at a time (`outbox-v3/sender.lock`).
 5. Each entry has a lease (an flock on `<id>.lock`). Whoever sends it, the
    client inline or the sender, holds the lease for the attempt and for
    recording its result, and rereads the entry first: the two never send
@@ -323,20 +323,27 @@ With `--durable`, a webhook is never fire-and-forget:
    that dies drops its lease, so the sender takes over at once.
 6. How an entry leaves is written down, never inferred. Before an entry is
    removed (`delivered`, `dropped`) or moved to `dead/` (`expired`), a
-   receipt `outbox-v2/receipts/<id>.json` (kept 7 days) records the
+   receipt `outbox-v3/receipts/<id>.json` (kept 7 days) records the
    disposition, under the entry's lease. A client that finds its entry gone
    reports what the receipt says: only `delivered` counts as delivered; an
    expired, dropped, unreadable or receipt-less entry is
    `"delivered": false` with its `disposition` (`expired`, `dropped`,
-   `unreadable`, `unknown`), and a completed wait then exits 4.
-7. Builds before this one kept entries in `outbox/` without leases or
-   `Retry-After` floors. Their senders never look at `outbox-v2/`. Entries
-   they left behind are moved into `outbox-v2/` under their own
-   `outbox/sender.lock` once older than the 90 s inline grace (a client of
-   that build may still be sending a younger one). Until then they count as
-   pending everywhere: `outbox list` (under `legacy`), `status`
-   (`legacyPending`), the exit code of `outbox run --once`, and the daemon,
-   which stays up until they are migrated and delivered.
+   `unreadable`, `unknown`), and a completed wait then exits 4. A receipt
+   is final: whoever holds an entry's lease checks for one before sending,
+   and an entry that survived beside its receipt (a crash between the two
+   writes) is only cleaned up as the receipt says, never sent, and the
+   receipt is never rewritten.
+7. Older builds keep their own outboxes, which this build's senders read
+   but theirs never see: builds before engine 4 in `outbox/` (no leases),
+   engine-4 builds (`0.2.0` up to `fa10d88`) in `outbox-v2/`. Their entries
+   are moved into `outbox-v3/` only once no client of theirs can still be
+   sending them: an `outbox/` entry after the 90 s inline grace, under that
+   build's `outbox/sender.lock`; an `outbox-v2/` entry under its own lease,
+   once it has been attempted or is 90 s old, and only if no receipt there
+   says it is finished (then it is cleaned up as the receipt says). Until
+   then they count as pending everywhere: `outbox list` (under `legacy`),
+   `status` (`legacyPending`), the exit code of `outbox run --once`, and the
+   daemon, which stays up until they are migrated and delivered.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -405,7 +412,7 @@ t3-watch separates what it can prove from what only someone else can:
 | `--final-marker <text>` | Also require this text in the final assistant message of the deciding run |
 | `--follow` | Report a failed run as progress and keep following the thread |
 | `--acknowledge <pendingKey>` | Keep waiting past the pending requests this key names |
-| `--timeout <dur>` | Give up after this long (default `4h`) |
+| `--timeout <dur>` | Give up after this long, suspended time included (default `4h`) |
 | `--interval <dur>` | Local poll interval (default `5s`) |
 | `--slice <dur>` | MCP long-poll length (default `30s`; no long-poll exceeds the 30 s attention interval) |
 | `--no-daemon` | Watch in this process instead of the shared daemon |
@@ -446,12 +453,20 @@ Each entry in `threads` has `machine`, `threadId`, `status`, `outcome`,
 `requests`, `resultRunId`, `delegatedSettled`, `delegatedWorkPending`,
 `finalMarkerSeen`, `upstream`, `lastError` and `diagnostic`.
 
-The top level also has `until`, `startedAt` and `endedAt` (UTC, from the
-waiting client), `elapsedMs` (the client's whole wait), `watchId`, `build`
-(this binary's `version`, `engine` and `rev`), `daemon` (the same for the
+The top level also has `until`, `watchId`, `build` (this binary's
+`version`, `engine`, `rev` and `capabilities`), `daemon` (the same for the
 daemon that served the wait, with its pid), and after a daemon restart
 mid-wait `daemonReconnects` and `registrationElapsedMs` (the daemon's time
-since the last re-registration). Each thread also has `observedAt` (when the
+since the last re-registration). Times, all from the waiting client:
+
+- `startedAt`, and `endedAt` (also `observationEndedAt`): when the wait
+  began and when its outcome was decided, UTC. `exitAt` (only in the printed
+  result, after delivery) and `notification.finishedAt` say when delivery
+  ended and the process exited.
+- `elapsedMs` counts time the host spent suspended, like `--timeout` does;
+  `elapsedAwakeMs` does not; `elapsedWallMs` is `endedAt` minus
+  `startedAt`. When the host slept during the wait, `suspendedMs` and a
+  `clock` note say for how long. Each thread also has `observedAt` (when the
 deciding observation was made) and, over MCP, `runCompletedAt` (T3's own
 completion time for the latest run).
 
@@ -476,13 +491,36 @@ regular files owned by you, so a FIFO or device at one of those paths
 costs log lines, nothing else. When a wake comes late or never, the trace
 shows how far the watcher got and when, even if its stdout went nowhere.
 `e2e/timeline.py <trace.jsonl>` prints one wait's steps with the time since
-the run completed.
+the run completed. It judges one acceptance event, the wait's final event
+(or `--id`), by that event's own 2xx; progress events are listed apart and
+never stand in for it.
+
+### Suspend and resume
+
+`--timeout` and every pause count time the host spends suspended (Linux
+`CLOCK_BOOTTIME`, macOS `CLOCK_MONOTONIC`, which include sleep; the clock
+behind most timers does not). The wait loop never sleeps longer than a
+second, so after a resume an expired budget ends the wait at once instead
+of after the time still left on a sleeping timer. An upstream call in
+flight across a suspend (the two clocks drift apart by more than 2 s) is
+cancelled and started again at once, since its connection is usually dead
+and its own timeout would hold back a completion that happened during the
+sleep; so is any call past its budget (the slice plus 60 s). A completion
+during a sleep is therefore seen within one fresh cycle after the resume.
+Each restart is traced as `watch.restart`, and `t3-watch status` counts
+them per watch.
+
+Thread arguments are parsed as URIs: in a `t3-thread://` link and an
+`http(s)` thread URL only the path names the thread, the query and fragment
+are ignored, and a URL with credentials (`user:password@`) or another
+scheme is refused with an error that does not repeat them. A bare thread id
+with `?`, `#`, `@` or whitespace is refused without being echoed.
 
 ## How it works
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-p2.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e5.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -502,9 +540,14 @@ the run completed.
   socket and is never reached, and on a shared `T3_WATCH_SOCKET` the client
   checks the `accepted` line and refuses with `error.kind =
   "incompatible_daemon"` (exit 2), dropping the connection so that daemon's
-  wait ends too. The daemon likewise refuses a request from another
-  revision (`incompatible_client`). An old daemon idles out on its own; stop
-  it sooner with its own binary's `t3-watch stop`.
+  wait ends too. The client also requires every capability it depends on
+  (`outbox-receipts`, `outbox-legacy-drain`, `suspend-aware`) in that line,
+  so a daemon that kept an engine number but lacks a behavior is refused
+  too. The daemon likewise refuses a request from another revision
+  (`incompatible_client`). An old daemon idles out on its own once its
+  clients and its own outbox are done; stop it sooner with its own binary's
+  `t3-watch stop`. Engine 5 (this build) does not reach engine-4 daemons
+  (`0.2.0` up to `fa10d88`, socket `daemon-e4.sock`).
 - Each client sends one request line and blocks in `read()`. It uses no CPU
   and no network until the answer arrives.
 - The daemon keeps one worker per watch key: (origin, pairing, thread,

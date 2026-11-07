@@ -20,15 +20,20 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.2.0 (engine 4, rev 1a2b3c...)`; packaged
-binaries always carry the commit they were built from. A daemon left
-running by an older build listens on another socket (`daemon.sock`,
-`daemon-p2.sock`) and is never used; on a shared `T3_WATCH_SOCKET` the
-client refuses it (`incompatible_daemon`). Old daemons still running their
-outbox senders keep to `outbox/`; this build's entries live in
-`outbox-v2/`. To retire an old daemon at once, run its own binary's
-`t3-watch stop`; otherwise it idles out once its clients and outbox are
-empty (this build moves entries it left in `outbox/` into `outbox-v2/`).
+source revision, e.g. `t3-watch 0.3.0 (engine 5, rev 1a2b3c...)`; packaged
+binaries always carry the commit they were built from.
+
+Upgrading over a running older build (for example `a92f977` or `fa10d88`,
+both engine 4): this build never talks to their daemons (socket
+`daemon-e4.sock` or older; on a shared `T3_WATCH_SOCKET` it refuses them,
+by engine and by missing capabilities) and keeps its entries in
+`outbox-v3/`, which their senders never read. Their daemons keep serving
+their own running clients and idle out afterwards; to retire one sooner,
+run its own binary's `t3-watch stop` once its clients are done. Entries
+they leave in `outbox/` or `outbox-v2/` are drained by this build's daemon
+once no client of theirs can still be sending them (see the README,
+"Durable delivery", item 7), and count as pending until then, so the
+daemon does not idle out with an event unsent.
 
 `<state>/trace.jsonl` records each wait, the daemon build that served it,
 the first proof or settled observation (with T3's `completedAt`), the
@@ -161,7 +166,17 @@ python3 -I e2e/timeline.py ~/.config/t3-watch/trace.jsonl --watch <watchId from 
 It prints each step (run `completedAt`, first proof or settled observation,
 payload end, outbox entry, every HTTP attempt and retry deadline, the 2xx,
 then the receipt and continuation you supply) with the time since
-completion, and a JSON summary to record. It verifies nothing by itself.
+completion, and a JSON summary to record. The acceptance event is the
+wait's final event (or `--id`); only its own 2xx counts, and progress
+events are listed apart. It verifies nothing by itself.
+
+The result's `startedAt`, `endedAt`, `exitAt`, `elapsedMs` (suspended time
+included), `elapsedAwakeMs`, `elapsedWallMs` and `suspendedMs` separate a
+host that slept from a slow server or a slow receiver. Run them through
+the timeline for the box incidents (a `--timeout 10m` watch that ran 18.5
+minutes, a webhook 15.6 minutes after completion): a large `suspendedMs`
+or `watch.restart` lines point at a sleeping host; none, at the server,
+the network or the receiver.
 
 Per scenario:
 
