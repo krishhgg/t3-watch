@@ -39,7 +39,7 @@ fn closed_port() -> u16 {
 }
 
 fn outbox(env: &Env) -> Vec<Value> {
-    let mut out: Vec<Value> = fs::read_dir(env.home.join("outbox"))
+    let mut out: Vec<Value> = fs::read_dir(env.home.join("outbox-v2"))
         .into_iter()
         .flatten()
         .flatten()
@@ -302,4 +302,139 @@ fn the_final_event_is_persisted_while_progress_is_still_being_delivered() {
         .collect();
     got.sort();
     assert_eq!(got, [(1, "run_failed".to_string()), (2, "settled".to_string())]);
+}
+
+// ---- Sol ordinal 4, P2: webhook state does not wait for a slow hook --------
+
+#[test]
+fn retry_after_is_persisted_while_a_slow_hook_still_runs() {
+    // Sol's repro, shortened: 429 Retry-After 3600 on the webhook while the
+    // --on-settle hook is still sleeping.
+    let mock = MockMcp::start();
+    mock.set_thread(T, "completed", 1);
+    let hook = MockHook::start();
+    hook.push(429, &[("Retry-After", "3600")]);
+    let env = mcp_env(&mock);
+    let started_ms = now_ms();
+    let mut child = env
+        .cmd(&[
+            "wait",
+            "--no-daemon",
+            "--durable",
+            "--webhook-url",
+            &hook.url,
+            "--on-settle",
+            "/bin/sleep",
+            "--on-settle-arg",
+            "8",
+            "--on-settle-timeout",
+            "20s",
+            T,
+        ])
+        .spawn()
+        .unwrap();
+    eventually("the Retry-After on disk", Duration::from_secs(5), || {
+        outbox(&env)
+            .first()
+            .and_then(|e| e["notBeforeMs"].as_u64())
+            .is_some_and(|t| t >= started_ms + 3_590_000)
+    });
+    assert!(child.try_wait().unwrap().is_none(), "the hook is still running");
+    // A sender taking over now (as the daemon would) must keep the floor:
+    // it finds the entry leased for the instant the client is still
+    // recording, then deferred, never due.
+    eventually("the sender to defer to Retry-After", Duration::from_secs(3), || {
+        let run = env.run(&["outbox", "run", "--once"]);
+        let r = &output_json(&run)["results"][0];
+        assert!(r["deferred"] == true || r["inFlight"] == true, "{r}");
+        r["deferred"] == true
+    });
+    assert!(child.try_wait().unwrap().is_none(), "the hook is still running");
+    assert_eq!(hook.requests().len(), 1, "no second POST inside the hour");
+    let st = child.wait().unwrap();
+    assert_eq!(st.code(), Some(4));
+    assert_eq!(hook.requests().len(), 1);
+}
+
+#[test]
+fn the_sender_never_races_a_live_inline_delivery() {
+    let mock = MockMcp::start();
+    mock.set_thread(T, "completed", 1);
+    let hook = MockHook::start();
+    hook.set_mode(HookMode::Blackhole);
+    let env = mcp_env(&mock);
+    let mut child = env
+        .cmd(&["wait", "--no-daemon", "--durable", "--webhook-url", &hook.url, T])
+        .spawn()
+        .unwrap();
+    eventually("the entry", Duration::from_secs(10), || outbox(&env).len() == 1);
+    std::thread::sleep(Duration::from_millis(300));
+    // The client is inside its inline POST: the sender must leave it alone,
+    // even forced.
+    let run = env.run(&["outbox", "run", "--once"]);
+    let r = output_json(&run);
+    assert_eq!(r["results"][0]["inFlight"], true, "{r}");
+    assert_eq!(outbox(&env)[0]["attempts"], 0, "the sender touched a leased entry");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // A dead client's lease is gone: the sender delivers.
+    hook.set_mode(HookMode::Normal);
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stdout));
+    assert_eq!(hook.requests().len(), 1);
+}
+
+// ---- diagnostics -----------------------------------------------------------
+
+#[test]
+fn results_and_the_trace_name_builds_and_delivery_timing() {
+    let mock = MockMcp::start();
+    mock.set_thread(T, "completed", 2);
+    mock.with(|s| s.completed_at = Some("2026-11-07T07:00:11.387Z".into()));
+    let hook = MockHook::start();
+    let env = mcp_env(&mock);
+    let out = env.run(&["wait", "--durable", "--webhook-url", &hook.url, T]);
+    assert_eq!(out.status.code(), Some(0));
+    let v = output_json(&out);
+    assert_eq!(v["build"]["engine"], 4);
+    assert_eq!(v["build"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["daemon"]["engine"], 4);
+    assert!(v["daemon"]["pid"].as_u64().is_some());
+    let t = &v["threads"][0];
+    assert_eq!(t["runCompletedAt"], "2026-11-07T07:00:11.387Z");
+    assert!(t["observedAt"].as_str().unwrap().ends_with('Z'));
+
+    let watch_id = v["watchId"].as_str().unwrap();
+    let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+    let lines: Vec<Value> = trace.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    for k in [
+        "wait.start",
+        "daemon.start",
+        "daemon.accepted",
+        "watch.settled",
+        "wait.outcome",
+        "notify.prepared",
+        "outbox.created",
+        "notify.attempt",
+        "notify.result",
+        "wait.exit",
+    ] {
+        assert!(kinds.contains(&k), "{k} missing from {kinds:?}");
+    }
+    let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+    assert!(pos("wait.start") < pos("wait.outcome") && pos("wait.outcome") < pos("notify.attempt"));
+    assert!(pos("notify.attempt") < pos("wait.exit"));
+    let settled = &lines[pos("watch.settled")];
+    assert_eq!(settled["runCompletedAt"], "2026-11-07T07:00:11.387Z");
+    assert_eq!(lines[pos("wait.outcome")]["watchId"], watch_id);
+    assert_eq!(lines[pos("notify.prepared")]["watchId"], watch_id);
+    assert!(lines.iter().all(|l| l["engine"] == 4 && l["at"].as_str().is_some()));
+    // Ids and statuses only: nothing that could carry a secret.
+    assert!(
+        !trace.contains("secret-path-123"),
+        "the webhook URL leaked into the trace"
+    );
+    let version = env.run(&["--version"]);
+    assert!(String::from_utf8_lossy(&version.stdout).contains("engine 4"));
 }

@@ -1,15 +1,27 @@
 //! Durable webhook delivery (`--durable`).
 //!
 //! Before the first attempt, the notification is written to
-//! `<state>/outbox/<id>.json` (0600 in a 0700 directory, fsynced, renamed
+//! `<state>/outbox-v2/<id>.json` (0600 in a 0700 directory, fsynced, renamed
 //! into place). The waiting client then tries it inline. A 2xx removes the
 //! entry; anything else leaves it for the sender, which runs inside the
 //! daemon (or as `t3-watch outbox run`) and retries with exponential
 //! backoff, capped at five minutes, until a 2xx or the entry's expiry, when
-//! it moves to `outbox/dead/`. One sender at a time holds `outbox/sender.lock`.
+//! it moves to `dead/`. One sender at a time holds `sender.lock`.
 //! A server's `Retry-After` is a floor, not a suggestion: it is stored as the
 //! entry's `notBefore` (across the hand-off from the client to the sender
 //! too) and neither the backoff cap nor `outbox run --once` sends earlier.
+//!
+//! Each entry has a lease, an flock on `<id>.lock`: whoever sends it (the
+//! client inline, or the sender) holds the lease for the attempt and for
+//! recording its result, and rereads the entry once it has it. So the two
+//! never send one entry at the same time, and neither writes over the
+//! other's newer state. The client records its webhook result as soon as
+//! the webhook is done, whatever a hook running beside it is doing. A
+//! process that dies drops its lease.
+//!
+//! Builds before this format kept entries in `outbox/` and had no leases;
+//! their senders never look at `outbox-v2/`. Entries of theirs older than
+//! the inline grace are moved here under their own `outbox/sender.lock`.
 //!
 //! Every attempt for an entry carries the same `X-T3-Watch-Id` and
 //! `Idempotency-Key`, so a receiver that got a request but whose answer was
@@ -22,9 +34,10 @@
 
 use crate::config;
 use crate::notify::{self, Webhook};
+use crate::trace;
 use crate::util::{self, Jitter};
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -32,8 +45,10 @@ pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 const BASE_DELAY: Duration = Duration::from_secs(2);
 const MAX_DELAY: Duration = Duration::from_secs(300);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-/// While the client makes its inline attempts the sender leaves the entry
-/// alone; if the client dies, the sender takes over after this.
+/// Between writing an entry and its first inline attempt (which may wait
+/// for earlier progress deliveries) the sender leaves it alone this long;
+/// past that it assumes the client is gone. Inline attempts themselves are
+/// covered by the lease.
 const INLINE_GRACE: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +70,7 @@ pub struct Entry {
     pub not_before_ms: Option<u64>,
     pub last_error: Option<String>,
     pub last_status: Option<u16>,
+    pub last_attempt_ms: Option<u64>,
 }
 
 /// What the client's inline attempts ended with.
@@ -83,6 +99,7 @@ impl Entry {
             "notBeforeMs": self.not_before_ms,
             "lastError": self.last_error,
             "lastStatus": self.last_status,
+            "lastAttemptMs": self.last_attempt_ms,
         })
     }
 
@@ -110,6 +127,7 @@ impl Entry {
             not_before_ms: n("notBeforeMs"),
             last_error: s("lastError"),
             last_status: n("lastStatus").map(|s| s as u16),
+            last_attempt_ms: n("lastAttemptMs"),
         })
     }
 
@@ -135,6 +153,8 @@ impl Entry {
             "notBefore": self.not_before_ms.map(util::rfc3339_ms),
             "lastError": self.last_error,
             "lastStatus": self.last_status,
+            "lastAttemptAt": self.last_attempt_ms.map(util::rfc3339_ms),
+            "inFlight": matches!(try_lease(&self.id), Ok(None)),
         })
     }
 }
@@ -151,14 +171,39 @@ fn path_of(id: &str) -> PathBuf {
     dir().join(format!("{id}.json"))
 }
 
+fn lock_of(id: &str) -> PathBuf {
+    dir().join(format!("{id}.lock"))
+}
+
+/// The exclusive right to send one entry and record the result. Dropped
+/// (or the process gone), the lease is free again.
+pub struct Lease {
+    _file: File,
+}
+
+/// Takes the entry's lease if nobody holds it. `Ok(None)`: someone does.
+pub fn try_lease(id: &str) -> Result<Option<Lease>, String> {
+    if !valid_id(id) {
+        return Err("not an outbox entry id".into());
+    }
+    util::ensure_private_dir(&dir()).map_err(|e| format!("cannot use the outbox directory: {e}"))?;
+    let f = util::open_lock_file(&lock_of(id)).map_err(|e| format!("cannot open the entry lease: {e}"))?;
+    match util::try_flock(&f) {
+        Ok(true) => Ok(Some(Lease { _file: f })),
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!("cannot take the entry lease: {e}")),
+    }
+}
+
 fn save(e: &Entry) -> Result<(), String> {
     util::ensure_private_dir(&config::state_dir())
         .map_err(|err| format!("cannot prepare the state directory: {err}"))?;
+    util::ensure_private_dir(&dir()).map_err(|err| format!("cannot use the outbox directory: {err}"))?;
     util::write_private(&path_of(&e.id), e.to_json().to_string().as_bytes())
         .map_err(|err| format!("cannot write outbox entry: {err}"))
 }
 
-fn load(id: &str) -> Option<Entry> {
+pub fn load(id: &str) -> Option<Entry> {
     let text = fs::read_to_string(path_of(id)).ok()?;
     Entry::from_json(&serde_json::from_str(&text).ok()?)
 }
@@ -186,23 +231,53 @@ pub fn enqueue(w: &Webhook, event: &str, id: &str, body: &[u8], max_age: Duratio
         not_before_ms: None,
         last_error: None,
         last_status: None,
-    })
+        last_attempt_ms: None,
+    })?;
+    trace::record(
+        "outbox.created",
+        json!({ "id": id, "event": event, "createdAt": util::rfc3339_ms(now) }),
+    );
+    Ok(())
+}
+
+/// Whether the client may still make its inline attempts on an entry whose
+/// lease it holds: not when the sender already took it over (it has its own
+/// schedule) or the receiver asked to wait.
+pub fn inline_allowed(e: &Entry) -> bool {
+    e.retries == 0 && e.not_before_ms.is_none_or(|t| t <= util::now_ms())
 }
 
 /// The inline attempts failed: hand the entry to the sender right away.
-pub fn after_inline_failure(id: &str, f: &InlineFailure) -> Result<(), String> {
+/// Call with the entry's lease held.
+pub fn after_inline_failure(id: &str, f: &InlineFailure) -> Result<Entry, String> {
     let mut e = load(id).ok_or("the outbox entry disappeared")?;
     e.attempts += f.attempts;
     e.last_error = Some(f.error.clone());
     e.last_status = f.status;
+    e.last_attempt_ms = Some(util::now_ms());
     e.not_before_ms = f.not_before_ms;
     e.next_attempt_ms = (util::now_ms() + BASE_DELAY.as_millis() as u64).max(f.not_before_ms.unwrap_or(0));
-    save(&e)
+    save(&e)?;
+    trace::record(
+        "outbox.queued",
+        json!({
+            "id": id,
+            "attempts": e.attempts,
+            "lastStatus": e.last_status,
+            "lastError": e.last_error,
+            "nextAttemptAt": util::rfc3339_ms(e.next_attempt_ms),
+            "notBefore": e.not_before_ms.map(util::rfc3339_ms),
+        }),
+    );
+    Ok(e)
 }
 
+/// Removes an entry and its lease file. Call with the lease held: the entry
+/// goes first, so a sender that gets a fresh lease file finds nothing.
 pub fn remove(id: &str) {
     if valid_id(id) {
         let _ = fs::remove_file(path_of(id));
+        let _ = fs::remove_file(lock_of(id));
     }
 }
 
@@ -239,7 +314,54 @@ fn dead_letter(e: &Entry) {
     let dead = dir().join("dead");
     if util::ensure_private_dir(&dead).is_ok() {
         let _ = fs::rename(path_of(&e.id), dead.join(format!("{}.json", e.id)));
+        let _ = fs::remove_file(lock_of(&e.id));
     }
+    trace::record("outbox.dead", json!({ "id": e.id, "attempts": e.attempts }));
+}
+
+/// Moves entries an older build left in `outbox/` into this outbox, under
+/// that build's own sender lock so none of its senders is mid-pass. Only
+/// entries past the inline grace: a client of that build may still be
+/// sending a younger one.
+fn migrate_legacy() -> Vec<Value> {
+    let legacy = config::legacy_outbox_dir();
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(&legacy) else {
+        return out;
+    };
+    let Ok(lock) = util::open_lock_file(&legacy.join("sender.lock")) else {
+        return out;
+    };
+    if !util::try_flock(&lock).unwrap_or(false) {
+        return out;
+    }
+    let cutoff = util::now_ms().saturating_sub(INLINE_GRACE.as_millis() as u64);
+    for f in rd.flatten() {
+        let name = f.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".json").filter(|id| valid_id(id)) else {
+            continue;
+        };
+        let Some(mut e) = fs::read_to_string(f.path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| Entry::from_json(&v))
+        else {
+            continue;
+        };
+        if e.created_ms > cutoff {
+            continue;
+        }
+        if load(id).is_none() {
+            e.next_attempt_ms = e.next_attempt_ms.min(util::now_ms());
+            if save(&e).is_err() {
+                continue;
+            }
+        }
+        let _ = fs::remove_file(f.path());
+        trace::record("outbox.migrated", json!({ "id": id }));
+        out.push(json!({ "id": id, "migrated": true }));
+    }
+    out
 }
 
 fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
@@ -248,21 +370,40 @@ fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
 
 /// One pass over the outbox: sends what is due (with `force`, everything
 /// the receiver has not asked to hold back with `Retry-After`), moves
-/// expired entries to `dead/`. Returns per-entry results. Holds the sender
-/// lock for the pass; if another sender has it, does nothing.
+/// expired entries to `dead/`, and leaves alone any entry whose lease
+/// someone else holds. Returns per-entry results. Holds the sender lock for
+/// the pass; if another sender has it, does nothing.
 pub fn pass(force: bool) -> Result<Vec<Value>, String> {
+    let mut results = migrate_legacy();
     if !dir().is_dir() {
-        return Ok(Vec::new());
+        return Ok(results);
     }
     util::ensure_private_dir(&dir()).map_err(|e| format!("cannot use the outbox directory: {e}"))?;
     let lock =
         util::open_lock_file(&dir().join("sender.lock")).map_err(|e| format!("cannot open the sender lock: {e}"))?;
     if !util::try_flock(&lock).map_err(|e| format!("cannot lock the outbox: {e}"))? {
-        return Ok(vec![json!({ "skipped": "another sender is running" })]);
+        results.push(json!({ "skipped": "another sender is running" }));
+        return Ok(results);
     }
     let mut jitter = Jitter::new();
-    let mut results = Vec::new();
-    for mut e in entries().0 {
+    for listed in entries().0 {
+        let lease = match try_lease(&listed.id) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                results.push(json!({ "id": listed.id, "inFlight": true,
+                                     "reason": "another process is sending this entry now" }));
+                continue;
+            }
+            Err(e) => {
+                results.push(json!({ "id": listed.id, "error": e }));
+                continue;
+            }
+        };
+        // Reread under the lease: whoever held it may have changed it.
+        let Some(mut e) = load(&listed.id) else {
+            drop(lease);
+            continue;
+        };
         let now = util::now_ms();
         if now >= e.expires_ms {
             dead_letter(&e);
@@ -289,15 +430,22 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
             ATTEMPT_TIMEOUT,
             e.attempts,
         );
+        let now = util::now_ms();
+        e.last_attempt_ms = Some(now);
+        trace::record(
+            "outbox.attempt",
+            json!({ "id": e.id, "event": e.event, "attempt": e.attempts, "status": a.status,
+                    "error": a.error, "retryAfterMs": a.retry_after.map(|d| d.as_millis() as u64) }),
+        );
         if a.delivered {
             remove(&e.id);
+            trace::record("outbox.delivered", json!({ "id": e.id, "attempts": e.attempts }));
             results.push(json!({ "id": e.id, "delivered": true, "attempts": e.attempts, "status": a.status }));
             continue;
         }
         e.last_error = a.error;
         e.last_status = a.status;
         // Only our own backoff is capped; the receiver's delay is a floor.
-        let now = util::now_ms();
         e.not_before_ms = a.retry_after.map(|d| now + d.as_millis() as u64);
         let own = now + backoff(e.retries, &mut jitter).min(MAX_DELAY).as_millis() as u64;
         e.next_attempt_ms = own.max(e.not_before_ms.unwrap_or(0));
@@ -312,6 +460,19 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
             "saveError": saved.err(),
         }));
     }
+    // Lease files whose entry is gone (a crash between the two removals).
+    for f in fs::read_dir(dir()).into_iter().flatten().flatten() {
+        let name = f.file_name().to_string_lossy().into_owned();
+        if let Some(id) = name.strip_suffix(".lock").filter(|id| valid_id(id)) {
+            if load(id).is_none() {
+                if let Ok(Some(_lease)) = try_lease(id) {
+                    if load(id).is_none() {
+                        let _ = fs::remove_file(f.path());
+                    }
+                }
+            }
+        }
+    }
     Ok(results)
 }
 
@@ -323,7 +484,7 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
             Ok(results) => {
                 for r in results
                     .iter()
-                    .filter(|r| r.get("id").is_some() && r.get("deferred").is_none())
+                    .filter(|r| r.get("id").is_some() && r.get("deferred").is_none() && r.get("inFlight").is_none())
                 {
                     log(&format!("outbox: {r}"));
                 }
@@ -362,6 +523,7 @@ mod tests {
             retries: 1,
             next_attempt_ms: 4,
             not_before_ms: Some(5),
+            last_attempt_ms: Some(6),
             last_error: Some("host not found".into()),
             last_status: None,
         };

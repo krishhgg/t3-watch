@@ -235,11 +235,28 @@ pub struct ThreadState {
     /// subscriber ignores anything older than its own registration, so a
     /// cached "completed" never wakes someone who just queued a new turn.
     pub observed_at: Instant,
+    /// The same moment on the wall clock (Unix ms), for diagnostics.
+    pub observed_wall_ms: u64,
+    /// T3's `completedAt` for the latest run, when the read listed it.
+    pub run_completed_at: Option<String>,
 }
 
 impl ThreadState {
     pub fn from_thread_json(v: &Value, thread_id: &str, observed_at: Instant) -> Self {
         let t = v.get("thread").filter(|t| t.is_object()).unwrap_or(v);
+        let latest = t.get("latestRunId").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let run_completed_at = v
+            .get("recentRuns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|r| {
+                let id = r.get("runId").and_then(Value::as_str);
+                matches!((id, latest), (Some(a), Some(b)) if a == b
+                    || parse_run(a).is_some_and(|x| parse_run(b) == Some(x)))
+            })
+            .and_then(|r| r.get("completedAt").and_then(Value::as_str))
+            .map(|c| crate::util::sanitize_text(c, 40));
         let s = |k: &str| {
             t.get(k)
                 .and_then(Value::as_str)
@@ -268,6 +285,8 @@ impl ThreadState {
             delegated_pending_hint: None,
             marker_seen: None,
             observed_at,
+            observed_wall_ms: crate::util::now_ms().saturating_sub(observed_at.elapsed().as_millis() as u64),
+            run_completed_at,
         }
     }
 
@@ -483,6 +502,13 @@ impl ThreadState {
         }
         if let Some(l) = &self.link {
             m.insert("link".into(), json!(l));
+        }
+        m.insert(
+            "observedAt".into(),
+            json!(crate::util::rfc3339_ms(self.observed_wall_ms)),
+        );
+        if let Some(c) = &self.run_completed_at {
+            m.insert("runCompletedAt".into(), json!(c));
         }
         if let Some(d) = self.diagnostic() {
             m.insert("diagnostic".into(), json!(d));

@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_t3-watch");
+/// The daemon socket of this engine revision under `T3_WATCH_HOME`.
+pub const SOCK: &str = "daemon-e4.sock";
 pub const TOKEN: &str = "test-token-read-only";
 
 pub struct MockState {
@@ -107,6 +109,10 @@ pub struct MockState {
     pub child_final_reads: usize,
     /// requestId -> what `t3_pending_request read` returns.
     pub pending_reads: HashMap<String, Value>,
+    /// Fields merged into every turn-mode probe answer (null removes).
+    pub probe_override: Map<String, Value>,
+    /// `completedAt` of the latest run in header reads' `recentRuns`.
+    pub completed_at: Option<String>,
 }
 
 impl Default for MockState {
@@ -158,6 +164,8 @@ impl Default for MockState {
             after_read: HashMap::new(),
             child_final_reads: 0,
             pending_reads: HashMap::new(),
+            probe_override: Map::new(),
+            completed_at: None,
         }
     }
 }
@@ -557,7 +565,7 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                 if !busy {
                     v["resultRun"] = json!({ "runId": format!("run:thread:{tid}:ordinal:{ord}"), "status": status });
                 }
-                Ok(v)
+                Ok(merged(v, &s.probe_override))
             }
         },
         "t3_thread_wait" => {
@@ -677,8 +685,14 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                     if let Some((t, status, ord)) = s.after_read.remove(&n) {
                         s.threads.insert(t, (status, ord));
                     }
+                    let recent = match &s.completed_at {
+                        Some(at) if !is_active(&status) => {
+                            json!([{ "runId": run, "ordinal": ord, "status": status, "completedAt": at }])
+                        }
+                        _ => json!([]),
+                    };
                     Ok(json!({ "thread": merged(thread, &s.read_override),
-                               "recentRuns": [], "items": items, "hasMore": false }))
+                               "recentRuns": recent, "items": items, "hasMore": false }))
                 }
             }
         }

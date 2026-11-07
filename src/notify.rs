@@ -12,6 +12,7 @@
 //! URL, header, key or response body.
 
 use crate::outbox;
+use crate::trace;
 use crate::util::{self, Jitter};
 use serde_json::{json, Value};
 use std::fs;
@@ -323,6 +324,19 @@ impl Notify {
             (Some(w), Some(max_age)) => Some(outbox::enqueue(w, event, &id, body, max_age)),
             _ => None,
         };
+        let meta: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        trace::record(
+            "notify.prepared",
+            json!({
+                "id": id,
+                "event": event,
+                "watchId": meta.get("watchId"),
+                "eventSeq": meta.get("eventSeq"),
+                "endedAt": meta.get("endedAt"),
+                "durable": queued.is_some(),
+                "queueError": queued.as_ref().and_then(|q| q.as_ref().err()),
+            }),
+        );
         Some(Prepared {
             event: event.to_string(),
             id,
@@ -332,9 +346,11 @@ impl Notify {
     }
 
     /// Attempts a prepared event: the webhook and the hook in parallel. With
-    /// `--durable` a 2xx removes the outbox entry; anything else hands it to
-    /// the sender, with any server `Retry-After` as its not-before time.
-    /// Returns a JSON summary with an overall `delivered` flag.
+    /// `--durable`, the webhook side takes the entry's lease, rereads it, and
+    /// records its result the moment the webhook is done (a 2xx removes the
+    /// entry; anything else hands it to the sender with any `Retry-After` as
+    /// its not-before time), without waiting for the hook. Returns a JSON
+    /// summary with an overall `delivered` flag.
     pub fn send(&self, p: Prepared) -> Value {
         let Prepared {
             event,
@@ -343,12 +359,13 @@ impl Notify {
             queued,
         } = p;
         let (event, body) = (event.as_str(), body.as_slice());
+        let durable = queued.as_ref().map(|q| q.clone().err());
         let (webhook, hook) = thread::scope(|scope| {
             let web = self.webhook.as_ref().map(|w| {
-                let id = id.as_str();
+                let (id, durable) = (id.as_str(), durable.clone());
                 thread::Builder::new()
                     .name("webhook".into())
-                    .spawn_scoped(scope, move || post_webhook(w, event, id, body))
+                    .spawn_scoped(scope, move || webhook_side(w, event, id, body, durable))
             });
             let hook = self.hook.as_ref().map(|h| run_hook(h, event, body));
             let web = web.map(|spawned| match spawned {
@@ -356,37 +373,27 @@ impl Notify {
                     .join()
                     .unwrap_or_else(|_| json!({"delivered": false, "error": "webhook thread panicked"})),
                 // No thread to spare: deliver on this one.
-                Err(_) => post_webhook(self.webhook.as_ref().unwrap(), event, &id, body),
+                Err(_) => webhook_side(self.webhook.as_ref().unwrap(), event, &id, body, durable.clone()),
             });
             (web, hook)
         });
-        let mut webhook = webhook;
-        if let (Some(queued), Some(w)) = (queued, webhook.as_mut()) {
-            match queued {
-                Ok(()) if w["delivered"] == true => outbox::remove(&id),
-                Ok(()) => {
-                    let failure = outbox::InlineFailure {
-                        attempts: w["attempts"].as_u64().unwrap_or(0) as u32,
-                        error: w["error"].as_str().unwrap_or("not delivered").to_string(),
-                        status: w["status"].as_u64().map(|s| s as u16),
-                        not_before_ms: w["notBeforeMs"].as_u64(),
-                    };
-                    match outbox::after_inline_failure(&id, &failure) {
-                        Ok(()) => {
-                            w["queued"] = json!(true);
-                            w["outboxId"] = json!(id);
-                        }
-                        Err(e) => w["queueError"] = json!(e),
-                    }
-                }
-                Err(e) => w["queueError"] = json!(e),
-            }
-        }
         let ok = |v: &Option<Value>| v.as_ref().is_none_or(|v| v["delivered"] == true);
         let mut out = json!({ "delivered": ok(&webhook) && ok(&hook), "id": id });
         if webhook.as_ref().is_some_and(|w| w["queued"] == true) {
             out["queued"] = json!(true);
         }
+        trace::record(
+            "notify.result",
+            json!({
+                "id": id,
+                "event": event,
+                "delivered": out["delivered"],
+                "queued": out.get("queued"),
+                "webhookStatus": webhook.as_ref().and_then(|w| w.get("status")),
+                "webhookError": webhook.as_ref().and_then(|w| w.get("error")),
+                "hookExit": hook.as_ref().and_then(|h| h.get("exitCode")),
+            }),
+        );
         if let Some(w) = webhook {
             out["webhook"] = w;
         }
@@ -508,6 +515,65 @@ pub fn post_once(
     }
 }
 
+/// The webhook half of `send`. `durable` is `None` without `--durable`,
+/// `Some(None)` when the outbox entry was written, `Some(Some(error))` when
+/// writing it failed.
+fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option<Option<String>>) -> Value {
+    let Some(queue_error) = durable else {
+        return post_webhook(w, event, id, body);
+    };
+    if let Some(e) = queue_error {
+        let mut r = post_webhook(w, event, id, body);
+        r["queueError"] = json!(e);
+        return r;
+    }
+    let lease = match outbox::try_lease(id) {
+        Ok(Some(l)) => l,
+        // The sender took the entry over (the client was slow to get here)
+        // and is sending it right now: it owns the delivery.
+        Ok(None) => {
+            return json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
+                           "inFlight": "the outbox sender is delivering this event" })
+        }
+        Err(e) => {
+            let mut r = post_webhook(w, event, id, body);
+            r["queueError"] = json!(e);
+            return r;
+        }
+    };
+    // Reread under the lease: the sender may already have delivered it, or
+    // own its schedule now.
+    let Some(entry) = outbox::load(id) else {
+        return json!({ "delivered": true, "attempts": 0, "by": "outbox sender" });
+    };
+    if !outbox::inline_allowed(&entry) {
+        return json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
+                       "nextAttemptAt": util::rfc3339_ms(entry.next_attempt_ms),
+                       "notBefore": entry.not_before_ms.map(util::rfc3339_ms) });
+    }
+    let mut r = post_webhook(w, event, id, body);
+    if r["delivered"] == true {
+        outbox::remove(id);
+    } else {
+        let failure = outbox::InlineFailure {
+            attempts: r["attempts"].as_u64().unwrap_or(0) as u32,
+            error: r["error"].as_str().unwrap_or("not delivered").to_string(),
+            status: r["status"].as_u64().map(|s| s as u16),
+            not_before_ms: r["notBeforeMs"].as_u64(),
+        };
+        match outbox::after_inline_failure(id, &failure) {
+            Ok(e) => {
+                r["queued"] = json!(true);
+                r["outboxId"] = json!(id);
+                r["nextAttemptAt"] = json!(util::rfc3339_ms(e.next_attempt_ms));
+            }
+            Err(e) => r["queueError"] = json!(e),
+        }
+    }
+    drop(lease);
+    r
+}
+
 fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
     let agent = agent_for(w);
     let budget_end = Instant::now() + WEBHOOK_BUDGET;
@@ -525,6 +591,12 @@ fn post_webhook(w: &Webhook, event: &str, id: &str, body: &[u8]) -> Value {
         }
         attempts += 1;
         let a = post_once(&agent, w, event, id, body, remaining.min(ATTEMPT_TIMEOUT), attempts);
+        trace::record(
+            "notify.attempt",
+            json!({ "id": id, "event": event, "attempt": attempts, "delivered": a.delivered,
+                    "status": a.status, "error": a.error,
+                    "retryAfterMs": a.retry_after.map(|d| d.as_millis() as u64) }),
+        );
         last_status = a.status.or(last_status);
         if a.delivered {
             return json!({ "delivered": true, "attempts": attempts, "status": a.status });

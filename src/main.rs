@@ -10,7 +10,9 @@ mod model;
 mod notify;
 mod oauth;
 mod outbox;
+mod trace;
 mod util;
+mod version;
 
 use config::Config;
 use engine::{error_json, Hub, Outcome, TargetSpec, Transport, WaitRequest, LOCAL_MACHINE};
@@ -661,7 +663,12 @@ fn cmd_wait(raw: &[String]) -> ! {
     // operational or not, becomes an outcome that goes through delivery: an
     // unattended bot with --notify-on all hears about a broken config too.
     let mut reconnects = 0;
+    let mut daemon_build: Option<Value> = None;
     let mut heartbeat = None;
+    trace::record(
+        "wait.start",
+        json!({ "watchId": watch_id, "threads": threads, "noDaemon": no_daemon, "durable": a.has("durable") }),
+    );
     let mut outcome = match prepare_wait(&a) {
         Err(e) => Outcome::Error(e),
         Ok(req) => {
@@ -698,8 +705,9 @@ fn cmd_wait(raw: &[String]) -> ! {
                     );
                 }
                 match daemon::wait(&req, &mut on_progress) {
-                    Ok((o, n)) => {
-                        reconnects = n;
+                    Ok((o, info)) => {
+                        reconnects = info.reconnects;
+                        daemon_build = info.build;
                         o
                     }
                     Err(e) => Outcome::Error(error_json("daemon", &e)),
@@ -727,9 +735,31 @@ fn cmd_wait(raw: &[String]) -> ! {
         v["endedAt"] = json!(util::rfc3339_ms(util::now_ms()));
         v["watchId"] = json!(watch_id);
         v["eventSeq"] = json!(next_seq());
+        v["build"] = version::json();
+        if let Some(d) = &daemon_build {
+            v["daemon"] = d.clone();
+        }
         if reconnects > 0 {
             v["daemonReconnects"] = json!(reconnects);
         }
+        trace::record(
+            "wait.outcome",
+            json!({
+                "watchId": watch_id,
+                "event": event,
+                "outcome": v["outcome"],
+                "endedAt": v["endedAt"],
+                "daemon": daemon_build,
+                "threads": v["threads"].as_array().map(|ts| ts.iter().map(|t| json!({
+                    "threadId": t["threadId"],
+                    "status": t["status"],
+                    "runOrdinal": t["runOrdinal"],
+                    "resultRunId": t.get("resultRunId"),
+                    "observedAt": t.get("observedAt"),
+                    "runCompletedAt": t.get("runCompletedAt"),
+                })).collect::<Vec<_>>()),
+            }),
+        );
         prepared = notify.prepare(event, v.to_string().as_bytes());
     }
     // Earlier progress goes out (or is queued) before the final event.
@@ -755,6 +785,7 @@ fn cmd_wait(raw: &[String]) -> ! {
     if let Some(v) = outcome.json() {
         print_json(v, pretty);
     }
+    trace::record("wait.exit", json!({ "watchId": watch_id, "code": code }));
     exit(code)
 }
 
@@ -804,8 +835,14 @@ fn cmd_outbox(raw: &[String]) -> ! {
             if !outbox::valid_id(id) {
                 fail_json("usage", "not an outbox entry id");
             }
-            let existed = config::outbox_dir().join(format!("{id}.json")).exists();
+            let lease = match outbox::try_lease(id) {
+                Ok(Some(l)) => l,
+                Ok(None) => fail_json("outbox", "that entry is being delivered right now; try again"),
+                Err(e) => fail_json("outbox", &e),
+            };
+            let existed = outbox::load(id).is_some();
             outbox::remove(id);
+            drop(lease);
             print_json(&json!({ "ok": existed, "id": id }), pretty);
             exit(if existed { 0 } else { 2 })
         }
@@ -940,7 +977,7 @@ fn main() {
             Ok(None) => write_stdout("{\"ok\":true,\"running\":false}\n"),
             Err(e) => fail_json("daemon", &e),
         },
-        Some("-V" | "--version" | "version") => write_stdout(&format!("t3-watch {}\n", env!("CARGO_PKG_VERSION"))),
+        Some("-V" | "--version" | "version") => write_stdout(&format!("{}\n", version::line())),
         Some("-h" | "--help" | "help") | None => write_stdout(USAGE),
         Some(other) => usage_error(&format!("unknown command {other:?}")),
     }

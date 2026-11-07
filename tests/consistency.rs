@@ -311,3 +311,60 @@ fn a_running_child_with_pending_input_is_reported_without_reading_its_timeline()
             .all(|a| matches!(a["action"].as_str(), Some("list" | "read"))));
     });
 }
+
+// ---- Sol ordinal 4, P1: the turn probe's resultRun ---------------------------
+
+#[test]
+fn a_newer_failed_result_run_named_by_the_probe_voids_completion() {
+    // Sol's repro: the header shows run 2 completed; the probe's runId is
+    // still run 2 but its resultRun is run 3, failed; run 3 is the real
+    // latest run.
+    let mock = MockMcp::start();
+    mock.set_thread(P, "completed", 2);
+    mock.with(|s| {
+        s.after_read.insert(2, (P.into(), "failed".into(), 3));
+        s.probe_override.insert("runId".into(), json!(run_id(P, 2)));
+        s.probe_override.insert("status".into(), json!("completed"));
+        s.probe_override.insert("timedOut".into(), json!(false));
+        s.probe_override
+            .insert("resultRun".into(), json!({"runId": run_id(P, 3), "status": "failed"}));
+    });
+    let hook = MockHook::start();
+    let env = mcp_env(&mock);
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "10s", "--webhook-url", &hook.url, P]);
+    let v = output_json(&out);
+    assert_ne!(out.status.code(), Some(0), "run 2 announced as completed: {v}");
+    assert_eq!(out.status.code(), Some(6), "{}", both(&out));
+    assert_eq!(v["threads"][0]["runOrdinal"], 3);
+    assert_eq!(v["outcome"], "failed");
+    let ev = events(&hook);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0].1["outcome"], "failed");
+    assert_eq!(ev[0].1["threads"][0]["runOrdinal"], 3);
+}
+
+#[test]
+fn a_completed_parent_with_running_children_still_completes_with_the_hint() {
+    for same_result in [false, true] {
+        let mock = MockMcp::start();
+        mock.set_thread(P, "completed", 2);
+        mock.with(|s| {
+            s.delegated_pending.insert(P.into());
+            // Whatever the probe says about the aggregate, it names no
+            // newer parent run.
+            s.probe_override.insert("status".into(), json!("running"));
+            if same_result {
+                s.probe_override.insert(
+                    "resultRun".into(),
+                    json!({"runId": run_id(P, 2), "status": "completed"}),
+                );
+            }
+        });
+        let env = mcp_env(&mock);
+        let out = env.run(&["wait", "--no-daemon", "--timeout", "10s", P]);
+        assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+        let v = output_json(&out);
+        assert_eq!(v["threads"][0]["runOrdinal"], 2);
+        assert_eq!(v["threads"][0]["delegatedWorkPending"], true, "{v}");
+    }
+}

@@ -261,7 +261,7 @@ fn killed_client_is_unsubscribed_and_daemon_idles_out() {
         assert!(Instant::now() < deadline, "daemon {pid} did not exit when idle");
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!env.home.join("daemon-p2.sock").exists());
+    assert!(!env.home.join(SOCK).exists());
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn state_dir_and_socket_are_private() {
     let out = env.run(&["wait", T]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(mode(&env.home), 0o700);
-    assert_eq!(mode(&env.home.join("daemon-p2.sock")) & 0o077, 0);
+    assert_eq!(mode(&env.home.join(SOCK)) & 0o077, 0);
     assert_eq!(mode(&env.home.join("daemon.log")), 0o600);
 }
 

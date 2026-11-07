@@ -684,7 +684,7 @@ fn something_else_at_the_socket_path_is_never_deleted() {
     let env = Env::new();
     let t3 = MockT3::new(&env);
     t3.set("lt", "completed", 1);
-    let sock = env.home.join("daemon-p2.sock");
+    let sock = env.home.join(SOCK);
     fs::write(&sock, "not a socket").unwrap();
     let out = env.run(&["wait", "--transport", "local", "--t3-bin", t3.bin_str(), "lt"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout_and_stderr(&out));
@@ -700,7 +700,7 @@ fn a_symlinked_lock_file_is_refused() {
     let env = Env::new();
     let victim = env.home.join("victim");
     fs::write(&victim, "keep").unwrap();
-    std::os::unix::fs::symlink(&victim, env.home.join("daemon-p2.sock.lock")).unwrap();
+    std::os::unix::fs::symlink(&victim, env.home.join(format!("{SOCK}.lock"))).unwrap();
     let out = env.run(&["daemon"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("lock"));
@@ -714,7 +714,7 @@ fn clients_refuse_a_socket_open_to_other_users() {
     t3.set("lt", "running", 1);
     let mut child = env.spawn(&["wait", "--transport", "local", "--t3-bin", t3.bin_str(), "lt"]);
     env.wait_status("subscriber", secs(10), |s| Env::subscribers(s) == 1);
-    let sock = env.home.join("daemon-p2.sock");
+    let sock = env.home.join(SOCK);
     fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap();
     let out = env.run(&["status"]);
     assert_eq!(out.status.code(), Some(2));
@@ -899,7 +899,7 @@ fn the_daemon_rejects_oversized_or_unterminated_requests() {
     let env = Env::new();
     let mut daemon = env.spawn(&["daemon", "--idle-exit", "30s"]);
     env.wait_status("daemon", secs(10), |s| s["running"] == true);
-    let sock = env.home.join("daemon-p2.sock");
+    let sock = env.home.join(SOCK);
 
     let s = UnixStream::connect(&sock).unwrap();
     let mut w = s.try_clone().unwrap();

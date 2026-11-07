@@ -108,6 +108,7 @@ impl WaitRequest {
         let p = &self.predicate;
         json!({
             "op": "wait",
+            "engine": crate::version::ENGINE,
             "targets": targets,
             "mode": if self.any { "any" } else { "all" },
             "until": if p.until_delegated { "workstream" } else { "turn" },
@@ -402,6 +403,8 @@ struct Caches {
     seen_latest: Option<String>,
     /// The watch has read the header at least once (before its first wait).
     primed: bool,
+    /// The last run whose settlement went into the delivery trace.
+    traced: Option<String>,
 }
 
 struct Watch {
@@ -1718,7 +1721,45 @@ impl Watch {
                 }
             }
         }
+        self.trace_settlement(&state, *until_delegated);
         Ok(Cycle { state, next })
+    }
+
+    /// Records, once per run, when this watch first saw it settled (turn
+    /// mode) or first had T3's proof for it (workstream mode), next to T3's
+    /// own `completedAt`: the first link of the delivery trace.
+    fn trace_settlement(&self, state: &ThreadState, workstream: bool) {
+        let run = if workstream {
+            state.delegated_settled.then(|| state.result_run_id.clone()).flatten()
+        } else if state.class() == StatusClass::Settled && state.active_run_id.is_none() {
+            state.latest_run_id.clone()
+        } else {
+            None
+        };
+        let Some(run) = run else {
+            return;
+        };
+        {
+            let mut c = lock(&self.caches);
+            if c.traced.as_deref() == Some(run.as_str()) {
+                return;
+            }
+            c.traced = Some(run.clone());
+        }
+        crate::trace::record(
+            if workstream { "watch.proof" } else { "watch.settled" },
+            json!({
+                "threadId": state.thread_id,
+                "runId": run,
+                "status": state.status,
+                "resultRunStatus": state.result_status,
+                "latestRunId": state.latest_run_id,
+                "runCompletedAt": state.run_completed_at,
+                "observedAt": util::rfc3339_ms(state.observed_wall_ms),
+                "markerSeen": state.marker_seen,
+                "needsInput": state.needs_input(),
+            }),
+        );
     }
 
     /// The cycle's observation was contradicted by a later response: report
@@ -1864,8 +1905,9 @@ impl Watch {
     /// Turn mode only: asks T3, without waiting, whether delegated work the
     /// finished turn started is still running. A hint for the caller. Also
     /// returns why the answer contradicts the header, when it names a newer
-    /// run of this thread (its status is not used for that: a timed-out
-    /// probe may describe the delegated work rather than the parent run).
+    /// run of this thread, in `runId` or in `resultRun`. Its status is not
+    /// used for that: a timed-out probe may describe the delegated work of
+    /// a completed parent rather than the parent run itself.
     fn probe_delegated(
         &self,
         client: &McpClient,
@@ -1890,20 +1932,22 @@ impl Watch {
         match client.call_tool(agent, cancel, "t3_thread_wait", args, Duration::from_secs(30)) {
             Ok(v) => {
                 let w = WaitReply::parse(&v);
-                let newer = w
-                    .run_id
-                    .as_deref()
-                    .and_then(|r| run_ordinal_of(&state.thread_id, r))
-                    .zip(state.ordinal())
-                    .is_some_and(|(probe, seen)| probe > seen);
-                if newer {
-                    let probe_run = w.run_id.as_deref().unwrap_or_default();
+                let seen = state.ordinal();
+                let newer = [w.run_id.as_deref(), w.result_run.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|r| {
+                        run_ordinal_of(&state.thread_id, r)
+                            .zip(seen)
+                            .is_some_and(|(p, s)| p > s)
+                    });
+                if let Some(probe_run) = newer {
                     return Ok((
                         None,
                         Some(format!(
-                            "the delegated-work probe saw {} after the header showed run {}",
+                            "the delegated-work probe named {} after the header showed run {}",
                             util::sanitize_text(probe_run, 160),
-                            state.ordinal().unwrap_or(0)
+                            seen.unwrap_or(0)
                         )),
                     ));
                 }

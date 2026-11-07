@@ -53,7 +53,7 @@ fn closed_port() -> u16 {
 }
 
 fn outbox_files(env: &Env) -> Vec<String> {
-    fs::read_dir(env.home.join("outbox"))
+    fs::read_dir(env.home.join("outbox-v2"))
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -112,8 +112,8 @@ fn a_dns_failure_is_queued_privately_not_lost() {
 
     // Kept, private, and listed without secrets.
     assert_eq!(outbox_files(&env), [format!("{id}.json")]);
-    assert_eq!(mode(&env.home.join("outbox")), 0o700);
-    assert_eq!(mode(&env.home.join("outbox").join(format!("{id}.json"))), 0o600);
+    assert_eq!(mode(&env.home.join("outbox-v2")), 0o700);
+    assert_eq!(mode(&env.home.join("outbox-v2").join(format!("{id}.json"))), 0o600);
     let list = env.run(&["outbox", "list"]);
     assert_eq!(list.status.code(), Some(0));
     let text = String::from_utf8_lossy(&list.stdout).to_string();
@@ -236,7 +236,12 @@ fn an_expired_entry_moves_to_dead_letters() {
     let r = output_json(&run);
     assert_eq!(r["results"][0]["deadLettered"], true, "{r}");
     assert!(outbox_files(&env).is_empty());
-    assert!(env.home.join("outbox").join("dead").join(format!("{id}.json")).exists());
+    assert!(env
+        .home
+        .join("outbox-v2")
+        .join("dead")
+        .join(format!("{id}.json"))
+        .exists());
 }
 
 #[test]

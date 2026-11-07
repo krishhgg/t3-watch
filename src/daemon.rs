@@ -7,6 +7,12 @@
 //! size-bounded; every read and write has a timeout except the long wait
 //! itself.
 //!
+//! Both sides check the engine revision (`version::ENGINE`) before a wait
+//! means anything: the daemon refuses a request from another revision, and
+//! the client refuses an `accepted` line that does not name its own. A
+//! daemon from a build with other result semantics is therefore never
+//! trusted, even on a custom socket shared by both.
+//!
 //! The daemon also runs the durable-notification sender (`outbox`) and does
 //! not idle-exit while the outbox holds entries.
 //!
@@ -18,7 +24,9 @@
 use crate::config;
 use crate::engine::{error_json, Hub, Outcome, SubMsg, WaitRequest};
 use crate::outbox;
+use crate::trace;
 use crate::util;
+use crate::version;
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -163,10 +171,12 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
     let limit = max_connections();
     let waits = Arc::new(AtomicUsize::new(0));
     log(&format!(
-        "listening on {} (idle exit {:?}, max {limit} waiting clients)",
+        "listening on {} (idle exit {:?}, max {limit} waiting clients; {})",
         sock.display(),
-        idle_exit
+        idle_exit,
+        version::line()
     ));
+    trace::record("daemon.start", json!({ "socket": sock.display().to_string() }));
 
     let hub = Hub::new("daemon");
     let connections = Arc::new(AtomicUsize::new(0));
@@ -323,9 +333,13 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
         Err(e) => return write_line(&stream, &error_json("protocol", &format!("bad request: {e}"))),
     };
     match req.get("op").and_then(Value::as_str).unwrap_or("") {
-        "ping" => write_line(&stream, &json!({ "ok": true, "pid": std::process::id() })),
+        "ping" => write_line(
+            &stream,
+            &json!({ "ok": true, "pid": std::process::id(), "build": version::json() }),
+        ),
         "status" => {
             let mut v = hub.status_json();
+            v["build"] = version::json();
             v["outbox"] = outbox::summary_json();
             write_line(&stream, &v)
         }
@@ -335,6 +349,23 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
             shutdown(sock)
         }
         "wait" => {
+            let engine = req.get("engine").and_then(Value::as_u64);
+            if engine != Some(u64::from(version::ENGINE)) {
+                return write_line(
+                    &stream,
+                    &error_json(
+                        "incompatible_client",
+                        &format!(
+                            "this daemon runs engine {} ({}); the client sent engine {}, so its \
+                             request may mean something else here. Use a t3-watch of the same engine \
+                             revision on this socket",
+                            version::ENGINE,
+                            version::line(),
+                            engine.map_or_else(|| "none".to_string(), |e| e.to_string())
+                        ),
+                    ),
+                );
+            }
             let Some(_slot) = slots.take() else {
                 return write_line(
                     &stream,
@@ -370,7 +401,13 @@ fn handle(hub: &Arc<Hub>, stream: UnixStream, sock: &Path, slots: &WaitSlots) ->
             }
             write_line(
                 &stream,
-                &json!({ "event": "accepted", "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION") }),
+                &json!({
+                    "event": "accepted",
+                    "pid": std::process::id(),
+                    "version": version::VERSION,
+                    "engine": version::ENGINE,
+                    "rev": version::REV,
+                }),
             )?;
             let outcome = hub.wait(&wreq, tx, rx, &mut |p| {
                 let _ = write_line(&stream, &p);
@@ -484,11 +521,62 @@ pub fn request(op: &str) -> Result<Option<Value>, String> {
     read_response(&stream).map(Some)
 }
 
+/// What the client learned about the daemon that served a wait.
+pub struct DaemonInfo {
+    pub reconnects: u32,
+    /// The `accepted` line's pid, version, engine and rev.
+    pub build: Option<Value>,
+}
+
+/// Why a daemon's answer cannot be trusted by this client, if it cannot:
+/// only an `accepted` line naming this engine revision makes what follows
+/// mean what this build means.
+fn incompatible(accepted: Option<&Value>, first: &Value, sock: &Path) -> Option<String> {
+    let engine = match accepted {
+        Some(a) => a.get("engine").and_then(Value::as_u64),
+        // An error before `accepted` is safe to pass on (a limit, a usage
+        // error, or a newer daemon refusing us); anything else is not.
+        None if first.get("event").and_then(Value::as_str) == Some("error") => return None,
+        None => None,
+    };
+    if engine == Some(u64::from(version::ENGINE)) {
+        return None;
+    }
+    let who = accepted.map_or_else(
+        || "an unidentified daemon".to_string(),
+        |a| {
+            format!(
+                "t3-watch {} (engine {}, rev {}, pid {})",
+                a.get("version").and_then(Value::as_str).unwrap_or("?"),
+                a.get("engine").map_or_else(|| "none".to_string(), |e| e.to_string()),
+                a.get("rev").and_then(Value::as_str).unwrap_or("?"),
+                a.get("pid").map_or_else(|| "?".to_string(), |p| p.to_string()),
+            )
+        },
+    );
+    Some(format!(
+        "the daemon at {} is {who}, but this client is {}: its results may mean something \
+         else, so none is trusted. Stop that daemon with its own t3-watch (`t3-watch stop`) or \
+         let it idle out, or point T3_WATCH_SOCKET elsewhere",
+        sock.display(),
+        version::line()
+    ))
+}
+
 /// Reads the daemon's answer to a wait, handing progress lines to
 /// `progress`. `None` means the connection dropped before an outcome
-/// arrived.
-fn read_outcome(stream: &UnixStream, started: Instant, progress: &mut dyn FnMut(Value)) -> Option<Outcome> {
+/// arrived. An answer from a daemon of another engine revision becomes an
+/// `incompatible_daemon` error, and the connection is dropped, which
+/// cancels that daemon's wait.
+fn read_outcome(
+    stream: &UnixStream,
+    started: Instant,
+    sock: &Path,
+    build: &mut Option<Value>,
+    progress: &mut dyn FnMut(Value),
+) -> Option<Outcome> {
     let mut reader = BufReader::new(stream);
+    let mut accepted: Option<Value> = None;
     loop {
         let line = match read_line_bounded(&mut reader, MAX_RESPONSE_LINE) {
             Ok(l) => l,
@@ -506,22 +594,40 @@ fn read_outcome(stream: &UnixStream, started: Instant, progress: &mut dyn FnMut(
             Err(_) => return None,
         };
         let v = serde_json::from_slice::<Value>(&line).ok()?;
+        let is_accepted = v.get("event").and_then(Value::as_str) == Some("accepted");
+        if accepted.is_none() {
+            let candidate = is_accepted.then_some(&v);
+            if let Some(why) = incompatible(candidate, &v, sock) {
+                trace::record("daemon.incompatible", json!({ "daemon": candidate, "reason": why }));
+                return Some(Outcome::Error(error_json("incompatible_daemon", &why)));
+            }
+            if is_accepted {
+                trace::record("daemon.accepted", json!({ "daemon": v }));
+                *build = Some(v.clone());
+                accepted = Some(v);
+                continue;
+            }
+        }
         if v.get("progress").and_then(Value::as_bool) == Some(true) {
             progress(v);
-        } else if v.get("event").and_then(Value::as_str) != Some("accepted") {
+        } else if !is_accepted {
             return Some(Outcome::from_json(v));
         }
     }
 }
 
-/// Runs a wait through the daemon and returns the outcome with the number of
-/// times the client had to reconnect. If the daemon dies mid-wait (crash,
+/// Runs a wait through the daemon and returns the outcome with what the
+/// client learned about the daemon. If the daemon dies mid-wait (crash,
 /// upgrade, idle-exit race) the client reconnects and re-registers with the
 /// remaining time; the daemon's `elapsedMs` then counts from the last
 /// registration only.
-pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, u32), String> {
+pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, DaemonInfo), String> {
     let started = Instant::now();
-    let mut reconnects = 0;
+    let sock = config::socket_path();
+    let mut info = DaemonInfo {
+        reconnects: 0,
+        build: None,
+    };
     loop {
         let stream = connect_or_spawn()?;
         let mut r = req.clone();
@@ -534,14 +640,15 @@ pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outco
         // answer at all, the daemon exited after we connected (idle exit or
         // `stop`): reconnect like any other dropped connection.
         let _ = write_line(&stream, &r.to_json());
-        if let Some(outcome) = read_outcome(&stream, started, progress) {
-            return Ok((outcome, reconnects));
+        if let Some(outcome) = read_outcome(&stream, started, &sock, &mut info.build, progress) {
+            return Ok((outcome, info));
         }
-        reconnects += 1;
-        if reconnects > 5 {
+        info.reconnects += 1;
+        trace::record("daemon.reconnect", json!({ "reconnects": info.reconnects }));
+        if info.reconnects > 5 {
             return Err("daemon kept closing the connection".into());
         }
-        thread::sleep(Duration::from_millis(50 * reconnects as u64));
+        thread::sleep(Duration::from_millis(50 * u64::from(info.reconnects)));
     }
 }
 

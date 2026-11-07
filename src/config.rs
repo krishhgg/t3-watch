@@ -4,9 +4,12 @@
 //!   machines.json     saved machines and their read-only tokens (0600)
 //!   config.lock       held while machines.json is read, changed and written
 //!   pending/          in-progress headless OAuth logins (0600 files)
-//!   daemon-p2.sock    the multiplexer socket (0600)
-//!   daemon-p2.sock.lock held by the running daemon
-//!   outbox/           durable notifications not yet delivered (0700, entries 0600)
+//!   daemon-e<N>.sock  the multiplexer socket for engine revision N (0600)
+//!   daemon-e<N>.sock.lock held by the running daemon
+//!   outbox-v2/        durable notifications not yet delivered (0700, entries
+//!                     and their per-entry lease files 0600)
+//!   outbox/           entries of older builds, migrated into outbox-v2/
+//!   trace.jsonl       delivery trace: waits, proofs, events, HTTP attempts
 //!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr
 
@@ -41,12 +44,14 @@ pub fn custom_socket() -> bool {
     env_path("T3_WATCH_SOCKET").is_some()
 }
 
-/// Socket file name. The number changes whenever the client/daemon protocol
-/// or the meaning of a result changes, so a daemon left running by an older
-/// t3-watch never answers a newer client (it would ignore options it does
-/// not know and report a failed run as success). Old and new daemons run
-/// side by side until the old one idles out.
-const SOCKET_NAME: &str = "daemon-p2.sock";
+/// Socket file name, derived from the engine revision, so a daemon left
+/// running by a build with other result semantics is never even reached by
+/// default (it would report results this build reads differently). Old and
+/// new daemons run side by side until the old one idles out. The handshake
+/// checks the revision as well, which is what protects a custom socket.
+fn socket_name() -> String {
+    format!("daemon-e{}.sock", crate::version::ENGINE)
+}
 
 /// The daemon socket. `$T3_WATCH_HOME` wins so tests and multiple users stay
 /// isolated; otherwise `$XDG_RUNTIME_DIR/t3-watch` when set (Linux), else the
@@ -57,15 +62,27 @@ pub fn socket_path() -> PathBuf {
     }
     if env_path("T3_WATCH_HOME").is_none() {
         if let Some(rt) = env_path("XDG_RUNTIME_DIR") {
-            return rt.join("t3-watch").join(SOCKET_NAME);
+            return rt.join("t3-watch").join(socket_name());
         }
     }
-    state_dir().join(SOCKET_NAME)
+    state_dir().join(socket_name())
 }
 
-/// Durable notifications waiting for delivery (`--durable`).
+/// Durable notifications waiting for delivery (`--durable`). Versioned: a
+/// sender from an older build (which shares the state directory but not
+/// this format's leases and `Retry-After` floors) never sees these entries.
 pub fn outbox_dir() -> PathBuf {
+    state_dir().join("outbox-v2")
+}
+
+/// Where builds before the versioned outbox kept their entries.
+pub fn legacy_outbox_dir() -> PathBuf {
     state_dir().join("outbox")
+}
+
+/// Append-only delivery trace (`trace.jsonl`, 0600).
+pub fn trace_path() -> PathBuf {
+    state_dir().join("trace.jsonl")
 }
 
 /// T3 Code's data directory: `$T3CODE_HOME` or `~/.t3`. Client side only:
