@@ -360,6 +360,22 @@ With `--durable`, a webhook is never fire-and-forget:
    everywhere: `outbox list` (under `legacy`, with their store), `status`
    (`legacyPending`), the exit code of `outbox run --once`, and the daemon,
    which stays up until they are delivered.
+8. An older build's entry can also leave undelivered: it expires, or
+   `outbox drop` drops it (`drop` finds entries in `outbox-v2/` and
+   `outbox-v3/` too). Engine-5 clients read the receipt, so an
+   `outbox-v3/` entry leaves as here. Engine-4 clients read a missing entry
+   as delivered whatever the receipt says, so an `outbox-v2/` entry stays
+   where it is beside its receipt, marked as the sender's (a retry
+   recorded; a dropped one also held back until its expiry, from engine-4
+   senders too). Such a client then reports it queued, and nobody sends
+   it. It goes (expired: to `dead/`) only once the delivery trace, which
+   engine-4 builds write too, shows its client is done with it: that
+   client's `notify.result` for the entry, or the process that created it
+   no longer running. Nothing else counts, not age. Until then it is
+   listed under `retained` in `outbox list` and as `legacyRetained` in
+   `status`, and is not pending. Without trace lines for it (a trace that
+   was not writable, or rotated away), it stays until you remove it
+   yourself once no engine-4 client can be running.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -473,7 +489,9 @@ The top level also has `until`, `watchId`, `build` (this binary's
 `version`, `engine`, `rev` and `capabilities`), `daemon` (the same for the
 daemon that served the wait, with its pid), and after a daemon restart
 mid-wait `daemonReconnects` and `registrationElapsedMs` (the daemon's time
-since the last re-registration). Times, all from the waiting client:
+since the last re-registration), and `daemonAnswersDiscarded` when an
+answer read after a suspend was thrown away. Times, all from the waiting
+client:
 
 - `startedAt`, and `endedAt` (also `observationEndedAt`): when the wait
   began and when its outcome was decided, UTC. `exitAt` (only in the printed
@@ -545,7 +563,18 @@ with a new daemon it sends only what is left of that deadline, and once
 nothing is left it ends with `timeout` instead of registering again. It
 reads the daemon's answer in one-second steps against the same deadline
 (plus 30 s for the daemon's own answer), so a daemon that is alive but
-silent cannot hold it past its timeout either.
+silent cannot hold it past its timeout either. It checks again after
+connecting, which can itself take a while.
+
+The client checks the daemon's answer the same way when it reads it, so
+an answer that sat in a socket buffer while the host slept is caught
+too. Read after the deadline, an answer never counts: the wait ends as
+`timeout` (traced as `daemon.late`). Read with time left, but with more
+than 2 s of suspended time since the client last found the socket empty
+(no part of a line pending), it may have been written before the sleep:
+the client drops it (`daemon.stale`), registers again with what is left of
+the deadline, and the daemon answers the new registration only from
+observations made after it.
 
 Thread arguments are parsed as URIs: in a `t3-thread://` link and an
 `http(s)` thread URL only the path names the thread, the query and fragment
@@ -557,7 +586,7 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e6.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e7.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -579,14 +608,16 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
   "incompatible_daemon"` (exit 2), dropping the connection so that daemon's
   wait ends too. The client also requires every capability it depends on
   (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
-  `suspend-aware`, `suspend-invalidation`) in that line,
+  `outbox-legacy-retain`, `suspend-aware`, `suspend-invalidation`) in that
+  line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 6 (this build) does not reach engine-5 daemons
-  (`0.3.0`, socket `daemon-e5.sock`) or engine-4 ones (`0.2.0` up to
-  `fa10d88`, socket `daemon-e4.sock`).
+  `t3-watch stop`. Engine 7 (this build) does not reach engine-6 daemons
+  (`0.4.0`, socket `daemon-e6.sock`), engine-5 ones (`0.3.0`,
+  `daemon-e5.sock`) or engine-4 ones (`0.2.0` up to `fa10d88`,
+  `daemon-e4.sock`).
 - Each client sends one request line and blocks in `read()`. It uses no CPU
   and no network until the answer arrives.
 - The daemon keeps one worker per watch key: (origin, pairing, thread,
