@@ -385,12 +385,36 @@ With `--durable`, a webhook is never fire-and-forget:
    `retained` in `outbox list` and as `legacyRetained` in `status`, and is
    not pending. Without trace lines for it (a trace that was not writable,
    or rotated away), it stays until you remove it yourself once no engine-4
-   client can be running. An engine-5 build (`0.3.0`, never released)
-   moves `outbox-v2/` entries whatever their state, minding only the entry
-   lease; nothing on disk keeps a retained entry from it. `outbox list` and
-   `status` report a running engine-5 daemon under `incompatibleSenders`;
-   stop it with its own binary's `t3-watch stop`. An entry it moved, still
-   held to 2100, is finished as expired wherever it ends up.
+   client can be running.
+
+   An older build may have left a receipt beside such an entry (a `0.5.0`
+   sender keeps it that way, and any build can crash between writing a
+   receipt and removing the entry). The entry must then be held and the
+   receipt taken back, since engine-6 and engine-7 senders remove an entry
+   beside a receipt. That changes two files, and no order is safe from
+   those senders in between, so it happens behind a fence: `sender.lock`
+   in `outbox-v2/` becomes a directory. Every leased older build opens that
+   path as a file before touching the store, fails (`cannot open the sender
+   lock: Is a directory`), and leaves `outbox-v2/` alone, even if this build
+   crashes halfway. Each step is checked: a failed save or a receipt that
+   cannot be removed is reported (`conversionError`), counts as pending
+   work (`outbox run --once` exits 4; `status` shows
+   `legacyConversionsIncomplete` and `legacyFence`), and leaves the fence
+   up. The next pass repairs whatever is left, including a held entry with
+   its receipt still beside it, and lowers the fence once nothing is. While
+   the fence stands, older builds' senders deliver nothing from
+   `outbox-v2/`; this build does, and their clients still send inline.
+
+   An engine-5 build (`0.3.0`, never released) moves `outbox-v2/` entries
+   whatever their state, minding only the entry lease and not the fence;
+   nothing on disk keeps a retained entry from it. `outbox list` and
+   `status` report a running engine-5 daemon under `incompatibleSenders`,
+   looking where a daemon listens by default (`$XDG_RUNTIME_DIR/t3-watch/`,
+   or the state directory, which is also checked). A daemon on a custom
+   `T3_WATCH_SOCKET`, or an `outbox run` without a daemon, is not found this
+   way: check for those yourself before relying on retention. Stop an
+   engine-5 sender with its own binary's `t3-watch stop`. An entry it moved,
+   still held to 2100, is finished as expired wherever it ends up.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -587,7 +611,8 @@ too. Read after the deadline, an answer never counts: the wait ends as
 `timeout` (traced as `daemon.late`). With time left, any sleep of more
 than 2 s while a registration is open voids it at the client's first
 look after the resume, whether that look finds an answer, part of one, or
-an empty socket. An empty socket proves nothing about an answer still on
+an empty socket. The client looks after every read, so an answer that
+trickles in a byte at a time cannot hold these checks back either. An empty socket proves nothing about an answer still on
 its way, or about when the daemon made the observation behind it. The
 client drops the registration (`daemon.stale`), registers again with what
 is left of the deadline, and the daemon answers the new registration only
@@ -603,7 +628,7 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e8.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e9.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -625,15 +650,17 @@ with `?`, `#`, `@` or whitespace is refused without being echoed.
   "incompatible_daemon"` (exit 2), dropping the connection so that daemon's
   wait ends too. The client also requires every capability it depends on
   (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
-  `outbox-legacy-retain`, `outbox-legacy-retain-held`, `suspend-aware`,
+  `outbox-legacy-retain`, `outbox-legacy-retain-held`,
+  `outbox-legacy-fence`, `suspend-aware`,
   `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 8 (this build) does not reach engine-7 daemons
-  (`0.5.0`, socket `daemon-e7.sock`), engine-6 ones (`0.4.0`,
+  `t3-watch stop`. Engine 9 (this build) does not reach engine-8 daemons
+  (`0.6.0`, socket `daemon-e8.sock`), engine-7 ones (`0.5.0`,
+  `daemon-e7.sock`), engine-6 ones (`0.4.0`,
   `daemon-e6.sock`), engine-5 ones (`0.3.0`, `daemon-e5.sock`) or
   engine-4 ones (`0.2.0` up to `fa10d88`, `daemon-e4.sock`).
 - Each client sends one request line and blocks in `read()`. It uses no CPU
