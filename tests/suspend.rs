@@ -11,7 +11,13 @@ mod common;
 
 use common::*;
 use std::fs;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const T: &str = "mcp:launch:sleepy";
@@ -338,5 +344,164 @@ fn a_daemon_lost_after_a_suspend_never_restarts_the_timeout() {
             1,
             "kill={kill}: registered again: {trace}"
         );
+    }
+}
+
+// ---- Sol ordinal 8, P1: an answer buffered across a suspend ---------------
+
+/// A socket between the client and a real daemon that holds the first
+/// connection's answer (everything after `accepted`) until released; later
+/// connections pass straight through.
+struct HoldingProxy {
+    held: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    forwarded: Arc<AtomicBool>,
+    connections: Arc<AtomicUsize>,
+}
+
+fn holding_proxy(listen: &Path, daemon: PathBuf) -> HoldingProxy {
+    let listener = UnixListener::bind(listen).unwrap();
+    fs::set_permissions(listen, fs::Permissions::from_mode(0o600)).unwrap();
+    let p = HoldingProxy {
+        held: Arc::new(AtomicBool::new(false)),
+        release: Arc::new(AtomicBool::new(false)),
+        forwarded: Arc::new(AtomicBool::new(false)),
+        connections: Arc::new(AtomicUsize::new(0)),
+    };
+    let (held, release, forwarded, connections) = (
+        p.held.clone(),
+        p.release.clone(),
+        p.forwarded.clone(),
+        p.connections.clone(),
+    );
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let n = connections.fetch_add(1, Ordering::SeqCst);
+            let Ok(up) = UnixStream::connect(&daemon) else {
+                continue;
+            };
+            let (mut from_client, mut to_daemon) = (client.try_clone().unwrap(), up.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut from_client, &mut to_daemon);
+                let _ = to_daemon.shutdown(Shutdown::Write);
+            });
+            let (held, release, forwarded) = (held.clone(), release.clone(), forwarded.clone());
+            std::thread::spawn(move || {
+                let mut from_daemon = BufReader::new(up);
+                let mut to_client = client;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if from_daemon.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let hold = n == 0 && !line.contains("\"event\":\"accepted\"");
+                    if hold {
+                        held.store(true, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    if to_client.write_all(line.as_bytes()).is_err() {
+                        break;
+                    }
+                    if hold {
+                        forwarded.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _ = to_client.shutdown(Shutdown::Both);
+            });
+        }
+    });
+    p
+}
+
+fn until(what: &str, ok: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
+    // Sol's repro: a genuine daemon's completed-run-2 answer sat in a socket
+    // proxy while the host slept 5 s and the parent moved to run 3. Both
+    // `--timeout 1s` and `--timeout 60s` returned exit 0 with run 2 and sent
+    // `settled` (the 1 s wait reporting elapsedMs 5061).
+    for timeout in ["1s", "60s"] {
+        let mock = MockMcp::start();
+        mock.set_thread(W, "completed", 2);
+        let hook = MockHook::start();
+        let env = mcp_env(&mock);
+        fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+        let clock = env.home.join("suspend");
+        suspend(&clock, 0);
+        let mut daemon = env
+            .cmd(&["daemon", "--idle-exit", "60s"])
+            .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+            .spawn()
+            .unwrap();
+        env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+        let sdir = env.home.join("s");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::set_permissions(&sdir, fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy_sock = sdir.join("proxy.sock");
+        let proxy = holding_proxy(&proxy_sock, env.home.join(SOCK));
+        let mut child = env
+            .cmd(&[
+                "wait",
+                "--until",
+                "workstream",
+                "--timeout",
+                timeout,
+                "--webhook-url",
+                &hook.url,
+                W,
+            ])
+            .env("T3_WATCH_SOCKET", &proxy_sock)
+            .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+            .spawn()
+            .unwrap();
+        let what = format!("timeout={timeout}");
+        until("the daemon's answer", || proxy.held.load(Ordering::SeqCst));
+        // The host sleeps with the answer on its way: everything stops, the
+        // parent starts run 3, and the answer lands as the host wakes.
+        let pid = child.id() as i32;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        mock.set_thread(W, "running", 3);
+        suspend(&clock, 5_000);
+        proxy.release.store(true, Ordering::SeqCst);
+        until("the answer to be forwarded", || proxy.forwarded.load(Ordering::SeqCst));
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        if timeout == "60s" {
+            until("a fresh registration", || proxy.connections.load(Ordering::SeqCst) >= 2);
+            still_running(&mut child, Duration::from_millis(800));
+            mock.set_thread(W, "completed", 3);
+        }
+        let (code, out, err) = finish(child, Duration::from_secs(30));
+        let seen = format!(
+            "{what}: exit {code}, outcome {}, run {}, elapsedMs {}, settled hooks {}",
+            out["outcome"],
+            out["threads"][0]["runOrdinal"],
+            out["elapsedMs"],
+            settled_hooks(&hook)
+        );
+        let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+        if timeout == "1s" {
+            assert_eq!(code, 3, "{seen}; {err}");
+            assert_eq!(out["outcome"], "timeout", "{seen}");
+            assert_eq!(settled_hooks(&hook), 0, "{seen}");
+            assert!(trace.contains("\"kind\":\"daemon.late\""), "{what}: {trace}");
+        } else {
+            assert_eq!(code, 0, "{seen}; {err}");
+            assert_eq!(out["threads"][0]["runOrdinal"], 3, "{seen}");
+            assert_eq!(out["daemonAnswersDiscarded"], 1, "{what}: {out}");
+            assert_eq!(settled_hooks(&hook), 1, "{seen}");
+            assert!(trace.contains("\"kind\":\"daemon.stale\""), "{what}: {trace}");
+        }
+        env.run(&["stop"]);
+        let _ = daemon.wait();
     }
 }

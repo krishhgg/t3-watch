@@ -451,7 +451,7 @@ enum CallOutcome {
 }
 
 /// More suspended time than this during one call means the host slept.
-const SUSPEND_GAP_MS: u64 = 2_000;
+pub const SUSPEND_GAP_MS: u64 = 2_000;
 /// How long past its slice an upstream call may run (its HTTP timeout is the
 /// slice plus 30 s; this also covers the reads after it).
 const CALL_GRACE_MS: u64 = 60_000;

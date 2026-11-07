@@ -22,7 +22,7 @@
 //! other's uid with `getpeereid`/`SO_PEERCRED`.
 
 use crate::config;
-use crate::engine::{error_json, Hub, Outcome, SubMsg, WaitRequest};
+use crate::engine::{error_json, Hub, Outcome, SubMsg, WaitRequest, SUSPEND_GAP_MS};
 use crate::outbox;
 use crate::trace;
 use crate::util;
@@ -529,6 +529,8 @@ pub fn request(op: &str) -> Result<Option<Value>, String> {
 /// What the client learned about the daemon that served a wait.
 pub struct DaemonInfo {
     pub reconnects: u32,
+    /// Answers thrown away because the host slept before they were read.
+    pub stale: u32,
     /// The `accepted` line's pid, version, engine and rev.
     pub build: Option<Value>,
 }
@@ -600,12 +602,29 @@ fn client_timeout(sw: &util::Stopwatch, why: &str) -> Outcome {
     }))
 }
 
+/// How reading one registration's answer ended.
+enum Answer {
+    Outcome(Outcome),
+    /// The connection dropped before an outcome arrived.
+    Dropped,
+    /// The host slept after the socket was last seen empty, so the answer
+    /// may have been written, or its observation made, before the sleep.
+    Stale,
+}
+
 /// Reads the daemon's answer to a wait, handing progress lines to
-/// `progress`. `None` means the connection dropped before an outcome
-/// arrived. An answer from a daemon of another engine revision becomes an
+/// `progress`. An answer from a daemon of another engine revision becomes an
 /// `incompatible_daemon` error, and the connection is dropped, which
 /// cancels that daemon's wait. Reads time out every second so the wait's
 /// suspend-inclusive deadline is checked even while the daemon is silent.
+///
+/// A final answer is checked when it is read, not only while it is
+/// awaited: after the deadline it never counts (the wait timed out), and
+/// one that may predate a suspend is `Stale`. Each read that times out on
+/// an empty socket (no part of a line pending) marks a point the answer
+/// must have been written after; more than `SUSPEND_GAP_MS` of suspended
+/// time since then means the host slept with the answer possibly already
+/// on its way.
 fn read_outcome(
     stream: &UnixStream,
     sw: &util::Stopwatch,
@@ -613,30 +632,38 @@ fn read_outcome(
     sock: &Path,
     build: &mut Option<Value>,
     progress: &mut dyn FnMut(Value),
-) -> Option<Outcome> {
+) -> Answer {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut reader = BufReader::new(stream);
     let mut accepted: Option<Value> = None;
     let mut partial = Vec::new();
+    let mut quiet_since = sw.suspended_ms();
     loop {
         let line = match read_line_resumable(&mut reader, MAX_RESPONSE_LINE, &mut partial) {
             Ok(l) => l,
             Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if partial.is_empty() {
+                    quiet_since = sw.suspended_ms();
+                }
                 if sw.elapsed_ms() >= deadline_ms + ANSWER_GRACE_MS {
-                    return Some(client_timeout(sw, "the daemon did not answer before the timeout"));
+                    return Answer::Outcome(client_timeout(sw, "the daemon did not answer before the timeout"));
                 }
                 continue;
             }
-            Err(LineError::TooLong) => return Some(Outcome::Error(error_json("protocol", "daemon reply is too long"))),
-            Err(_) => return None,
+            Err(LineError::TooLong) => {
+                return Answer::Outcome(Outcome::Error(error_json("protocol", "daemon reply is too long")))
+            }
+            Err(_) => return Answer::Dropped,
         };
-        let v = serde_json::from_slice::<Value>(&line).ok()?;
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+            return Answer::Dropped;
+        };
         let is_accepted = v.get("event").and_then(Value::as_str) == Some("accepted");
         if accepted.is_none() {
             let candidate = is_accepted.then_some(&v);
             if let Some(why) = incompatible(candidate, &v, sock) {
                 trace::record("daemon.incompatible", json!({ "daemon": candidate, "reason": why }));
-                return Some(Outcome::Error(error_json("incompatible_daemon", &why)));
+                return Answer::Outcome(Outcome::Error(error_json("incompatible_daemon", &why)));
             }
             if is_accepted {
                 trace::record("daemon.accepted", json!({ "daemon": v }));
@@ -647,10 +674,49 @@ fn read_outcome(
         }
         if v.get("progress").and_then(Value::as_bool) == Some(true) {
             progress(v);
-        } else if !is_accepted {
-            return Some(Outcome::from_json(v));
+            continue;
         }
+        if is_accepted {
+            continue;
+        }
+        let outcome = Outcome::from_json(v);
+        if matches!(outcome, Outcome::Timeout(_)) {
+            return Answer::Outcome(outcome);
+        }
+        // An expired budget wins over any answer, however it got here.
+        let elapsed = sw.elapsed_ms();
+        if elapsed >= deadline_ms {
+            trace::record(
+                "daemon.late",
+                json!({ "event": outcome.event(), "elapsedMs": elapsed, "suspendedMs": sw.suspended_ms() }),
+            );
+            return Answer::Outcome(client_timeout(
+                sw,
+                "the daemon's answer was read after the wait's time ran out (suspended time included); it was not used",
+            ));
+        }
+        let slept = sw.suspended_ms().saturating_sub(quiet_since);
+        if slept > SUSPEND_GAP_MS {
+            trace::record(
+                "daemon.stale",
+                json!({ "event": outcome.event(), "sleptMs": slept, "elapsedMs": elapsed }),
+            );
+            return Answer::Stale;
+        }
+        return Answer::Outcome(outcome);
     }
+}
+
+/// The wait's time ran out before (re)registering with a daemon.
+fn expired(sw: &util::Stopwatch, info: &DaemonInfo) -> Outcome {
+    trace::record(
+        "daemon.expired",
+        json!({ "reconnects": info.reconnects, "stale": info.stale, "elapsedMs": sw.elapsed_ms() }),
+    );
+    client_timeout(
+        sw,
+        "the wait's time ran out (suspended time included) before it could be registered again",
+    )
 }
 
 /// Runs a wait through the daemon and returns the outcome with what the
@@ -658,47 +724,49 @@ fn read_outcome(
 /// suspend-inclusive clock, kept across reconnects: if the daemon dies
 /// mid-wait (crash, upgrade, idle-exit race) the client reconnects and
 /// re-registers with what is left of it, and times out at once when nothing
-/// is. The daemon's `elapsedMs` counts from the last registration only.
+/// is. An answer that may predate a suspend is thrown away the same way:
+/// the client registers again, and the daemon answers the new registration
+/// only from observations made after it. The daemon's `elapsedMs` counts
+/// from the last registration only.
 pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, DaemonInfo), String> {
     let sw = util::Stopwatch::start();
     let deadline_ms = req.timeout.as_millis() as u64;
     let sock = config::socket_path();
     let mut info = DaemonInfo {
         reconnects: 0,
+        stale: 0,
         build: None,
     };
     loop {
-        let remaining = deadline_ms.saturating_sub(sw.elapsed_ms());
-        if remaining == 0 {
-            trace::record(
-                "daemon.expired",
-                json!({ "reconnects": info.reconnects, "elapsedMs": sw.elapsed_ms() }),
-            );
-            return Ok((
-                client_timeout(
-                    &sw,
-                    "the wait's time ran out (suspended time included) before it could be registered again",
-                ),
-                info,
-            ));
+        if sw.elapsed_ms() >= deadline_ms {
+            return Ok((expired(&sw, &info), info));
         }
         let stream = connect_or_spawn()?;
+        // Connecting can take a while (starting a daemon, or a sleep).
+        let remaining = deadline_ms.saturating_sub(sw.elapsed_ms());
+        if remaining == 0 {
+            return Ok((expired(&sw, &info), info));
+        }
         let mut r = req.clone();
-        r.timeout = Duration::from_millis(deadline_ms.saturating_sub(sw.elapsed_ms()).max(1));
+        r.timeout = Duration::from_millis(remaining);
         // Read even if the write failed: a daemon at its connection limit
         // answers with an error and closes before our request lands. With no
         // answer at all, the daemon exited after we connected (idle exit or
         // `stop`): reconnect like any other dropped connection.
         let _ = write_line(&stream, &r.to_json());
-        if let Some(outcome) = read_outcome(&stream, &sw, deadline_ms, &sock, &mut info.build, progress) {
-            return Ok((outcome, info));
+        match read_outcome(&stream, &sw, deadline_ms, &sock, &mut info.build, progress) {
+            Answer::Outcome(outcome) => return Ok((outcome, info)),
+            // Dropping the connection ends that registration in the daemon.
+            Answer::Stale => info.stale += 1,
+            Answer::Dropped => {
+                info.reconnects += 1;
+                trace::record("daemon.reconnect", json!({ "reconnects": info.reconnects }));
+                if info.reconnects > 5 {
+                    return Err("daemon kept closing the connection".into());
+                }
+                thread::sleep(Duration::from_millis(50 * u64::from(info.reconnects)));
+            }
         }
-        info.reconnects += 1;
-        trace::record("daemon.reconnect", json!({ "reconnects": info.reconnects }));
-        if info.reconnects > 5 {
-            return Err("daemon kept closing the connection".into());
-        }
-        thread::sleep(Duration::from_millis(50 * u64::from(info.reconnects)));
     }
 }
 

@@ -44,6 +44,17 @@
 //!   the attempt as a sender retry. An old client that comes back to it then
 //!   either finds it still there with a retry recorded (and reports it
 //!   queued, not delivered) or gone after a real 2xx (with a receipt).
+//! - Engine-5 clients read a receipt when their entry is gone, so an
+//!   `outbox-v3/` entry that expires or is dropped leaves as here. Engine-4
+//!   clients (`outbox-v2/`) read a missing entry as delivered, receipt or
+//!   not, so an `outbox-v2/` entry that leaves undelivered (expired,
+//!   dropped) stays where it is, marked as the sender's (a retry recorded;
+//!   a dropped one also held back until its expiry), beside its receipt.
+//!   Such a client then reports it queued. It goes only once the delivery
+//!   trace, which those builds write too, shows that client is done with
+//!   it: its `notify.result` for the entry, or the process that created the
+//!   entry gone. Without that evidence it stays (`outbox list`, under
+//!   `retained`); no age, absence or guess counts.
 //! - Builds before engine 4 used `outbox/`, without leases; their clients
 //!   never treat a missing entry as delivered. Their entries move here after
 //!   the 90 s inline grace, under their `outbox/sender.lock`.
@@ -66,8 +77,11 @@ use crate::notify::{self, Webhook};
 use crate::trace;
 use crate::util::{self, Jitter};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -241,10 +255,23 @@ pub enum EntryState {
     Missing,
 }
 
+/// Why an undelivered `outbox-v2/` entry is still there.
+const RETAINED: &str = "an engine-4 client reads a missing entry as delivered; kept, marked as the \
+                        sender's, until the trace shows the client that made it is done with it";
+
+/// How often the supervised sender reads the trace again for retained
+/// entries (`outbox run --once` and `outbox drop` always do).
+const RETIRE_RESCAN: Duration = Duration::from_secs(30);
+
 /// One outbox directory: this build's, or an older build's leased one.
 struct Store {
     dir: PathBuf,
     label: &'static str,
+    /// Clients of the build that writes here report an entry they find gone
+    /// as delivered (engine 4, `outbox-v2/`).
+    absence_is_delivery: bool,
+    /// A trace scan made before this (ms since the epoch) is read again.
+    trace_fresh_after_ms: u64,
 }
 
 impl Store {
@@ -252,20 +279,26 @@ impl Store {
         Store {
             dir: config::outbox_dir(),
             label: "outbox-v4",
+            absence_is_delivery: false,
+            trace_fresh_after_ms: 0,
         }
     }
 
     /// Older builds' stores with the same format and leases, delivered in
     /// place.
-    fn leased_legacy() -> [Store; 2] {
+    fn leased_legacy(trace_fresh_after_ms: u64) -> [Store; 2] {
         [
             Store {
                 dir: config::legacy_v2_outbox_dir(),
                 label: "outbox-v2",
+                absence_is_delivery: true,
+                trace_fresh_after_ms,
             },
             Store {
                 dir: config::legacy_v3_outbox_dir(),
                 label: "outbox-v3",
+                absence_is_delivery: false,
+                trace_fresh_after_ms,
             },
         ]
     }
@@ -346,8 +379,49 @@ impl Store {
         }
     }
 
-    /// Removes an entry (expired: moves it to `dead/`) and its lease file.
-    fn cleanup(&self, e: &Entry, how: Disposition) {
+    /// Whether the client that made this entry is done with it, by the
+    /// delivery trace: its `notify.result` for the entry, or the process
+    /// that created the entry no longer running. Nothing else counts.
+    fn client_done(&self, id: &str) -> bool {
+        let mut cache = TRACE_SCAN.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.as_ref().is_none_or(|s| s.at_ms < self.trace_fresh_after_ms) {
+            *cache = Some(scan_trace());
+        }
+        cache.as_ref().is_some_and(|scan| {
+            scan.done.contains(id) || scan.creators.get(id).is_some_and(|pid| !util::process_running(*pid))
+        })
+    }
+
+    /// Keeps an undelivered entry where an engine-4 client looks, in the one
+    /// state such a client reads as not delivered: there, with a sender retry
+    /// recorded, so it reports the event queued and does not send it itself.
+    /// A dropped entry is also held back until its expiry, so an engine-4
+    /// sender still running does not send it either.
+    fn retain(&self, e: &Entry, how: Disposition) {
+        let mut kept = e.clone();
+        kept.retries = kept.retries.max(1);
+        if how == Disposition::Dropped {
+            kept.not_before_ms = Some(kept.not_before_ms.unwrap_or(0).max(kept.expires_ms));
+        }
+        if kept.retries != e.retries || kept.not_before_ms != e.not_before_ms {
+            let saved = self.save(&kept);
+            trace::record(
+                "outbox.retained",
+                json!({ "id": e.id, "store": self.label, "disposition": how.as_str(),
+                        "saveError": saved.err() }),
+            );
+        }
+    }
+
+    /// Removes an entry (expired: moves it to `dead/`) and its lease file,
+    /// and returns true. An undelivered entry in a store whose clients read
+    /// absence as delivery stays (see `retain`) until its client is done
+    /// with it; then this returns false.
+    fn cleanup(&self, e: &Entry, how: Disposition) -> bool {
+        if self.absence_is_delivery && how != Disposition::Delivered && !self.client_done(&e.id) {
+            self.retain(e, how);
+            return false;
+        }
         if how == Disposition::Expired {
             let dead = self.dir.join("dead");
             if util::ensure_private_dir(&dead).is_ok() {
@@ -357,6 +431,7 @@ impl Store {
         } else {
             self.remove(&e.id);
         }
+        true
     }
 
     /// Records how an entry left the store, then removes it (or, expired,
@@ -365,11 +440,11 @@ impl Store {
     /// valid receipt already there is final: cleanup follows it instead.
     fn finish(&self, e: &Entry, how: Disposition, status: Option<u16>, by: &str) {
         if let ReceiptStatus::Valid(existing, _) = self.receipt_status(&e.id) {
-            self.cleanup(e, existing);
+            let removed = self.cleanup(e, existing);
             trace::record(
                 "outbox.reconciled",
                 json!({ "id": e.id, "store": self.label, "disposition": existing.as_str(),
-                        "wanted": how.as_str(), "by": by }),
+                        "wanted": how.as_str(), "by": by, "retained": !removed }),
             );
             return;
         }
@@ -384,11 +459,11 @@ impl Store {
         });
         let written = util::ensure_private_dir(&self.dir.join("receipts"))
             .and_then(|_| util::write_private(&self.receipt_path(&e.id), receipt.to_string().as_bytes()));
-        self.cleanup(e, how);
+        let removed = self.cleanup(e, how);
         trace::record(
             &format!("outbox.{}", how.as_str()),
             json!({ "id": e.id, "store": self.label, "attempts": e.attempts, "status": status, "by": by,
-                    "receiptError": written.err().map(|err| err.to_string()) }),
+                    "retained": !removed, "receiptError": written.err().map(|err| err.to_string()) }),
         );
     }
 
@@ -400,11 +475,13 @@ impl Store {
         match self.receipt_status(&e.id) {
             ReceiptStatus::None => Ok(None),
             ReceiptStatus::Valid(how, _) => {
-                self.cleanup(e, how);
-                trace::record(
-                    "outbox.reconciled",
-                    json!({ "id": e.id, "store": self.label, "disposition": how.as_str() }),
-                );
+                let removed = self.cleanup(e, how);
+                if removed {
+                    trace::record(
+                        "outbox.reconciled",
+                        json!({ "id": e.id, "store": self.label, "disposition": how.as_str() }),
+                    );
+                }
                 Ok(Some(how))
             }
             ReceiptStatus::Invalid(why) => {
@@ -431,19 +508,42 @@ impl Store {
         (out, bad)
     }
 
-    /// Entries still to be sent: all but those with a valid receipt beside
-    /// them (finished; an invalid receipt does not count).
+    /// A valid receipt is beside the entry: it is finished (an invalid
+    /// receipt does not count).
+    fn finished(&self, id: &str) -> bool {
+        matches!(self.receipt_status(id), ReceiptStatus::Valid(..))
+    }
+
+    /// Entries still to be sent: all but finished ones.
     fn pending(&self) -> Vec<Entry> {
+        self.entries().0.into_iter().filter(|e| !self.finished(&e.id)).collect()
+    }
+
+    /// Undelivered entries kept in place for engine-4 clients, with how
+    /// they left.
+    fn retained(&self) -> Vec<(Entry, Disposition)> {
+        if !self.absence_is_delivery {
+            return Vec::new();
+        }
         self.entries()
             .0
             .into_iter()
-            .filter(|e| !matches!(self.receipt_status(&e.id), ReceiptStatus::Valid(..)))
+            .filter_map(|e| match self.receipt_status(&e.id) {
+                ReceiptStatus::Valid(how, _) if how != Disposition::Delivered => Some((e, how)),
+                _ => None,
+            })
             .collect()
     }
 
+    /// Removes receipts past their TTL, except those of entries still kept
+    /// beside them: without its receipt a retained entry would look pending.
     fn prune_receipts(&self) {
         let cutoff = std::time::SystemTime::now() - RECEIPT_TTL;
         for f in fs::read_dir(self.dir.join("receipts")).into_iter().flatten().flatten() {
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.strip_suffix(".json").is_some_and(|id| self.path_of(id).exists()) {
+                continue;
+            }
             if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) {
                 let _ = fs::remove_file(f.path());
             }
@@ -486,7 +586,11 @@ impl Store {
             };
             match self.reconcile(&e) {
                 Ok(Some(how)) => {
-                    results.push(json!({ "id": e.id, "store": self.label, "reconciled": how.as_str() }));
+                    results.push(if self.path_of(&e.id).exists() {
+                        json!({ "id": e.id, "store": self.label, "retained": how.as_str(), "reason": RETAINED })
+                    } else {
+                        json!({ "id": e.id, "store": self.label, "reconciled": how.as_str() })
+                    });
                     continue;
                 }
                 Ok(None) => {}
@@ -496,7 +600,12 @@ impl Store {
             let now = util::now_ms();
             if now >= e.expires_ms {
                 self.finish(&e, Disposition::Expired, e.last_status, "outbox sender");
-                results.push(json!({ "id": e.id, "store": self.label, "deadLettered": true, "attempts": e.attempts }));
+                results.push(if self.path_of(&e.id).exists() {
+                    json!({ "id": e.id, "store": self.label, "retained": "expired", "attempts": e.attempts,
+                            "reason": RETAINED })
+                } else {
+                    json!({ "id": e.id, "store": self.label, "deadLettered": true, "attempts": e.attempts })
+                });
                 continue;
             }
             if let Some(t) = e.not_before_ms.filter(|t| now < *t) {
@@ -570,6 +679,54 @@ impl Store {
     }
 }
 
+/// What the delivery trace (this build's and older builds') says about
+/// entries' clients: the ids whose client recorded `notify.result` (it is
+/// done with the entry), and the pid that created each entry
+/// (`outbox.created`, `notify.prepared`).
+struct TraceScan {
+    at_ms: u64,
+    done: HashSet<String>,
+    creators: HashMap<String, u64>,
+}
+
+static TRACE_SCAN: Mutex<Option<TraceScan>> = Mutex::new(None);
+
+fn scan_trace() -> TraceScan {
+    let mut scan = TraceScan {
+        at_ms: util::now_ms(),
+        done: HashSet::new(),
+        creators: HashMap::new(),
+    };
+    let current = config::trace_path();
+    let mut rotated = current.as_os_str().to_owned();
+    rotated.push(".1");
+    for path in [PathBuf::from(rotated), current] {
+        // Never follows a symlink or blocks on a FIFO.
+        let Ok(f) = util::open_private_read(&path) else {
+            continue;
+        };
+        for line in BufReader::new(f.take(32 << 20)).lines().map_while(Result::ok) {
+            let done = line.contains("\"kind\":\"notify.result\"");
+            if !done && !line.contains("\"kind\":\"outbox.created\"") && !line.contains("\"kind\":\"notify.prepared\"")
+            {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(id) = v.get("id").and_then(Value::as_str).filter(|id| valid_id(id)) else {
+                continue;
+            };
+            if done {
+                scan.done.insert(id.to_string());
+            } else if let Some(pid) = v.get("pid").and_then(Value::as_u64) {
+                scan.creators.entry(id.to_string()).or_insert(pid);
+            }
+        }
+    }
+    scan
+}
+
 fn read_entry(path: &Path) -> Option<Entry> {
     fs::read_to_string(path)
         .ok()
@@ -602,10 +759,6 @@ fn backoff(attempts: u32, jitter: &mut Jitter) -> Duration {
 /// Takes the entry's lease if nobody holds it. `Ok(None)`: someone does.
 pub fn try_lease(id: &str) -> Result<Option<Lease>, String> {
     Store::current().try_lease(id)
-}
-
-pub fn load(id: &str) -> Option<Entry> {
-    Store::current().load(id)
 }
 
 pub fn entry_state(id: &str) -> EntryState {
@@ -749,7 +902,7 @@ pub fn legacy_entries() -> Vec<Entry> {
         .into_iter()
         .filter_map(|(_, p)| read_entry(&p))
         .collect();
-    for store in Store::leased_legacy() {
+    for store in Store::leased_legacy(0) {
         out.extend(store.pending());
     }
     out.sort_by_key(|e| e.created_ms);
@@ -767,10 +920,53 @@ pub fn legacy_public_json() -> Vec<Value> {
             v
         })
         .collect();
-    for store in Store::leased_legacy() {
+    for store in Store::leased_legacy(0) {
         out.extend(store.pending().iter().map(|e| e.public_json_in(&store)));
     }
     out
+}
+
+/// Undelivered `outbox-v2/` entries kept where engine-4 clients look, for
+/// `outbox list`.
+pub fn retained_public_json() -> Vec<Value> {
+    let mut out = Vec::new();
+    for store in Store::leased_legacy(0) {
+        for (e, how) in store.retained() {
+            let mut v = e.public_json_in(&store);
+            v["disposition"] = json!(how.as_str());
+            v["reason"] = json!(RETAINED);
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// `outbox drop`: finishes the entry as dropped, in this build's outbox or
+/// an older build's leased one. `None` when there is no such entry.
+pub fn drop_entry(id: &str) -> Result<Option<Value>, String> {
+    if !valid_id(id) {
+        return Err("not an outbox entry id".into());
+    }
+    let mut stores = vec![Store::current()];
+    stores.extend(Store::leased_legacy(util::now_ms()));
+    for store in stores {
+        if !store.path_of(id).exists() {
+            continue;
+        }
+        let Some(lease) = store.try_lease(id)? else {
+            return Err("that entry is being delivered right now; try again".into());
+        };
+        let Some(e) = store.load(id) else {
+            continue;
+        };
+        store.finish(&e, Disposition::Dropped, e.last_status, "outbox drop");
+        let kept = store.path_of(id).exists();
+        drop(lease);
+        return Ok(Some(
+            json!({ "store": store.label, "retained": kept.then_some(RETAINED) }),
+        ));
+    }
+    Ok(None)
 }
 
 /// Everything still to be sent, this build's entries and older builds'. The
@@ -785,7 +981,13 @@ pub fn pending_count() -> usize {
 pub fn pass(force: bool) -> Result<Vec<Value>, String> {
     let mut results = Vec::new();
     migrate_v1(&mut results);
-    for store in Store::leased_legacy() {
+    let now = util::now_ms();
+    let fresh_after = if force {
+        now
+    } else {
+        now.saturating_sub(RETIRE_RESCAN.as_millis() as u64)
+    };
+    for store in Store::leased_legacy(fresh_after) {
         if let Err(e) = store.send_pass(force, &mut results) {
             results.push(json!({ "store": store.label, "error": e }));
         }
@@ -800,10 +1002,12 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
     loop {
         match pass(false) {
             Ok(results) => {
-                for r in results
-                    .iter()
-                    .filter(|r| r.get("id").is_some() && r.get("deferred").is_none() && r.get("inFlight").is_none())
-                {
+                for r in results.iter().filter(|r| {
+                    r.get("id").is_some()
+                        && r.get("deferred").is_none()
+                        && r.get("inFlight").is_none()
+                        && r.get("retained").is_none()
+                }) {
                     log(&format!("outbox: {r}"));
                 }
             }
@@ -814,13 +1018,17 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
 }
 
 pub fn summary_json() -> Value {
-    let (entries, bad) = entries();
-    let pending = Store::current().pending();
+    let store = Store::current();
+    // Both counts come from one inventory: entries written while this runs
+    // are in it or not, never counted as pending but not as entries.
+    let (entries, bad) = store.entries();
+    let pending: Vec<&Entry> = entries.iter().filter(|e| !store.finished(&e.id)).collect();
     let legacy = legacy_entries();
-    let oldest = pending.iter().chain(&legacy).map(|e| e.created_ms).min();
+    let oldest = pending.iter().copied().chain(&legacy).map(|e| e.created_ms).min();
     json!({
         "pending": pending.len() + legacy.len(),
         "legacyPending": legacy.len(),
+        "legacyRetained": retained_public_json().len(),
         "finishedAwaitingCleanup": entries.len() - pending.len(),
         "unreadable": bad.len(),
         "oldestCreatedAt": oldest.map(util::rfc3339_ms),

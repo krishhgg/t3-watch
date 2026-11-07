@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 6;
+pub const ENGINE: u32 = 7;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -30,6 +30,9 @@ pub const CAPABILITIES: &[&str] = &[
     // leased older stores are delivered in place, never adopted by age.
     "outbox-legacy-drain",
     "outbox-legacy-in-place",
+    // Undelivered engine-4 entries stay where their clients look until the
+    // trace shows those clients are done with them.
+    "outbox-legacy-retain",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

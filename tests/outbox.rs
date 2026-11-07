@@ -286,3 +286,74 @@ fn the_daemon_keeps_retrying_a_needs_input_wake_until_delivered() {
         env.status()["running"] != json!(true)
     });
 }
+
+#[test]
+fn status_counts_come_from_one_inventory_while_entries_arrive() {
+    // Sol ordinal 8, P2: with 150 entries pending and 500 more arriving,
+    // status counted entries and pending entries in two separate scans and
+    // subtracted them: finishedAwaitingCleanup came out as 2^64 - 1 with no
+    // receipt anywhere.
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let dir = env.home.join(OUTBOX);
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // Not due for an hour: the sender leaves them alone.
+    let write = |n: u32| {
+        let id = format!("{n:08x}");
+        let e = json!({ "version": 1, "id": id, "event": "settled", "body": "{}",
+                        "url": "http://127.0.0.1:9/hook", "headers": [], "secret": null,
+                        "createdMs": now, "expiresMs": now + 86_400_000, "attempts": 0, "retries": 0,
+                        "nextAttemptMs": now + 3_600_000 });
+        let tmp = dir.join(format!(".{id}.tmp"));
+        fs::write(&tmp, e.to_string()).unwrap();
+        fs::rename(tmp, dir.join(format!("{id}.json"))).unwrap();
+    };
+    for n in 0..150 {
+        write(n);
+    }
+    let mut daemon = env.spawn(&["daemon", "--idle-exit", "60s"]);
+    env.wait_status("daemon", secs(10), |s| s["running"] == true);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let bad = std::sync::Mutex::new(Vec::new());
+    let samples = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let o = &env.status()["outbox"];
+                    samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let finished = o["finishedAwaitingCleanup"].as_u64().unwrap_or(u64::MAX);
+                    let pending = o["pending"].as_u64().unwrap_or(u64::MAX);
+                    if finished != 0 || !(150..=650).contains(&pending) {
+                        bad.lock().unwrap().push(o.clone());
+                    }
+                }
+            });
+        }
+        for n in 150..650 {
+            write(n);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let bad = bad.into_inner().unwrap();
+    let samples = samples.into_inner();
+    assert!(samples >= 10, "only {samples} status samples");
+    assert!(
+        bad.is_empty(),
+        "{} of {samples} status samples were wrong, e.g. {}",
+        bad.len(),
+        bad[0]
+    );
+    let o = &env.status()["outbox"];
+    assert_eq!(o["pending"], 650, "{o}");
+    assert_eq!(o["finishedAwaitingCleanup"], 0, "{o}");
+    env.run(&["stop"]);
+    daemon.wait().unwrap();
+}

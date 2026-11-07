@@ -307,25 +307,40 @@ fn a_young_entry_left_by_a_crashed_old_client_is_kept_pending_and_delivered() {
 // ---- Sol ordinal 6, P1: the engine-4 upgrade boundary -----------------------
 
 #[test]
-fn an_engine_4_daemon_at_its_own_default_socket_is_never_reached() {
-    // a92f977 and fa10d88 both listen on daemon-e4.sock and call themselves
-    // engine 4; neither drains legacy entries the way this build must.
+fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
+    // a92f977 and fa10d88 listen on daemon-e4.sock, 0.3.0 on daemon-e5.sock,
+    // 0.4.0 on daemon-e6.sock; none handles legacy entries or stale answers
+    // the way this build must.
     let mock = MockMcp::start();
     mock.set_thread(T, "running", 3);
     let env = mcp_env(&mock);
     fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
-    let served = fake_daemon(
-        &env.home.join("daemon-e4.sock"),
-        completed_by_old_engine(json!({ "event": "accepted", "pid": 4242, "version": "0.2.0",
-                                        "engine": 4, "rev": "a92f977" })),
-    );
+    let served: Vec<_> = [(4, "0.2.0"), (5, "0.3.0"), (6, "0.4.0")]
+        .into_iter()
+        .map(|(engine, version)| {
+            fake_daemon(
+                &env.home.join(format!("daemon-e{engine}.sock")),
+                completed_by_old_engine(json!({ "event": "accepted", "pid": 4242, "version": version,
+                                                "engine": engine, "rev": "old" })),
+            )
+        })
+        .collect();
     let out = env.run(&["wait", "--timeout", "1500ms", T]);
     assert_eq!(out.status.code(), Some(3), "{}", both(&out));
     let v = output_json(&out);
     assert_eq!(v["daemon"]["engine"], ENGINE);
-    assert_eq!(served.load(Ordering::SeqCst), 0, "the engine-4 socket was contacted");
+    for s in &served {
+        assert_eq!(s.load(Ordering::SeqCst), 0, "an older engine's socket was contacted");
+    }
     let caps = v["daemon"]["capabilities"].to_string();
-    for c in ["outbox-receipts", "outbox-legacy-drain", "suspend-aware"] {
+    for c in [
+        "outbox-receipts",
+        "outbox-legacy-drain",
+        "outbox-legacy-in-place",
+        "outbox-legacy-retain",
+        "suspend-aware",
+        "suspend-invalidation",
+    ] {
         assert!(caps.contains(c), "{c} missing from {caps}");
     }
 }
@@ -410,7 +425,14 @@ fn older_builds_entries_are_delivered_where_they_are_never_moved() {
         assert!(entry_at(&env.home.join(OUTBOX), waiting).is_none(), "{store}: copied");
         assert!(!dir.join("receipts").join(format!("{waiting}.json")).exists());
         assert!(entry_at(&dir, held).is_some(), "{store}: leased entry touched");
-        assert!(entry_at(&dir, finished).is_none(), "{store}: finished entry kept");
+        // Dropped, but undelivered: an engine-4 client would read its
+        // absence as delivery, and no trace says its client is done.
+        if store == "outbox-v2" {
+            let kept = entry_at(&dir, finished).unwrap_or_else(|| panic!("{store}: dropped entry removed"));
+            assert!(kept["retries"].as_u64().unwrap() >= 1, "{kept}");
+        } else {
+            assert!(entry_at(&dir, finished).is_none(), "{store}: finished entry kept");
+        }
         assert!(
             fs::read_to_string(dir.join("receipts").join(format!("{finished}.json")))
                 .unwrap()
@@ -513,4 +535,126 @@ fn an_entry_left_beside_its_receipt_is_never_sent() {
             disposition == "expired"
         );
     }
+}
+
+// ---- Sol ordinal 8, P1: an undelivered engine-4 entry never just vanishes ---
+
+/// Appends a line to the delivery trace as an engine-4 build writes it.
+fn old_trace(env: &Env, kind: &str, id: &str, pid: u32) {
+    let line = json!({ "at": "2026-11-07T00:00:00.000Z", "kind": kind, "pid": pid, "engine": 4,
+                       "rev": "a92f977", "id": id });
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(env.home.join("trace.jsonl"))
+        .unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+fn exited_pid() -> u32 {
+    let mut c = std::process::Command::new("true").spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+fn receipt_in(dir: &Path, id: &str) -> Value {
+    serde_json::from_str(&fs::read_to_string(dir.join("receipts").join(format!("{id}.json"))).unwrap()).unwrap()
+}
+
+#[test]
+fn an_expired_engine_4_entry_stays_where_its_client_looks_until_that_client_is_done() {
+    // Sol's repro: an a92f977 client (--durable-max-age 1s) held back by its
+    // progress hook; its final entry expired and engine 6 dead-lettered it,
+    // so the client found it gone and reported the event delivered.
+    let env = Env::new();
+    let hook = MockHook::start();
+    let v2 = private_dir(&env, "outbox-v2");
+    let now = now_ms();
+    let (live, finished, crashed, untraced) = ("1a1a1a01", "1b1b1b02", "1c1c1c03", "1d1d1d04");
+    for id in [live, finished, crashed, untraced] {
+        let mut e = v2_entry(id, &hook.url, now - 5_000, 0);
+        e["expiresMs"] = json!(now - 1_000);
+        e["nextAttemptMs"] = json!(now + 85_000);
+        fs::write(v2.join(format!("{id}.json")), e.to_string()).unwrap();
+    }
+    let me = std::process::id();
+    // Its client is still running.
+    old_trace(&env, "outbox.created", live, me);
+    // Its client sent it and moved on.
+    old_trace(&env, "outbox.created", finished, me);
+    old_trace(&env, "notify.result", finished, me);
+    // The process that made it is gone.
+    old_trace(&env, "outbox.created", crashed, exited_pid());
+
+    let run = env.run(&["outbox", "run", "--once"]);
+    let r = output_json(&run);
+    assert!(hook.requests().is_empty(), "an expired entry was sent: {r}");
+    for id in [live, untraced] {
+        let kept = entry_at(&v2, id).unwrap_or_else(|| panic!("{id} left outbox-v2 undelivered: {r}"));
+        // What an engine-4 client reads as "queued", never as delivered.
+        assert!(kept["retries"].as_u64().unwrap() >= 1, "{kept}");
+        assert_eq!(receipt_in(&v2, id)["disposition"], "expired");
+        assert!(!v2.join("dead").join(format!("{id}.json")).exists());
+    }
+    for id in [finished, crashed] {
+        assert!(
+            entry_at(&v2, id).is_none(),
+            "{id} kept although its client is done: {r}"
+        );
+        assert!(v2.join("dead").join(format!("{id}.json")).exists(), "{id}");
+        assert_eq!(receipt_in(&v2, id)["disposition"], "expired");
+    }
+    assert_eq!(run.status.code(), Some(0), "retained entries are not pending: {r}");
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(list["retained"].as_array().unwrap().len(), 2, "{list}");
+    assert_eq!(list["legacy"].as_array().unwrap().len(), 0, "{list}");
+
+    // A later pass sends nothing and keeps them; once the client is done
+    // with one, it goes.
+    old_trace(&env, "notify.result", live, me);
+    let r = output_json(&env.run(&["outbox", "run", "--once"]));
+    assert!(hook.requests().is_empty(), "{r}");
+    assert!(entry_at(&v2, live).is_none(), "{r}");
+    assert!(v2.join("dead").join(format!("{live}.json")).exists());
+    assert!(
+        entry_at(&v2, untraced).is_some(),
+        "nothing says its client is done: {r}"
+    );
+}
+
+#[test]
+fn a_dropped_engine_4_entry_stays_where_its_client_looks_until_that_client_is_done() {
+    let env = Env::new();
+    let hook = MockHook::start();
+    let v2 = private_dir(&env, "outbox-v2");
+    let now = now_ms();
+    let id = "1e1e1e05";
+    let mut e = v2_entry(id, &hook.url, now - 5_000, 0);
+    e["nextAttemptMs"] = json!(now - 1_000);
+    fs::write(v2.join(format!("{id}.json")), e.to_string()).unwrap();
+    let me = std::process::id();
+    old_trace(&env, "outbox.created", id, me);
+
+    let out = env.run(&["outbox", "drop", id]);
+    let d = output_json(&out);
+    assert_eq!(out.status.code(), Some(0), "{d}");
+    assert_eq!(d["store"], "outbox-v2", "{d}");
+    assert!(d["retained"].is_string(), "{d}");
+    let kept = entry_at(&v2, id).expect("a dropped engine-4 entry vanished");
+    assert!(kept["retries"].as_u64().unwrap() >= 1, "{kept}");
+    // Held back from an engine-4 sender too.
+    assert_eq!(kept["notBeforeMs"], kept["expiresMs"], "{kept}");
+    assert_eq!(receipt_in(&v2, id)["disposition"], "dropped");
+
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", both(&run));
+    assert!(hook.requests().is_empty(), "a dropped entry was sent");
+    assert!(entry_at(&v2, id).is_some());
+
+    old_trace(&env, "notify.result", id, me);
+    env.run(&["outbox", "run", "--once"]);
+    assert!(entry_at(&v2, id).is_none(), "its client is done with it");
+    assert_eq!(receipt_in(&v2, id)["disposition"], "dropped");
+    assert!(hook.requests().is_empty());
 }

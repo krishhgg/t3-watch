@@ -540,6 +540,36 @@ pub fn open_log(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// Opens a file for reading only if it is a regular file owned by you,
+/// never following a symlink or blocking on a FIFO or device.
+pub fn open_private_read(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != geteuid() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file owned by you",
+            path.display()
+        )));
+    }
+    Ok(f)
+}
+
+/// Whether a process with this pid exists. Unknown counts as running.
+pub fn process_running(pid: u64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()

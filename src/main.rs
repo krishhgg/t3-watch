@@ -694,6 +694,7 @@ fn cmd_wait(raw: &[String]) -> ! {
     // operational or not, becomes an outcome that goes through delivery: an
     // unattended bot with --notify-on all hears about a broken config too.
     let mut reconnects = 0;
+    let mut stale_answers = 0;
     let mut daemon_build: Option<Value> = None;
     let mut heartbeat = None;
     // Threads are traced as parsed ids only: an argument can be a URL whose
@@ -757,6 +758,7 @@ fn cmd_wait(raw: &[String]) -> ! {
                 match daemon::wait(&req, &mut on_progress) {
                     Ok((o, info)) => {
                         reconnects = info.reconnects;
+                        stale_answers = info.stale;
                         daemon_build = info.build;
                         o
                     }
@@ -776,7 +778,7 @@ fn cmd_wait(raw: &[String]) -> ! {
     let mut prepared = None;
     if let Some(v) = outcome.json_mut() {
         if let Some(daemon_elapsed) = v.get("elapsedMs").cloned() {
-            if reconnects > 0 {
+            if reconnects > 0 || stale_answers > 0 {
                 v["registrationElapsedMs"] = daemon_elapsed;
             }
         }
@@ -806,6 +808,9 @@ fn cmd_wait(raw: &[String]) -> ! {
         }
         if reconnects > 0 {
             v["daemonReconnects"] = json!(reconnects);
+        }
+        if stale_answers > 0 {
+            v["daemonAnswersDiscarded"] = json!(stale_answers);
         }
         trace::record(
             "wait.outcome",
@@ -891,6 +896,7 @@ fn cmd_outbox(raw: &[String]) -> ! {
                 &json!({
                     "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
                     "legacy": outbox::legacy_public_json(),
+                    "retained": outbox::retained_public_json(),
                     "unreadable": bad,
                     "dir": config::outbox_dir().display().to_string(),
                 }),
@@ -914,21 +920,21 @@ fn cmd_outbox(raw: &[String]) -> ! {
             if !outbox::valid_id(id) {
                 fail_json("usage", "not an outbox entry id");
             }
-            let lease = match outbox::try_lease(id) {
-                Ok(Some(l)) => l,
-                Ok(None) => fail_json("outbox", "that entry is being delivered right now; try again"),
-                Err(e) => fail_json("outbox", &e),
-            };
-            let existed = match outbox::load(id) {
-                Some(e) => {
-                    outbox::finish(&e, outbox::Disposition::Dropped, e.last_status, "outbox drop");
-                    true
+            match outbox::drop_entry(id) {
+                Ok(Some(how)) => {
+                    let mut v = json!({ "ok": true, "id": id });
+                    if let (Value::Object(o), Value::Object(h)) = (&mut v, how) {
+                        o.extend(h);
+                    }
+                    print_json(&v, pretty);
+                    exit(0)
                 }
-                None => false,
-            };
-            drop(lease);
-            print_json(&json!({ "ok": existed, "id": id }), pretty);
-            exit(if existed { 0 } else { 2 })
+                Ok(None) => {
+                    print_json(&json!({ "ok": false, "id": id }), pretty);
+                    exit(2)
+                }
+                Err(e) => fail_json("outbox", &e),
+            }
         }
         other => usage_error(&format!("unknown outbox subcommand {other:?}")),
     }
