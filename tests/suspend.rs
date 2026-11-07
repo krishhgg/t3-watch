@@ -109,3 +109,234 @@ fn a_long_poll_stalled_across_a_suspend_is_restarted_on_resume() {
         assert!(trace.contains("\"kind\":\"watch.restart\""), "{trace}");
     }
 }
+
+// ---- Sol ordinal 7 -----------------------------------------------------------
+
+const W: &str = "mcp:launch:stale";
+const L: &str = "lt-stale";
+
+fn run_id(thread: &str, n: u64) -> String {
+    format!("run:thread:{thread}:ordinal:{n}")
+}
+
+fn settled_hooks(hook: &MockHook) -> usize {
+    hook.requests()
+        .iter()
+        .filter(|r| r.headers.get("x-t3-watch-event").map(String::as_str) == Some("settled"))
+        .count()
+}
+
+#[test]
+fn an_answer_from_before_a_suspend_never_completes_the_wait() {
+    // Sol's repro: the workstream cycle's final header read answers with a
+    // snapshot of completed run 2 taken before the host slept 5 s; by the
+    // time it arrives the parent is running run 3. With `--timeout 1s` the
+    // only right outcome is timeout; with time left, run 3.
+    for (daemon, timeout) in [(false, "1s"), (true, "1s"), (false, "60s"), (true, "60s")] {
+        let mock = MockMcp::start();
+        mock.set_thread(W, "completed", 2);
+        let hook = MockHook::start();
+        let env = mcp_env(&mock);
+        let clock = env.home.join("suspend");
+        suspend(&clock, 0);
+        // Read 1 primes the watch, read 2 follows the first long-poll.
+        mock.with(|s| {
+            s.after_read.insert(2, (W.into(), "running".into(), 3));
+            s.suspend_after_read.insert(2, (clock.clone(), 5_000));
+        });
+        let mut args = vec![
+            "wait",
+            "--until",
+            "workstream",
+            "--timeout",
+            timeout,
+            "--webhook-url",
+            &hook.url,
+        ];
+        if !daemon {
+            args.push("--no-daemon");
+        }
+        args.push(W);
+        let mut child = env
+            .cmd(&args)
+            .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+            .spawn()
+            .unwrap();
+        let what = format!("daemon={daemon} timeout={timeout}");
+        if timeout == "60s" {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !fs::read_to_string(env.home.join("trace.jsonl"))
+                .unwrap_or_default()
+                .contains("\"kind\":\"watch.restart\"")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: the stale answer was never discarded"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            still_running(&mut child, Duration::from_millis(500));
+            mock.set_thread(W, "completed", 3);
+        }
+        let (code, out, err) = finish(child, Duration::from_secs(20));
+        assert!(
+            mock.with(|s| s.suspend_after_read.is_empty()),
+            "{what}: the stale read never happened"
+        );
+        let seen = format!(
+            "{what}: exit {code}, outcome {}, run {}, delegatedSettled {}, settled hooks {}",
+            out["outcome"],
+            out["threads"][0]["runOrdinal"],
+            out["threads"][0]["delegatedSettled"],
+            settled_hooks(&hook)
+        );
+        if timeout == "1s" {
+            assert_eq!(code, 3, "{seen}; {err}");
+            assert_eq!(out["outcome"], "timeout", "{what}: {out}");
+            assert_ne!(out["threads"][0]["delegatedSettled"], true, "{what}: {out}");
+            assert_eq!(settled_hooks(&hook), 0, "{what}: a settled event went out");
+        } else {
+            assert_eq!(code, 0, "{seen}; {err}");
+            assert_eq!(out["outcome"], "completed", "{what}: {out}");
+            assert_eq!(out["threads"][0]["runOrdinal"], 3, "{seen}");
+            assert_eq!(out["threads"][0]["resultRunId"], run_id(W, 3), "{what}: {out}");
+            let hooks = hook.requests();
+            assert_eq!(hooks.len(), 1, "{what}");
+            assert!(
+                String::from_utf8_lossy(&hooks[0].body).contains(&run_id(W, 3)),
+                "{what}"
+            );
+        }
+        let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+        assert!(trace.contains("\"kind\":\"watch.restart\""), "{what}: {trace}");
+    }
+}
+
+#[test]
+fn a_local_answer_from_before_a_suspend_never_completes_the_wait() {
+    for (daemon, timeout) in [(false, "3s"), (true, "3s"), (false, "60s"), (true, "60s")] {
+        let env = Env::new();
+        let t3 = MockT3::new(&env);
+        t3.set(L, "running", 2);
+        let hook = MockHook::start();
+        let clock = env.home.join("suspend");
+        suspend(&clock, 0);
+        let mut args = vec![
+            "wait",
+            "--transport",
+            "local",
+            "--t3-bin",
+            t3.bin_str(),
+            "--interval",
+            "100ms",
+            "--timeout",
+            timeout,
+            "--webhook-url",
+            &hook.url,
+        ];
+        if !daemon {
+            args.push("--no-daemon");
+        }
+        args.push(L);
+        let mut child = env
+            .cmd(&args)
+            .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+            .spawn()
+            .unwrap();
+        let what = format!("daemon={daemon} timeout={timeout}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while t3.calls() == 0 {
+            assert!(Instant::now() < deadline, "{what}: t3 was never called");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        t3.stale_once(L, ("completed", 2), ("running", 3), &clock, 5_000);
+        let stale = t3.dir.join("stale").join(L);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stale.exists() {
+            assert!(Instant::now() < deadline, "{what}: the stale answer was never read");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if timeout == "60s" {
+            still_running(&mut child, Duration::from_millis(800));
+            t3.set(L, "completed", 3);
+        }
+        let (code, out, err) = finish(child, Duration::from_secs(20));
+        let seen = format!(
+            "{what}: exit {code}, outcome {}, run {}, settled hooks {}",
+            out["outcome"],
+            out["threads"][0]["runOrdinal"],
+            settled_hooks(&hook)
+        );
+        if timeout == "3s" {
+            assert_eq!(code, 3, "{seen}; {err}");
+            assert_eq!(out["outcome"], "timeout", "{what}: {out}");
+            assert_eq!(settled_hooks(&hook), 0, "{what}: a settled event went out");
+        } else {
+            assert_eq!(code, 0, "{seen}; {err}");
+            assert_eq!(out["threads"][0]["runOrdinal"], 3, "{seen}");
+            assert_eq!(settled_hooks(&hook), 1, "{what}");
+        }
+        let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+        assert!(trace.contains("\"kind\":\"watch.restart\""), "{what}: {trace}");
+    }
+}
+
+#[test]
+fn a_daemon_lost_after_a_suspend_never_restarts_the_timeout() {
+    // Sol's repro: a 10-minute wait, the host sleeps 11 minutes, the daemon
+    // dies. The client must not register again with a fresh budget, and a
+    // daemon that is alive but silent must not hold it past the deadline.
+    for kill in [true, false] {
+        let mock = MockMcp::start();
+        mock.set_thread(T, "running", 2);
+        let env = mcp_env(&mock);
+        let clock = env.home.join("suspend");
+        suspend(&clock, 0);
+        let child = env
+            .cmd(&["wait", "--timeout", "10m", T])
+            .env("T3_WATCH_TEST_SUSPEND_FILE", &clock)
+            .spawn()
+            .unwrap();
+        let s = env.wait_status("the wait to register", Duration::from_secs(10), |s| {
+            Env::subscribers(s) == 1
+        });
+        let pid = s["pid"].as_u64().unwrap() as i32;
+        // Stopped first, so this daemon cannot notice the suspend itself.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        let resumed = Instant::now();
+        suspend(&clock, 11 * 60 * 1000);
+        if kill {
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        }
+        // The thread completes later: the wait must already be over.
+        std::thread::sleep(Duration::from_millis(1500));
+        mock.set_thread(T, "completed", 2);
+        let (code, out, err) = finish(child, Duration::from_secs(20));
+        if !kill {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let seen = format!(
+            "kill={kill}: exit {code}, outcome {}, elapsedMs {}, daemonReconnects {}, ended {:?} after the resume",
+            out["outcome"],
+            out["elapsedMs"],
+            out["daemonReconnects"],
+            resumed.elapsed()
+        );
+        assert_eq!(code, 3, "{seen}; {err}");
+        assert_eq!(out["outcome"], "timeout", "kill={kill}: {out}");
+        assert!(
+            resumed.elapsed() < Duration::from_secs(10),
+            "kill={kill}: the expired wait took {:?} to end",
+            resumed.elapsed()
+        );
+        assert!(out["elapsedMs"].as_u64().unwrap() >= 600_000, "kill={kill}: {out}");
+        let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+        assert_eq!(
+            trace.matches("\"kind\":\"daemon.accepted\"").count(),
+            1,
+            "kill={kill}: registered again: {trace}"
+        );
+    }
+}

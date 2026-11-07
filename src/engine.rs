@@ -596,6 +596,22 @@ fn workstream_proof(thread_id: &str, w: &WaitReply, s: &ThreadState, seen_before
     )
 }
 
+/// A subscriber's clock: its stopwatch, and the earliest observation time it
+/// accepts, which is its registration and moves forward to every resume it
+/// detects (anything observed before a suspend may be stale after it).
+#[derive(Clone, Copy)]
+struct WaitClock {
+    sw: util::Stopwatch,
+    fresh: Instant,
+}
+
+impl WaitClock {
+    fn start() -> Self {
+        let sw = util::Stopwatch::start();
+        WaitClock { sw, fresh: sw.awake }
+    }
+}
+
 /// One watch's state, copied once per evaluation so the settled decision and
 /// the printed report always describe the same observations.
 struct Snap {
@@ -898,7 +914,7 @@ impl Hub {
         // The deadline counts time the host spends suspended (`--timeout`
         // is real time), and the loop below never sleeps longer than a
         // second, so after a resume an expired budget ends the wait at once.
-        let sw = util::Stopwatch::start();
+        let mut clock = WaitClock::start();
         let timeout_ms = req.timeout.as_millis() as u64;
         if let Err(e) = req.validate() {
             return Outcome::Error(error_json("usage", &e));
@@ -924,17 +940,27 @@ impl Hub {
 
         let mut reported = Reported::default();
         let tick = Duration::from_millis(if req.notify_unreachable.is_some() { 500 } else { 1000 });
+        let mut last_gap = clock.sw.suspended_ms();
         let outcome = match failure {
             Some(e) => Outcome::Error(e),
             None => loop {
-                let snaps = snapshot(&watches);
-                self.report_progress(&snaps, req, &sw, &mut reported, progress);
-                if let Some(done) = self.evaluate(&snaps, req, &sw, &reported) {
-                    break done;
+                // A resume since the last look: nothing observed before it
+                // counts any more, whatever it says.
+                let gap = clock.sw.suspended_ms();
+                if gap > last_gap + SUSPEND_GAP_MS {
+                    clock.fresh = Instant::now();
                 }
-                let elapsed = sw.elapsed_ms();
+                last_gap = gap;
+                let snaps = snapshot(&watches);
+                // An expired budget wins over anything observed: after a
+                // suspend past the deadline the answer is a timeout.
+                let elapsed = clock.sw.elapsed_ms();
                 if elapsed >= timeout_ms {
-                    break Outcome::Timeout(self.report("timeout", &snaps, req, &sw, None, &reported));
+                    break Outcome::Timeout(self.report("timeout", &snaps, req, &clock, None, &reported));
+                }
+                self.report_progress(&snaps, req, &clock, &mut reported, progress);
+                if let Some(done) = self.evaluate(&snaps, req, &clock, &reported) {
+                    break done;
                 }
                 match rx.recv_timeout(Duration::from_millis(timeout_ms - elapsed).min(tick)) {
                     Ok(SubMsg::Update) => {}
@@ -960,7 +986,7 @@ impl Hub {
         &self,
         snaps: &[Snap],
         req: &WaitRequest,
-        sw: &util::Stopwatch,
+        clock: &WaitClock,
         r: &mut Reported,
         progress: Progress,
     ) {
@@ -968,10 +994,10 @@ impl Hub {
             let t = &req.targets[i];
             if req.predicate.follow {
                 if let Some(Observation::State(s)) = &snap.last {
-                    if s.observed_at >= sw.awake && s.outcome(&req.predicate) == ThreadOutcome::Failed {
+                    if s.observed_at >= clock.fresh && s.outcome(&req.predicate) == ThreadOutcome::Failed {
                         let run = s.latest_run_id.clone().unwrap_or_default();
                         if r.failed_runs.insert((i, run.clone())) {
-                            let mut thread = self.thread_json(snap, t, req, sw);
+                            let mut thread = self.thread_json(snap, t, req, clock);
                             thread["followed"] = json!(true);
                             r.failed
                                 .push(json!({ "threadId": t.thread_id, "runId": run, "status": s.status }));
@@ -1010,17 +1036,11 @@ impl Hub {
 
     /// Decides from one snapshot, and builds the report from that same
     /// snapshot, so `event` and the per-thread flags always agree.
-    fn evaluate(
-        &self,
-        snaps: &[Snap],
-        req: &WaitRequest,
-        sw: &util::Stopwatch,
-        reported: &Reported,
-    ) -> Option<Outcome> {
+    fn evaluate(&self, snaps: &[Snap], req: &WaitRequest, clock: &WaitClock, reported: &Reported) -> Option<Outcome> {
         let mut outcomes = Vec::with_capacity(snaps.len());
         for (i, snap) in snaps.iter().enumerate() {
             match &snap.last {
-                Some(Observation::Failed { error, at }) if *at >= sw.awake => {
+                Some(Observation::Failed { error, at }) if *at >= clock.fresh => {
                     let t = &req.targets[i];
                     let err = json!({
                         "kind": error.kind(),
@@ -1032,12 +1052,12 @@ impl Hub {
                         "error",
                         snaps,
                         req,
-                        sw,
+                        clock,
                         Some(err),
                         reported,
                     )));
                 }
-                Some(Observation::State(s)) if s.observed_at >= sw.awake => outcomes.push(s.outcome(&req.predicate)),
+                Some(Observation::State(s)) if s.observed_at >= clock.fresh => outcomes.push(s.outcome(&req.predicate)),
                 _ => outcomes.push(ThreadOutcome::Pending),
             }
         }
@@ -1047,7 +1067,7 @@ impl Hub {
                 "needs_input",
                 snaps,
                 req,
-                sw,
+                clock,
                 None,
                 reported,
             )));
@@ -1059,10 +1079,10 @@ impl Hub {
         };
         let count = outcomes.iter().filter(|o| terminal(o)).count();
         let done = if req.any { count > 0 } else { count == snaps.len() };
-        done.then(|| Outcome::Settled(self.report("settled", snaps, req, sw, None, reported)))
+        done.then(|| Outcome::Settled(self.report("settled", snaps, req, clock, None, reported)))
     }
 
-    fn thread_json(&self, snap: &Snap, t: &TargetSpec, req: &WaitRequest, sw: &util::Stopwatch) -> Value {
+    fn thread_json(&self, snap: &Snap, t: &TargetSpec, req: &WaitRequest, clock: &WaitClock) -> Value {
         let mut m = Map::new();
         m.insert("machine".into(), json!(t.machine));
         m.insert("threadId".into(), json!(t.thread_id));
@@ -1074,7 +1094,7 @@ impl Hub {
                 if let Value::Object(fields) = s.to_json(&req.predicate) {
                     m.extend(fields);
                 }
-                let fresh = s.observed_at >= sw.awake;
+                let fresh = s.observed_at >= clock.fresh;
                 let outcome = if fresh {
                     s.outcome(&req.predicate)
                 } else {
@@ -1104,14 +1124,14 @@ impl Hub {
         event: &str,
         snaps: &[Snap],
         req: &WaitRequest,
-        sw: &util::Stopwatch,
+        clock: &WaitClock,
         error: Option<Value>,
         reported: &Reported,
     ) -> Value {
         let threads: Vec<Value> = snaps
             .iter()
             .zip(&req.targets)
-            .map(|(snap, t)| self.thread_json(snap, t, req, sw))
+            .map(|(snap, t)| self.thread_json(snap, t, req, clock))
             .collect();
         let outcome = match event {
             "settled" => {
@@ -1131,8 +1151,8 @@ impl Hub {
             "outcome": outcome,
             "mode": if req.any { "any" } else { "all" },
             "until": if req.predicate.until_delegated { "workstream" } else { "turn" },
-            "elapsedMs": sw.elapsed_ms(),
-            "elapsedAwakeMs": sw.awake_ms(),
+            "elapsedMs": clock.sw.elapsed_ms(),
+            "elapsedAwakeMs": clock.sw.awake_ms(),
             "via": self.label,
             "threads": threads,
         });
@@ -1486,6 +1506,8 @@ impl Watch {
         let cancel = Cancel::new();
         let (tx, rx) = mpsc::channel();
         let (me, token) = (self.clone(), cancel.clone());
+        // Started before the call: a suspend at any point of it counts.
+        let sw = util::Stopwatch::start();
         let spawned = util::spawn_thread("t3-watch-call", 256 * 1024, move || {
             let _permit = permit;
             let result = me.cycle(&token);
@@ -1500,19 +1522,13 @@ impl Watch {
                 status: None,
             })));
         }
-        let sw = util::Stopwatch::start();
         let budget_ms = self.slice_ms.load(Ordering::Relaxed) + CALL_GRACE_MS;
         let mut g = lock(&self.inner);
         loop {
-            if let Ok(result) = rx.try_recv() {
-                return CallOutcome::Done(Box::new(result));
-            }
-            if g.subs.is_empty() {
-                drop(g);
-                cancel.cancel();
-                hub.ops.cancelled.fetch_add(1, Ordering::Relaxed);
-                return CallOutcome::Abandoned;
-            }
+            // Checked before a ready result is taken: answers to requests
+            // made before a suspend describe the thread before it, and are
+            // thrown away rather than published.
+            let ready = rx.try_recv().ok();
             let reason = if sw.suspended_ms() > SUSPEND_GAP_MS {
                 Some(format!(
                     "the host was suspended for about {} s during an upstream call; restarting it",
@@ -1530,7 +1546,21 @@ impl Watch {
                 drop(g);
                 cancel.cancel();
                 hub.ops.cancelled.fetch_add(1, Ordering::Relaxed);
+                let reason = if ready.is_some() {
+                    format!("{reason} (its answer may predate the suspend and was discarded)")
+                } else {
+                    reason
+                };
                 return CallOutcome::Restart(reason);
+            }
+            if let Some(result) = ready {
+                return CallOutcome::Done(Box::new(result));
+            }
+            if g.subs.is_empty() {
+                drop(g);
+                cancel.cancel();
+                hub.ops.cancelled.fetch_add(1, Ordering::Relaxed);
+                return CallOutcome::Abandoned;
             }
             g = self
                 .cv
@@ -2451,7 +2481,7 @@ mod tests {
             local_target(std::path::Path::new("/x"), None, "a"),
             local_target(std::path::Path::new("/x"), None, "b"),
         ]);
-        let sw = util::Stopwatch::start();
+        let sw = WaitClock::start();
         let done = ThreadState::from_thread_json(
             &json!({"status": "completed", "latestRunId": "run:thread:a:ordinal:1"}),
             "a",
@@ -2486,7 +2516,7 @@ mod tests {
             local_target(std::path::Path::new("/x"), None, "a"),
             local_target(std::path::Path::new("/x"), None, "b"),
         ]);
-        let sw = util::Stopwatch::start();
+        let sw = WaitClock::start();
         let state = |id: &str, v: Value| ThreadState::from_thread_json(&v, id, Instant::now());
         let done = state(
             "a",
@@ -2524,7 +2554,7 @@ mod tests {
         let hub = Hub::new("test");
         let mut req = request(vec![local_target(std::path::Path::new("/x"), None, T)]);
         req.predicate.follow = true;
-        let sw = util::Stopwatch::start();
+        let sw = WaitClock::start();
         let mut events = Vec::new();
         let mut r = Reported::default();
         let failed5 = snap(read(json!({"status": "failed", "latestRunId": run(T, 5)})));

@@ -812,6 +812,7 @@ fn cmd_wait(raw: &[String]) -> ! {
             json!({
                 "watchId": watch_id,
                 "event": event,
+                "eventSeq": v["eventSeq"],
                 "outcome": v["outcome"],
                 "endedAt": v["endedAt"],
                 "elapsedMs": v["elapsedMs"],
@@ -889,7 +890,7 @@ fn cmd_outbox(raw: &[String]) -> ! {
             print_json(
                 &json!({
                     "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
-                    "legacy": outbox::legacy_entries().iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
+                    "legacy": outbox::legacy_public_json(),
                     "unreadable": bad,
                     "dir": config::outbox_dir().display().to_string(),
                 }),

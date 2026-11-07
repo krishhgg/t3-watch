@@ -6,9 +6,11 @@
 //!   pending/          in-progress headless OAuth logins (0600 files)
 //!   daemon-e<N>.sock  the multiplexer socket for engine revision N (0600)
 //!   daemon-e<N>.sock.lock held by the running daemon
-//!   outbox-v3/        durable notifications not yet delivered (0700, entries,
+//!   outbox-v4/        durable notifications not yet delivered (0700, entries,
 //!                     per-entry lease files and receipts 0600)
-//!   outbox/, outbox-v2/ entries of older builds, migrated into outbox-v3/
+//!   outbox/           entries of builds before engine 4, migrated into outbox-v4/
+//!   outbox-v2/, outbox-v3/ entries of engine-4 and engine-5 builds, delivered
+//!                     where they are, the way those builds' senders would
 //!   trace.jsonl       delivery trace: waits, proofs, events, HTTP attempts
 //!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr
@@ -73,7 +75,7 @@ pub fn socket_path() -> PathBuf {
 /// directory but not this format's receipts and pending rules) never sees
 /// these entries.
 pub fn outbox_dir() -> PathBuf {
-    state_dir().join("outbox-v3")
+    state_dir().join("outbox-v4")
 }
 
 /// Where builds before engine 4 kept their entries (no leases).
@@ -84,6 +86,11 @@ pub fn legacy_outbox_dir() -> PathBuf {
 /// Where engine-4 builds keep theirs (per-entry leases).
 pub fn legacy_v2_outbox_dir() -> PathBuf {
     state_dir().join("outbox-v2")
+}
+
+/// Where engine-5 builds keep theirs (per-entry leases and receipts).
+pub fn legacy_v3_outbox_dir() -> PathBuf {
+    state_dir().join("outbox-v3")
 }
 
 /// Append-only delivery trace (`trace.jsonl`, 0600).

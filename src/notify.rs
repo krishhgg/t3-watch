@@ -515,18 +515,22 @@ pub fn post_once(
 }
 
 /// What the receipt of a finished entry says, as a webhook result. Only a
-/// `delivered` receipt counts as delivery; no receipt is `unknown`.
+/// valid `delivered` receipt counts as delivery; none, or one that cannot be
+/// trusted, is `unknown`.
 fn from_receipt(id: &str) -> Value {
-    match outbox::receipt(id) {
-        Some(r) if r["disposition"] == "delivered" => json!({
+    match outbox::receipt_status(id) {
+        outbox::ReceiptStatus::Valid(outbox::Disposition::Delivered, r) => json!({
             "delivered": true, "attempts": r["attempts"], "status": r["status"],
             "by": r["by"], "deliveredAt": r["at"], "disposition": "delivered" }),
-        Some(r) => json!({
-            "delivered": false, "attempts": r["attempts"], "disposition": r["disposition"],
+        outbox::ReceiptStatus::Valid(how, r) => json!({
+            "delivered": false, "attempts": r["attempts"], "disposition": how.as_str(),
             "outboxId": id, "at": r["at"],
-            "error": format!("the outbox entry was {} before it was delivered",
-                             r["disposition"].as_str().unwrap_or("finished")) }),
-        None => json!({
+            "error": format!("the outbox entry was {} before it was delivered", how.as_str()) }),
+        outbox::ReceiptStatus::Invalid(why) => json!({
+            "delivered": false, "attempts": 0, "disposition": "unknown", "outboxId": id,
+            "receiptError": why,
+            "error": "the outbox entry is gone and its receipt cannot be trusted; not counted as delivered" }),
+        outbox::ReceiptStatus::None => json!({
             "delivered": false, "attempts": 0, "disposition": "unknown", "outboxId": id,
             "error": "the outbox entry is gone and no receipt says why; not counted as delivered" }),
     }
@@ -570,17 +574,23 @@ fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option
         outbox::EntryState::Missing => return from_receipt(id),
     };
     // Finished already (a crash left the entry beside its receipt): never
-    // send it, and report what the receipt says.
-    if outbox::reconcile(&entry).is_some() {
-        return from_receipt(id);
-    }
-    if !outbox::inline_allowed(&entry) {
-        return json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
-                       "nextAttemptAt": util::rfc3339_ms(entry.next_attempt_ms),
-                       "notBefore": entry.not_before_ms.map(util::rfc3339_ms) });
-    }
-    let mut r = post_webhook(w, event, id, body);
-    if r["delivered"] == true {
+    // send it, and report what the receipt says. A receipt that cannot be
+    // trusted is reported and the event sent as usual.
+    let receipt_error = match outbox::reconcile(&entry) {
+        Ok(Some(_)) => return from_receipt(id),
+        Ok(None) => None,
+        Err(why) => Some(why),
+    };
+    let mut r = if !outbox::inline_allowed(&entry) {
+        json!({ "delivered": false, "queued": true, "outboxId": id, "attempts": 0,
+                "nextAttemptAt": util::rfc3339_ms(entry.next_attempt_ms),
+                "notBefore": entry.not_before_ms.map(util::rfc3339_ms) })
+    } else {
+        post_webhook(w, event, id, body)
+    };
+    if r["queued"] == true {
+        // Left to the sender, which owns its schedule.
+    } else if r["delivered"] == true {
         let mut done = (*entry).clone();
         done.attempts += r["attempts"].as_u64().unwrap_or(0) as u32;
         outbox::finish(
@@ -606,6 +616,9 @@ fn webhook_side(w: &Webhook, event: &str, id: &str, body: &[u8], durable: Option
         }
     }
     drop(lease);
+    if let Some(why) = receipt_error {
+        r["receiptError"] = json!(why);
+    }
     r
 }
 

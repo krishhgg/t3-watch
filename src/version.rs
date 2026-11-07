@@ -20,15 +20,20 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 5;
+pub const ENGINE: u32 = 6;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
-    // delivery, and a receipt is never overwritten.
+    // delivery, a valid receipt is never overwritten, and one without the
+    // entry's id and a known disposition is never trusted.
     "outbox-receipts",
-    // Entries older builds left are pending until migrated and delivered.
+    // Entries older builds left are pending until delivered, and those of
+    // leased older stores are delivered in place, never adopted by age.
     "outbox-legacy-drain",
-    // Deadlines count suspended time; stalled polls restart on resume.
+    "outbox-legacy-in-place",
+    // Deadlines count suspended time; stalled polls restart on resume, and
+    // answers or observations from before a resume are discarded.
     "suspend-aware",
+    "suspend-invalidation",
 ];
 pub const REV: &str = match option_env!("T3_WATCH_BUILD_REV") {
     Some(r) => r,

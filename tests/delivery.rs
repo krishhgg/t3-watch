@@ -732,3 +732,69 @@ fn the_timeline_judges_the_final_event_not_an_earlier_progress_one() {
     assert_eq!(progress[0]["event"], "run_failed");
     assert!(progress[0]["deliveredAt"].as_str().is_some(), "{summary}");
 }
+
+#[test]
+fn the_timeline_never_takes_a_progress_event_for_a_final_outcome_without_one() {
+    // Sol ordinal 7: run_failed went out (200), then the wait timed out
+    // under the default --notify-on, which prepares no timeout event. The
+    // delivered run_failed must not be read as the acceptance event.
+    for notify_on in [None, Some("all")] {
+        let mock = MockMcp::start();
+        mock.set_thread(T, "failed", 5);
+        let hook = MockHook::start();
+        let env = mcp_env(&mock);
+        let mut args = vec![
+            "wait",
+            "--no-daemon",
+            "--follow",
+            "--expect-min-run-ordinal",
+            "5",
+            "--timeout",
+            "3s",
+            "--webhook-url",
+            &hook.url,
+        ];
+        if let Some(n) = notify_on {
+            args.extend(["--notify-on", n]);
+        }
+        args.push(T);
+        let out = env.run(&args);
+        assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+        let tl = std::process::Command::new("python3")
+            .args(["-I", concat!(env!("CARGO_MANIFEST_DIR"), "/e2e/timeline.py")])
+            .arg(env.home.join("trace.jsonl"))
+            .output()
+            .unwrap();
+        assert!(tl.status.success(), "{}", String::from_utf8_lossy(&tl.stderr));
+        let stdout = String::from_utf8_lossy(&tl.stdout);
+        let summary: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["acceptanceEvent"]["event"], "timeout", "{summary}");
+        let progress = summary["progressEvents"].as_array().unwrap();
+        assert!(
+            progress
+                .iter()
+                .any(|p| p["event"] == "run_failed" && p["deliveredAt"].is_string()),
+            "{summary}"
+        );
+        if notify_on.is_none() {
+            assert_eq!(summary["acceptanceDelivered"], false, "{summary}");
+            assert_eq!(summary["acceptanceEvent"]["id"], Value::Null, "{summary}");
+            assert!(
+                summary["acceptanceEvent"]["missing"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("timeout")),
+                "{summary}"
+            );
+            assert_eq!(summary["completionTo2xxS"], Value::Null, "{summary}");
+        } else {
+            // With --notify-on all the bot hears about the timeout too.
+            assert_eq!(summary["acceptanceDelivered"], true, "{summary}");
+            assert!(summary["acceptanceEvent"]["id"].is_string(), "{summary}");
+            assert_eq!(summary["acceptanceEvent"]["missing"], Value::Null, "{summary}");
+            assert!(hook
+                .requests()
+                .iter()
+                .any(|r| r.headers.get("x-t3-watch-event").map(String::as_str) == Some("timeout")));
+        }
+    }
+}

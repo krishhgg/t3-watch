@@ -261,7 +261,12 @@ enum LineError {
 
 /// Reads one `\n`-terminated line of at most `max` bytes (newline excluded).
 fn read_line_bounded(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, LineError> {
-    let mut out = Vec::new();
+    read_line_resumable(r, max, &mut Vec::new())
+}
+
+/// `read_line_bounded` that keeps what it read in `out` when the read times
+/// out, so the caller can check a deadline and carry on with the same line.
+fn read_line_resumable(r: &mut impl BufRead, max: usize, out: &mut Vec<u8>) -> Result<Vec<u8>, LineError> {
     loop {
         let buf = match r.fill_buf() {
             Ok(b) => b,
@@ -281,7 +286,7 @@ fn read_line_bounded(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, LineEr
         out.extend_from_slice(&buf[..take]);
         r.consume(if done { take + 1 } else { take });
         if done {
-            return Ok(out);
+            return Ok(std::mem::take(out));
         }
     }
 }
@@ -578,32 +583,49 @@ fn incompatible(accepted: Option<&Value>, first: &Value, sock: &Path) -> Option<
     ))
 }
 
+/// How long past the wait's own deadline the client gives the daemon to
+/// answer (it times the wait out itself at the same moment).
+const ANSWER_GRACE_MS: u64 = 30_000;
+
+/// The answer to a wait whose time ran out on the client's side: before a
+/// (re)registration, or while the daemon did not answer.
+fn client_timeout(sw: &util::Stopwatch, why: &str) -> Outcome {
+    Outcome::Timeout(json!({
+        "event": "timeout",
+        "outcome": "timeout",
+        "elapsedMs": sw.elapsed_ms(),
+        "via": "daemon",
+        "threads": [],
+        "lastError": why,
+    }))
+}
+
 /// Reads the daemon's answer to a wait, handing progress lines to
 /// `progress`. `None` means the connection dropped before an outcome
 /// arrived. An answer from a daemon of another engine revision becomes an
 /// `incompatible_daemon` error, and the connection is dropped, which
-/// cancels that daemon's wait.
+/// cancels that daemon's wait. Reads time out every second so the wait's
+/// suspend-inclusive deadline is checked even while the daemon is silent.
 fn read_outcome(
     stream: &UnixStream,
-    started: Instant,
+    sw: &util::Stopwatch,
+    deadline_ms: u64,
     sock: &Path,
     build: &mut Option<Value>,
     progress: &mut dyn FnMut(Value),
 ) -> Option<Outcome> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut reader = BufReader::new(stream);
     let mut accepted: Option<Value> = None;
+    let mut partial = Vec::new();
     loop {
-        let line = match read_line_bounded(&mut reader, MAX_RESPONSE_LINE) {
+        let line = match read_line_resumable(&mut reader, MAX_RESPONSE_LINE, &mut partial) {
             Ok(l) => l,
             Err(LineError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                return Some(Outcome::Timeout(json!({
-                    "event": "timeout",
-                    "outcome": "timeout",
-                    "elapsedMs": started.elapsed().as_millis() as u64,
-                    "via": "daemon",
-                    "threads": [],
-                    "lastError": "the daemon did not answer before the timeout",
-                })));
+                if sw.elapsed_ms() >= deadline_ms + ANSWER_GRACE_MS {
+                    return Some(client_timeout(sw, "the daemon did not answer before the timeout"));
+                }
+                continue;
             }
             Err(LineError::TooLong) => return Some(Outcome::Error(error_json("protocol", "daemon reply is too long"))),
             Err(_) => return None,
@@ -632,30 +654,43 @@ fn read_outcome(
 }
 
 /// Runs a wait through the daemon and returns the outcome with what the
-/// client learned about the daemon. If the daemon dies mid-wait (crash,
-/// upgrade, idle-exit race) the client reconnects and re-registers with the
-/// remaining time; the daemon's `elapsedMs` then counts from the last
-/// registration only.
+/// client learned about the daemon. The wait has one deadline on the
+/// suspend-inclusive clock, kept across reconnects: if the daemon dies
+/// mid-wait (crash, upgrade, idle-exit race) the client reconnects and
+/// re-registers with what is left of it, and times out at once when nothing
+/// is. The daemon's `elapsedMs` counts from the last registration only.
 pub fn wait(req: &WaitRequest, progress: &mut dyn FnMut(Value)) -> Result<(Outcome, DaemonInfo), String> {
-    let started = Instant::now();
+    let sw = util::Stopwatch::start();
+    let deadline_ms = req.timeout.as_millis() as u64;
     let sock = config::socket_path();
     let mut info = DaemonInfo {
         reconnects: 0,
         build: None,
     };
     loop {
+        let remaining = deadline_ms.saturating_sub(sw.elapsed_ms());
+        if remaining == 0 {
+            trace::record(
+                "daemon.expired",
+                json!({ "reconnects": info.reconnects, "elapsedMs": sw.elapsed_ms() }),
+            );
+            return Ok((
+                client_timeout(
+                    &sw,
+                    "the wait's time ran out (suspended time included) before it could be registered again",
+                ),
+                info,
+            ));
+        }
         let stream = connect_or_spawn()?;
         let mut r = req.clone();
-        r.timeout = req.timeout.saturating_sub(started.elapsed());
-        // The daemon enforces the timeout; this bound only matters if the
-        // daemon itself stops answering.
-        let _ = stream.set_read_timeout(Some(r.timeout + Duration::from_secs(30)));
+        r.timeout = Duration::from_millis(deadline_ms.saturating_sub(sw.elapsed_ms()).max(1));
         // Read even if the write failed: a daemon at its connection limit
         // answers with an error and closes before our request lands. With no
         // answer at all, the daemon exited after we connected (idle exit or
         // `stop`): reconnect like any other dropped connection.
         let _ = write_line(&stream, &r.to_json());
-        if let Some(outcome) = read_outcome(&stream, started, &sock, &mut info.build, progress) {
+        if let Some(outcome) = read_outcome(&stream, &sw, deadline_ms, &sock, &mut info.build, progress) {
             return Ok((outcome, info));
         }
         info.reconnects += 1;

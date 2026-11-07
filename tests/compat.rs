@@ -219,7 +219,7 @@ fn entries_left_by_an_older_build_are_migrated_only_when_no_client_can_own_them(
     let run = env.run(&["outbox", "run", "--once"]);
     let r = output_json(&run);
     assert!(r["results"].to_string().contains("\"migrated\":true"), "{r}");
-    // The old entry moved to outbox-v2 and was delivered with its own id.
+    // The old entry moved to this build's outbox and was delivered with its own id.
     let reqs = hook.requests();
     assert_eq!(reqs.len(), 1, "{r}");
     assert_eq!(reqs[0].headers["x-t3-watch-id"], old_id);
@@ -245,6 +245,7 @@ fn this_builds_entries_live_where_old_senders_never_look() {
     assert_eq!(out.status.code(), Some(4), "{}", both(&out));
     assert!(!env.home.join("outbox").exists(), "old senders read outbox/");
     assert!(!env.home.join("outbox-v2").exists(), "engine-4 senders read outbox-v2/");
+    assert!(!env.home.join("outbox-v3").exists(), "engine-5 senders read outbox-v3/");
     let v2: Vec<_> = fs::read_dir(env.home.join(OUTBOX))
         .unwrap()
         .flatten()
@@ -336,88 +337,149 @@ fn v2_entry(id: &str, url: &str, created_ms: u64, attempts: u32) -> Value {
     e
 }
 
-#[test]
-fn engine_4_entries_move_over_only_when_no_engine_4_process_can_own_them() {
-    let env = Env::new();
-    let hook = MockHook::start();
-    let v2 = private_dir(&env, "outbox-v2");
-    let now = now_ms();
-    // Attempted inline already, lease free: its client is done with it.
-    let (done, young, held, finished) = ("0a0a0a01", "0b0b0b02", "0c0c0c03", "0d0d0d04");
-    fs::write(
-        v2.join(format!("{done}.json")),
-        v2_entry(done, &hook.url, now, 4).to_string(),
-    )
-    .unwrap();
-    // Never attempted and just written: its client may be about to send it.
-    fs::write(
-        v2.join(format!("{young}.json")),
-        v2_entry(young, &hook.url, now, 0).to_string(),
-    )
-    .unwrap();
-    // Leased by a live engine-4 process right now.
-    fs::write(
-        v2.join(format!("{held}.json")),
-        v2_entry(held, &hook.url, now - 600_000, 4).to_string(),
-    )
-    .unwrap();
-    let lease = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(v2.join(format!("{held}.lock")))
-        .unwrap();
-    use std::os::fd::AsRawFd;
-    assert_eq!(
-        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
-    // Already finished there (dropped), entry left behind by a crash.
-    fs::write(
-        v2.join(format!("{finished}.json")),
-        v2_entry(finished, &hook.url, now - 600_000, 1).to_string(),
-    )
-    .unwrap();
-    fs::create_dir_all(v2.join("receipts")).unwrap();
-    fs::write(
-        v2.join("receipts").join(format!("{finished}.json")),
-        json!({ "id": finished, "disposition": "dropped" }).to_string(),
-    )
-    .unwrap();
+fn entry_at(dir: &Path, id: &str) -> Option<Value> {
+    fs::read_to_string(dir.join(format!("{id}.json")))
+        .ok()
+        .map(|t| serde_json::from_str(&t).unwrap())
+}
 
-    let run = env.run(&["outbox", "run", "--once"]);
-    let r = output_json(&run);
-    assert_eq!(
-        run.status.code(),
-        Some(4),
-        "the young and the leased one are still pending: {r}"
-    );
-    let text = r["results"].to_string();
-    assert!(text.contains(done) && text.contains("\"migrated\":true"), "{r}");
-    let sent: Vec<String> = hook
-        .requests()
-        .iter()
-        .map(|q| q.headers["x-t3-watch-id"].clone())
-        .collect();
-    assert_eq!(sent, [done.to_string()], "only the finished-with entry is sent: {r}");
-    assert!(
-        v2.join(format!("{young}.json")).exists(),
-        "young entry kept for its client"
-    );
-    assert!(v2.join(format!("{held}.json")).exists(), "leased entry untouched");
-    assert!(
-        !v2.join(format!("{finished}.json")).exists(),
-        "finished entry cleaned up"
-    );
-    assert!(
-        fs::read_to_string(v2.join("receipts").join(format!("{finished}.json")))
-            .unwrap()
-            .contains("dropped"),
-        "its receipt is unchanged"
-    );
-    let status = output_json(&env.run(&["outbox", "list"]));
-    assert_eq!(status["legacy"].as_array().unwrap().len(), 2, "{status}");
-    drop(lease);
+#[test]
+fn older_builds_entries_are_delivered_where_they_are_never_moved() {
+    // Sol ordinal 7, P1: an a92f977 client, held back 100 s by a slow
+    // progress hook, found its entry gone after engine 5 moved it at 91 s
+    // (the receiver had answered 401) and reported the event delivered. To
+    // an engine-4 or engine-5 client only a real 2xx may take its entry
+    // away; anything else must leave it where it is, marked as the
+    // sender's, so that client reports it queued.
+    for store in ["outbox-v2", "outbox-v3"] {
+        let env = Env::new();
+        let hook = MockHook::start();
+        let dir = private_dir(&env, store);
+        let now = now_ms();
+        let (waiting, held, finished) = ("0a0a0a01", "0c0c0c03", "0d0d0d04");
+        // Never attempted, 91 s old: its client is still held back.
+        let mut e = v2_entry(waiting, &hook.url, now - 91_000, 0);
+        e["nextAttemptMs"] = json!(now - 1_000);
+        fs::write(dir.join(format!("{waiting}.json")), e.to_string()).unwrap();
+        // Leased by a live old process right now.
+        fs::write(
+            dir.join(format!("{held}.json")),
+            v2_entry(held, &hook.url, now - 600_000, 4).to_string(),
+        )
+        .unwrap();
+        let lease = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{held}.lock")))
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // Already finished there (dropped), entry left behind by a crash.
+        fs::write(
+            dir.join(format!("{finished}.json")),
+            v2_entry(finished, &hook.url, now - 600_000, 1).to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("receipts")).unwrap();
+        fs::write(
+            dir.join("receipts").join(format!("{finished}.json")),
+            json!({ "id": finished, "disposition": "dropped" }).to_string(),
+        )
+        .unwrap();
+
+        hook.push(401, &[]);
+        let run = env.run(&["outbox", "run", "--once"]);
+        let r = output_json(&run);
+        assert_eq!(run.status.code(), Some(4), "{store}: {r}");
+        assert!(!r["results"].to_string().contains("migrated"), "{store}: {r}");
+        let sent: Vec<String> = hook
+            .requests()
+            .iter()
+            .map(|q| q.headers["x-t3-watch-id"].clone())
+            .collect();
+        assert_eq!(sent, [waiting.to_string()], "{store}: {r}");
+        // Still where its client looks, with the attempt counted as the
+        // sender's: a92f977's client then reports it queued.
+        let kept = entry_at(&dir, waiting).unwrap_or_else(|| panic!("{store}: the entry left its store: {r}"));
+        assert!(kept["retries"].as_u64().unwrap() >= 1, "{store}: {kept}");
+        assert_eq!(kept["lastStatus"], 401, "{store}: {kept}");
+        assert!(entry_at(&env.home.join(OUTBOX), waiting).is_none(), "{store}: copied");
+        assert!(!dir.join("receipts").join(format!("{waiting}.json")).exists());
+        assert!(entry_at(&dir, held).is_some(), "{store}: leased entry touched");
+        assert!(entry_at(&dir, finished).is_none(), "{store}: finished entry kept");
+        assert!(
+            fs::read_to_string(dir.join("receipts").join(format!("{finished}.json")))
+                .unwrap()
+                .contains("dropped"),
+            "{store}: its receipt changed"
+        );
+        let list = output_json(&env.run(&["outbox", "list"]));
+        assert_eq!(list["legacy"].as_array().unwrap().len(), 2, "{store}: {list}");
+        assert!(list["legacy"].to_string().contains(store), "{store}: {list}");
+
+        // The receiver takes it: only now does it leave, with a receipt.
+        let run = env.run(&["outbox", "run", "--once"]);
+        assert_eq!(run.status.code(), Some(4), "{store}: the leased one is still pending");
+        assert_eq!(hook.requests().len(), 2, "{store}");
+        assert!(entry_at(&dir, waiting).is_none(), "{store}: delivered but kept");
+        let receipt = fs::read_to_string(dir.join("receipts").join(format!("{waiting}.json"))).unwrap();
+        assert!(receipt.contains("\"disposition\":\"delivered\""), "{store}: {receipt}");
+        drop(lease);
+    }
+}
+
+#[test]
+fn a_receipt_that_cannot_be_trusted_never_discards_an_event() {
+    // Sol ordinal 7, P2: a pending entry beside the receipt `{}` was deleted
+    // unsent and `outbox run --once` exited 0 with nothing pending.
+    let bad = [
+        "{}".to_string(),
+        json!({ "id": "0f0f0f06", "disposition": "teleported" }).to_string(),
+        json!({ "id": "0e0e0e0e", "disposition": "delivered" }).to_string(),
+        json!({ "disposition": "delivered" }).to_string(),
+        "not json".to_string(),
+    ];
+    for store in ["outbox-v2", "outbox-v3", OUTBOX] {
+        for receipt in &bad {
+            let env = Env::new();
+            let hook = MockHook::start();
+            let dir = private_dir(&env, store);
+            let id = "0f0f0f06";
+            fs::write(
+                dir.join(format!("{id}.json")),
+                v2_entry(id, &hook.url, now_ms() - 600_000, 1).to_string(),
+            )
+            .unwrap();
+            fs::create_dir_all(dir.join("receipts")).unwrap();
+            fs::write(dir.join("receipts").join(format!("{id}.json")), receipt).unwrap();
+            let what = format!("{store} {receipt}");
+
+            let list = output_json(&env.run(&["outbox", "list"]));
+            assert!(list.to_string().contains(id), "{what}: not listed as pending: {list}");
+            hook.push(503, &[]);
+            let run = env.run(&["outbox", "run", "--once"]);
+            let r = output_json(&run);
+            assert_eq!(run.status.code(), Some(4), "{what}: {r}");
+            assert!(r["pending"].as_u64().unwrap() >= 1, "{what}: {r}");
+            assert!(r["results"].to_string().contains("receiptError"), "{what}: {r}");
+            assert_eq!(hook.requests().len(), 1, "{what}: the event was not sent");
+            assert!(entry_at(&dir, id).is_some(), "{what}: the event was discarded");
+
+            let run = env.run(&["outbox", "run", "--once"]);
+            assert_eq!(run.status.code(), Some(0), "{what}: {}", both(&run));
+            assert_eq!(hook.requests().len(), 2, "{what}");
+            assert!(entry_at(&dir, id).is_none(), "{what}");
+            let now: Value =
+                serde_json::from_str(&fs::read_to_string(dir.join("receipts").join(format!("{id}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(now["id"], id, "{what}: {now}");
+            assert_eq!(now["disposition"], "delivered", "{what}: {now}");
+        }
+    }
 }
 
 // ---- Sol ordinal 6, P2: a receipt next to a surviving entry is final -------

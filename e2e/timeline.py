@@ -20,10 +20,13 @@ times must come from the bot's own records, per event, for completion,
 needs-input and durable replay separately.
 
 The acceptance event is one notification: the one named by --id, else the
-wait's final event (its highest eventSeq). Only its delivery counts toward
-`completionTo2xxS`; progress events (run_failed, outages) are listed apart
-and never stand in for it. If the acceptance event was not delivered, the
-summary says so (`acceptanceDelivered: false`, `completionTo2xxS: null`).
+notification of the wait's final outcome (the `wait.outcome` line's event
+and eventSeq). Only its delivery counts toward `completionTo2xxS`; progress
+events (run_failed, outages) are listed apart and never stand in for it,
+even when they are the latest notification prepared. If the final outcome
+had no notification (say a timeout under `--notify-on settled`), the summary
+says it is missing (`acceptanceEvent.missing`); missing or not delivered,
+`acceptanceDelivered` is false and `completionTo2xxS` null.
 
 Usage: timeline.py TRACE [--watch WATCH_ID] [--id EVENT_ID] [--receipt TS]
                          [--continuation TS] [--bot NAME]
@@ -45,7 +48,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
     ap.add_argument("--watch")
-    ap.add_argument("--id", help="the acceptance notification id (default: the wait's final event)")
+    ap.add_argument("--id", help="the acceptance notification id (default: the final outcome's notification)")
     ap.add_argument("--receipt")
     ap.add_argument("--continuation")
     ap.add_argument("--bot")
@@ -67,13 +70,30 @@ def main():
         sys.exit(f"no lines for watch {watch}")
     prepared = [l for l in lines if l.get("kind") == "notify.prepared" and l.get("watchId") == watch]
     ids = {l["id"] for l in prepared}
+    outcome = next((l for l in mine if l.get("kind") == "wait.outcome"), {})
+    missing = None
     if a.id:
         target = next((l for l in prepared if l["id"] == a.id), None)
         if not target:
             sys.exit(f"notification {a.id} is not an event of watch {watch}")
+    elif not outcome:
+        target = None
+        missing = "the wait has no final outcome in this trace"
     else:
-        target = max(prepared, key=lambda l: (l.get("eventSeq") or 0), default=None)
-    outcome = next((l for l in mine if l.get("kind") == "wait.outcome"), {})
+        # The final outcome's own notification: same event, and the same
+        # eventSeq when the trace records it (older traces do not).
+        final = [
+            l
+            for l in prepared
+            if l.get("event") == outcome.get("event")
+            and (outcome.get("eventSeq") is None or l.get("eventSeq") == outcome.get("eventSeq"))
+        ]
+        target = max(final, key=lambda l: (l.get("eventSeq") or 0), default=None)
+        if not target:
+            missing = (
+                f"no notification was prepared for the final outcome ({outcome.get('event')}); "
+                "check --notify-on"
+            )
     threads = {t.get("threadId") for t in outcome.get("threads") or []}
     start_at = ts(mine[0]["at"])
     end_at = ts(next((l["at"] for l in mine if l.get("kind") == "wait.exit"), mine[-1]["at"]))
@@ -161,8 +181,9 @@ def main():
         "eventIds": sorted(ids),
         "acceptanceEvent": {
             "id": target_id,
-            "event": target.get("event") if target else None,
-            "eventSeq": target.get("eventSeq") if target else None,
+            "event": target.get("event") if target else outcome.get("event"),
+            "eventSeq": target.get("eventSeq") if target else outcome.get("eventSeq"),
+            "missing": missing,
         },
         "acceptanceDelivered": delivered is not None,
         "acceptanceDisposition": disposition(target_id) if target_id else None,

@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 pub const BIN: &str = env!("CARGO_BIN_EXE_t3-watch");
 /// This build's engine revision, its daemon socket under `T3_WATCH_HOME`,
 /// and its outbox directory.
-pub const ENGINE: u64 = 5;
-pub const SOCK: &str = "daemon-e5.sock";
-pub const OUTBOX: &str = "outbox-v3";
+pub const ENGINE: u64 = 6;
+pub const SOCK: &str = "daemon-e6.sock";
+pub const OUTBOX: &str = "outbox-v4";
 pub const TOKEN: &str = "test-token-read-only";
 
 pub struct MockState {
@@ -119,6 +119,10 @@ pub struct MockState {
     /// The next this many long-polls never answer (a connection that died
     /// while the host slept); they end only when the client hangs up.
     pub hang_waits: usize,
+    /// After the Nth `t3_thread_read` (1-based) has been answered, write
+    /// this many ms to this suspend file before the answer goes out: the
+    /// host slept while the answer, a snapshot from before, was on its way.
+    pub suspend_after_read: HashMap<usize, (PathBuf, u64)>,
 }
 
 impl Default for MockState {
@@ -173,6 +177,7 @@ impl Default for MockState {
             probe_override: Map::new(),
             completed_at: None,
             hang_waits: 0,
+            suspend_after_read: HashMap::new(),
         }
     }
 }
@@ -702,6 +707,9 @@ fn handle_mcp(mut stream: TcpStream, req: Req, m: &Mutex<MockState>, cv: &Condva
                     if let Some((t, status, ord)) = s.after_read.remove(&n) {
                         s.threads.insert(t, (status, ord));
                     }
+                    if let Some((file, ms)) = s.suspend_after_read.remove(&n) {
+                        fs::write(file, ms.to_string()).unwrap();
+                    }
                     let recent = match &s.completed_at {
                         Some(at) if !is_active(&status) => {
                             json!([{ "runId": run, "ordinal": ord, "status": status, "completedAt": at }])
@@ -1041,6 +1049,13 @@ for a; do last="$a"; done
 f='{d}/threads/'"$last"
 if [ ! -f "$f" ]; then echo "Thread $last is no longer available." >&2; exit 1; fi
 read status ord < "$f"
+st='{d}/stale/'"$last"
+if [ -f "$st" ]; then
+  read status ord next_status next_ord suspend_file suspend_ms < "$st"
+  rm -f "$st"
+  printf '%s %s\n' "$next_status" "$next_ord" > "$f"
+  printf '%s' "$suspend_ms" > "$suspend_file"
+fi
 m='{d}/messages/'"$last"
 msgs='[]'
 if [ -f "$m" ]; then msgs=$(cat "$m"); fi
@@ -1057,6 +1072,28 @@ printf '{{"thread":{{"threadId":"%s","title":"mock local","status":"%s","latestR
         let tmp = self.dir.join("tmp");
         fs::write(&tmp, format!("{status} {ordinal}\n")).unwrap();
         fs::rename(tmp, self.dir.join("threads").join(id)).unwrap();
+    }
+
+    /// The next `t3` call for this thread prints `then` (a snapshot from
+    /// before a suspend), while the thread moves to `now` and the suspend
+    /// file to `suspend_ms` before the output goes out.
+    pub fn stale_once(&self, id: &str, then: (&str, u64), now: (&str, u64), suspend: &Path, suspend_ms: u64) {
+        fs::create_dir_all(self.dir.join("stale")).unwrap();
+        let tmp = self.dir.join("stale-tmp");
+        fs::write(
+            &tmp,
+            format!(
+                "{} {} {} {} {} {}\n",
+                then.0,
+                then.1,
+                now.0,
+                now.1,
+                suspend.display(),
+                suspend_ms
+            ),
+        )
+        .unwrap();
+        fs::rename(tmp, self.dir.join("stale").join(id)).unwrap();
     }
 
     /// What `t3 thread show --messages` prints for this thread.
