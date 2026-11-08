@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 pub const BIN: &str = env!("CARGO_BIN_EXE_t3-watch");
 /// This build's engine revision, its daemon socket under `T3_WATCH_HOME`,
 /// and its outbox directory.
-pub const ENGINE: u64 = 10;
-pub const SOCK: &str = "daemon-e10.sock";
+pub const ENGINE: u64 = 11;
+pub const SOCK: &str = "daemon-e11.sock";
 pub const OUTBOX: &str = "outbox-v4";
 pub const TOKEN: &str = "test-token-read-only";
 

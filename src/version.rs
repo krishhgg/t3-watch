@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 10;
+pub const ENGINE: u32 = 11;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -40,6 +40,9 @@ pub const CAPABILITIES: &[&str] = &[
     // that never leave an entry more exposed to an older sender than
     // before, and repaired after a crash.
     "outbox-legacy-checked-convert",
+    // `claude-code:<session_id>` targets, watched through the session's
+    // recorded hook events (experimental).
+    "native-claude-code-hooks",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

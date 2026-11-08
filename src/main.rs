@@ -7,6 +7,7 @@ mod engine;
 mod local;
 mod mcp;
 mod model;
+mod native;
 mod notify;
 mod oauth;
 mod outbox;
@@ -46,10 +47,13 @@ USAGE
   t3-watch auth oauth-finish <CALLBACK>   pair from a headless machine, step 2
   t3-watch auth discover <ORIGIN|URL>     show OAuth metadata without registering
   t3-watch auth list | default <NAME> | logout <NAME>
+  t3-watch hook claude-code [--print-settings]
+                                          record a Claude Code hook event (experimental)
 
 THREAD is a thread id, a T3 thread URL (https://<relay>/<envId>/<threadId>),
 or a t3-thread://v2/<envId>/<threadId> link. URLs pick the saved machine
-with the same origin.
+with the same origin. Experimental: claude-code:<session_id> watches a native
+Claude Code session through `t3-watch hook claude-code` (docs/native-sessions.md).
 
 WAIT OPTIONS
   -m, --machine <NAME>             saved machine to use (`local` for the local CLI)
@@ -272,6 +276,28 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
     // Every message below shows the argument without userinfo, query or
     // fragment: any of them can carry a credential.
     let shown = util::without_secrets(arg);
+    // Native sessions (experimental): a Claude Code session through its
+    // hook event log. Native Codex threads are not supported yet.
+    if let Some(session) = arg.strip_prefix(native::CLAUDE_PREFIX) {
+        if !native::valid_session_id(session) {
+            return Err("a Claude Code target is claude-code:<session_id> (letters, digits, '-' and '_')".into());
+        }
+        return Ok(TargetSpec {
+            transport: Transport::ClaudeCode,
+            machine: "claude-code".into(),
+            thread_id: native::claude_thread_id(session),
+            environment_id: None,
+            t3_bin: None,
+            base_dir: None,
+        });
+    }
+    if arg.to_ascii_lowercase().starts_with("codex://") {
+        return Err(
+            "codex:// targets are not supported yet: the native Codex adapter is still being verified \
+             (docs/native-sessions.md)"
+                .into(),
+        );
+    }
     let mut origin: Option<(String, String)> = None; // (origin, host)
     let (thread_id, env) = if let Some((scheme, rest)) = arg.split_once("://") {
         // A URL: only its path names the thread. The query and fragment
@@ -716,7 +742,7 @@ fn cmd_wait(raw: &[String]) -> ! {
                         "machine": t.machine,
                         "threadId": t.thread_id,
                         "environmentId": t.environment_id,
-                        "transport": if t.transport == Transport::Local { "local" } else { "mcp" },
+                        "transport": t.transport.as_str(),
                     })).collect::<Vec<_>>(),
                     "until": if req.predicate.until_delegated { "workstream" } else { "turn" },
                     "noDaemon": no_daemon,
@@ -941,6 +967,28 @@ fn cmd_outbox(raw: &[String]) -> ! {
     }
 }
 
+/// `t3-watch hook claude-code`: an async Claude Code command hook. It never
+/// prints and always exits 0, so it cannot change the session; a failure to
+/// record goes to stderr, which Claude Code shows at most as a notice.
+fn cmd_hook(raw: &[String]) -> ! {
+    match raw.first().map(String::as_str) {
+        Some("claude-code") if raw.get(1).map(String::as_str) == Some("--print-settings") => {
+            let bin = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "t3-watch".into());
+            print_json(&native::claude_settings(&bin), true);
+            exit(0)
+        }
+        Some("claude-code") => {
+            if let Err(e) = native::record_claude_hook(std::io::stdin().lock()) {
+                util::warn(&format!("t3-watch hook: {e}"));
+            }
+            exit(0)
+        }
+        _ => usage_error("hook takes: claude-code [--print-settings]"),
+    }
+}
+
 fn cmd_auth(raw: &[String]) -> ! {
     let Some(sub) = raw.first() else {
         usage_error("auth needs a subcommand: login, oauth-start, oauth-finish, discover, list, default, logout")
@@ -1043,6 +1091,7 @@ fn main() {
         Some("wait") => cmd_wait(rest),
         Some("auth") => cmd_auth(rest),
         Some("outbox") => cmd_outbox(rest),
+        Some("hook") => cmd_hook(rest),
         Some(sub @ ("login" | "oauth-start" | "oauth-finish")) => run_auth(sub, rest),
         Some("daemon") => {
             let a = parse_args(rest, &["idle-exit"], &[]).unwrap_or_else(|e| usage_error(&e));

@@ -58,6 +58,19 @@ const HEADER_ONLY: u64 = 1_000_000_000;
 pub enum Transport {
     Mcp,
     Local,
+    /// A native Claude Code session, through its hook event log
+    /// (experimental, see `native`).
+    ClaudeCode,
+}
+
+impl Transport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Mcp => "mcp",
+            Transport::Local => "local",
+            Transport::ClaudeCode => "claude-code",
+        }
+    }
 }
 
 /// One thread to watch, as the client resolved it.
@@ -96,7 +109,7 @@ impl WaitRequest {
             .iter()
             .map(|t| {
                 json!({
-                    "transport": if t.transport == Transport::Local { "local" } else { "mcp" },
+                    "transport": t.transport.as_str(),
                     "machine": t.machine,
                     "threadId": t.thread_id,
                     "environmentId": t.environment_id,
@@ -132,6 +145,7 @@ impl WaitRequest {
                 transport: match s(t, "transport").as_deref() {
                     Some("local") => Transport::Local,
                     Some("mcp") => Transport::Mcp,
+                    Some("claude-code") => Transport::ClaudeCode,
                     _ => return Err("target has no valid transport".into()),
                 },
                 machine: s(t, "machine").ok_or("target missing machine")?,
@@ -217,6 +231,19 @@ impl WaitRequest {
                 }
                 if t.t3_bin.as_ref().is_some_and(|p| !p.is_absolute()) {
                     return Err("local targets need an absolute t3 binary path".into());
+                }
+            }
+            if t.transport == Transport::ClaudeCode {
+                let session = t.thread_id.strip_prefix(crate::native::CLAUDE_PREFIX).unwrap_or("");
+                if !crate::native::valid_session_id(session) {
+                    return Err("a Claude Code target is claude-code:<session_id>".into());
+                }
+                if self.predicate.until_delegated || self.predicate.final_marker.is_some() {
+                    return Err(
+                        "--until workstream and --final-marker are T3 contracts; a Claude Code session \
+                         is watched turn by turn (see docs/native-sessions.md)"
+                            .into(),
+                    );
                 }
             }
         }
@@ -330,18 +357,23 @@ enum WatchKey {
         thread_id: String,
         final_marker: Option<String>,
     },
+    /// Keyed by the session id (`thread_id` is `claude-code:<id>`).
+    ClaudeCode { thread_id: String },
 }
 
 impl WatchKey {
     fn thread_id(&self) -> &str {
         match self {
-            WatchKey::Mcp { thread_id, .. } | WatchKey::Local { thread_id, .. } => thread_id,
+            WatchKey::Mcp { thread_id, .. }
+            | WatchKey::Local { thread_id, .. }
+            | WatchKey::ClaudeCode { thread_id } => thread_id,
         }
     }
 
     fn final_marker(&self) -> Option<&str> {
         match self {
             WatchKey::Mcp { final_marker, .. } | WatchKey::Local { final_marker, .. } => final_marker.as_deref(),
+            WatchKey::ClaudeCode { .. } => None,
         }
     }
 }
@@ -354,6 +386,10 @@ enum Backend {
     Local {
         t3_bin: Option<PathBuf>,
         base_dir: PathBuf,
+    },
+    /// Folds `native::claude_state` from the session's hook event log.
+    ClaudeCode {
+        session: String,
     },
 }
 
@@ -826,6 +862,19 @@ impl Hub {
                         },
                     )
                 }
+                Transport::ClaudeCode => {
+                    let session = t
+                        .thread_id
+                        .strip_prefix(crate::native::CLAUDE_PREFIX)
+                        .unwrap_or_default()
+                        .to_string();
+                    (
+                        WatchKey::ClaudeCode {
+                            thread_id: t.thread_id.clone(),
+                        },
+                        Backend::ClaudeCode { session },
+                    )
+                }
             };
             out.push(entry);
         }
@@ -1220,6 +1269,10 @@ impl Hub {
                         v["baseDir"] = json!(base_dir.to_string_lossy());
                         v["t3Bin"] = json!(t3_bin.as_ref().map(|p| p.to_string_lossy()));
                     }
+                    WatchKey::ClaudeCode { .. } => {
+                        v["transport"] = json!("claude-code");
+                        v["until"] = json!("turn");
+                    }
                 }
                 v
             })
@@ -1395,11 +1448,18 @@ fn marker_in_local_messages(v: &Value, run: &str, marker: &str) -> bool {
 impl Watch {
     fn poll_interval(&self) -> Duration {
         let g = lock(&self.inner);
-        g.subs
+        let every = g
+            .subs
             .iter()
             .map(|s| s.interval)
             .min()
-            .unwrap_or(Duration::from_secs(5))
+            .unwrap_or(Duration::from_secs(5));
+        // Reading a hook log is a local file read: look twice a second.
+        if matches!(self.backend, Backend::ClaudeCode { .. }) {
+            every.min(Duration::from_millis(500))
+        } else {
+            every
+        }
     }
 
     fn unsubscribe(&self, sub: u64) {
@@ -1573,6 +1633,11 @@ impl Watch {
     fn cycle(&self, cancel: &Cancel) -> Result<Cycle, CallError> {
         match &self.backend {
             Backend::Mcp(client) => self.mcp_cycle(client, cancel),
+            // A local file read: no process, no network, no model.
+            Backend::ClaudeCode { session } => Ok(Cycle {
+                state: crate::native::claude_state(session, Instant::now()),
+                next: Next::Interval,
+            }),
             Backend::Local { t3_bin, base_dir } => {
                 let bin = t3_bin
                     .clone()
