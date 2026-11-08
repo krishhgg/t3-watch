@@ -632,6 +632,15 @@ are ignored, and a URL with credentials (`user:password@`) or another
 scheme is refused with an error that does not repeat them. A bare thread id
 with `?`, `#`, `@` or whitespace is refused without being echoed.
 
+## Native Codex and Claude Code sessions (experimental)
+
+Bots that manage existing native Codex threads or Claude Code sessions
+need the same wakes as for T3 threads. Adapters for those are scoped in
+[`docs/native-sessions.md`](docs/native-sessions.md). They follow the
+same rules: watch only, never answer an approval, official interfaces
+only. They are experimental and outside the T3 acceptance gates, and
+neither counts as supported until its own acceptance checks pass.
+
 ## How it works
 
 ```
