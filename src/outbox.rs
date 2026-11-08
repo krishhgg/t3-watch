@@ -1469,7 +1469,8 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
 /// engine 5 (`0.3.0`, never released) moves such entries whatever their
 /// state, minding only the entry lease; engine 6 (`0.4.0`) removes one that
 /// has a receipt beside it (`legacyConversionsIncomplete`). Found when a
-/// daemon of theirs answers at a default socket: where it would listen in
+/// daemon of theirs is alive at a default socket (holding its socket lock,
+/// or accepting or queueing connections, see `util::daemon_alive`): where it would listen in
 /// this environment (`$XDG_RUNTIME_DIR/t3-watch/` or the state directory),
 /// and the state directory as well (a daemon started without
 /// `$XDG_RUNTIME_DIR`). A daemon on a custom `T3_WATCH_SOCKET`, or an
@@ -1493,7 +1494,7 @@ pub fn incompatible_senders() -> Vec<Value> {
         ];
         places.dedup();
         for sock in places {
-            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            if util::daemon_alive(&sock) {
                 out.push(json!({
                     "engine": engine,
                     "socket": sock.display().to_string(),

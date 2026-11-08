@@ -317,8 +317,15 @@ With `--durable`, a webhook is never fire-and-forget:
    even `outbox run --once` waits for it. DNS failures, refused
    connections, 5xx and 4xx alike are retried; after `--durable-max-age`
    (default 7 days) the entry moves to `outbox-v4/dead/`.
-4. The daemon does not idle-exit while the outbox holds entries. One sender
-   runs at a time (`outbox-v4/sender.lock`).
+4. The daemon does not idle-exit while it has entries to send: this
+   build's, an older build's it may deliver (item 7), and receipts it
+   still has to take back. Entries it may not touch (a blocked
+   `outbox-v2/`, item 8), retained entries and dead letters do not keep it
+   up, and an entry stops being retried once it expires, delivered or
+   not. A daemon that is killed, or a host that is off or asleep, sends
+   nothing until a t3-watch command starts the daemon again (any `wait`
+   does) or a supervised `t3-watch outbox run` is running. One sender runs
+   at a time (`outbox-v4/sender.lock`).
 5. Each entry has a lease (an flock on `<id>.lock`). Whoever sends it, the
    client inline or the sender, holds the lease for the attempt and for
    recording its result, and rereads the entry first: the two never send
@@ -357,10 +364,12 @@ With `--durable`, a webhook is never fire-and-forget:
    receipt in that store. Builds before engine 4 used `outbox/`, without
    leases; their clients only report delivery on their own 2xx, so those
    entries move here after the 90 s inline grace, under that build's
-   `outbox/sender.lock`. Until delivered, all of these count as pending
-   everywhere: `outbox list` (under `legacy`, with their store), `status`
-   (`legacyPending`), the exit code of `outbox run --once`, and the daemon,
-   which stays up until they are delivered.
+   `outbox/sender.lock`. Until delivered or expired, those this build may
+   send count as pending: `outbox list` (under `legacy`, with their store),
+   `status` (`legacyPending`), the exit code of `outbox run --once`, and
+   the daemon, which stays up while any remain. Entries of a blocked
+   `outbox-v2/` (item 8) are counted apart (`legacyBlocked`) and do not keep
+   it up.
 8. An older build's entry can also leave undelivered: it expires, or
    `outbox drop` drops it (`drop` finds entries in `outbox-v2/` and
    `outbox-v3/` too). Engine-5 clients read the receipt, so an
@@ -421,14 +430,17 @@ With `--durable`, a webhook is never fire-and-forget:
      access to this state directory; `--revoke` withdraws it;
    - no engine-5 or engine-6 daemon answers at a default socket
      (`$XDG_RUNTIME_DIR/t3-watch/`, or the state directory, which is also
-     checked). One that does refuses even an acknowledged store, and
-     refuses the acknowledgement itself.
+     checked). A daemon counts as alive if it holds its socket lock
+     (`<socket>.lock`, held by every build since engine 4) or accepts or
+     queues a connection, so one that has stopped accepting is still found.
+     One that is alive refuses even an acknowledged store, and refuses the
+     acknowledgement itself.
 
-   Until then `outbox run --once`, `outbox list` and `outbox drop` on such
-   an entry fail closed: exit 4 (`drop`: 2) with `upgradePrecondition`
-   saying why. `status` shows the same and counts the entries as
-   `legacyBlocked`, which do not keep the daemon up, and the daemon logs
-   the refusal once. The absence of those sockets is never taken as
+   Until then `outbox run --once`, `outbox list`, `status` and `outbox
+   drop` on such an entry fail closed: exit 4 (`drop`: 2) with
+   `upgradePrecondition` saying why (`status` under `outbox`, with or
+   without a running daemon). The entries are counted as `legacyBlocked`
+   and do not keep the daemon up, and the daemon logs the refusal once. The absence of those sockets is never taken as
    enough: a custom-socket daemon or an `outbox run` cannot be seen from
    here. A busy `outbox-v2/` lock is an error too, since the sender holding
    it may be an older build's. An entry engine 5 moved, still held to

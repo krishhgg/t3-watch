@@ -1224,3 +1224,79 @@ fn a_busy_outbox_v2_lock_is_an_error_and_the_fence_stays() {
         drop(held);
     }
 }
+
+// ---- Follow-ups after review ordinal 14 ------------------------------------------
+
+#[test]
+fn status_fails_closed_like_list_and_a_blocked_store_does_not_keep_the_daemon_up() {
+    // `status` exited 0 while reporting the refusal that makes `outbox list`
+    // and `outbox run --once` exit 4, and the docs said a queued outbox
+    // keeps the daemon up until delivery, which a blocked store does not.
+    let env = Env::new();
+    let id = "9a9a9a9a";
+    let v2 = fresh_unattempted_entry(&env, id);
+    let before = snapshot(&v2);
+    // No daemon: the local outbox summary, refusal included.
+    let out = env.run(&["status"]);
+    let v = output_json(&out);
+    assert_eq!(out.status.code(), Some(4), "{v}");
+    assert_eq!(v["running"], false, "{v}");
+    assert!(v["outbox"]["upgradePrecondition"].is_object(), "{v}");
+    // With a daemon (idle exit 2 s in tests): the same, and it still idles
+    // out, since a blocked entry is not its to send.
+    let mut daemon = env.spawn(&["daemon"]);
+    env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+    let out = env.run(&["status"]);
+    assert_eq!(out.status.code(), Some(4), "{}", both(&out));
+    assert_eq!(output_json(&out)["outbox"]["legacyBlocked"], 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while daemon.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon stayed up for an entry it may not send"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(snapshot(&v2), before);
+    // Nothing refused: status exits 0.
+    let clean = Env::new();
+    let out = clean.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+}
+
+#[test]
+fn a_live_engine_6_daemon_that_does_not_accept_is_still_found() {
+    // A single connect missed a daemon that holds its lock but does not
+    // accept (hung, stopped, or its backlog full).
+    use std::os::fd::AsRawFd;
+    let env = Env::new();
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = env.home.join("daemon-e6.sock");
+    // A socket file nobody accepts on: connect is refused.
+    drop(UnixListener::bind(&sock).unwrap());
+    assert!(UnixStream::connect(&sock).is_err());
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(
+        list["incompatibleSenders"],
+        json!([]),
+        "a stale socket is not a daemon: {list}"
+    );
+    // Its daemon is alive: it holds the lock, as every build does.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.home.join("daemon-e6.sock.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(list["incompatibleSenders"][0]["engine"], 6, "{list}");
+    let ack = env.run(&["outbox", "legacy-ack", "--senders-stopped"]);
+    assert_eq!(ack.status.code(), Some(2), "{}", both(&ack));
+    // The probe neither took the lock from it nor created anything.
+    assert_ne!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, -1);
+    assert!(!env.home.join("daemon-e5.sock.lock").exists());
+}

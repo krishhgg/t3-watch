@@ -1137,14 +1137,23 @@ fn main() {
                 exit(1)
             }
         }
-        Some("status") => match daemon::request("status") {
-            Ok(Some(mut v)) => {
-                v["running"] = Value::Bool(true);
-                print_json(&v, rest.iter().any(|a| a == "--pretty"))
-            }
-            Ok(None) => write_stdout("{\"running\":false}\n"),
-            Err(e) => fail_json("daemon", &e),
-        },
+        // Exits 4, like `outbox list` and `outbox run --once`, while the
+        // outbox reports an unmet upgrade precondition; the outbox summary is
+        // reported whether or not a daemon runs.
+        Some("status") => {
+            let pretty = rest.iter().any(|a| a == "--pretty");
+            let v = match daemon::request("status") {
+                Ok(Some(mut v)) => {
+                    v["running"] = Value::Bool(true);
+                    v
+                }
+                Ok(None) => json!({ "running": false, "outbox": outbox::summary_json() }),
+                Err(e) => fail_json("daemon", &e),
+            };
+            let refused = !v["outbox"]["upgradePrecondition"].is_null();
+            print_json(&v, pretty);
+            exit(if refused { EXIT_NOTIFY_FAILED } else { 0 })
+        }
         Some("stop") => match daemon::request("stop") {
             Ok(Some(v)) => print_json(&v, false),
             Ok(None) => write_stdout("{\"ok\":true,\"running\":false}\n"),

@@ -47,10 +47,12 @@ this build leaves `outbox-v2/` untouched until you stop every engine-5
 custom socket, and `outbox run` without a daemon) and then run
 `t3-watch outbox legacy-ack --senders-stopped`. Until then, and whenever
 such a daemon answers at a default socket, `outbox run --once` and
-`outbox list` exit 4 with `upgradePrecondition`, and `status` reports it. Entries in `outbox/` (before engine 4)
-move over after the 90 s inline grace. All of them count as pending until
-delivered or retained, so the daemon does not idle out with an event
-unsent.
+`outbox list` and `status` exit 4 with `upgradePrecondition`. Entries in
+`outbox/` (before engine 4) move over after the 90 s inline grace. The
+daemon stays up while it has entries it may send (until each is delivered
+or expires). A blocked `outbox-v2/`, retained entries and dead letters do
+not keep it up, and nothing is sent while the daemon is not running or
+the host is asleep.
 
 `<state>/trace.jsonl` records each wait, the daemon build that served it,
 the first proof or settled observation (with T3's `completedAt`), the

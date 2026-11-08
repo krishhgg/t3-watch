@@ -557,6 +557,65 @@ pub fn open_private_read(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// Whether a t3-watch daemon (of any build) is alive at `sock`: it holds the
+/// flock on `<sock>.lock` (every build since engine 4 does for its whole
+/// life), or something accepts or queues a connection there. Never blocks
+/// and never creates a file: the lock is opened read-only and probed with a
+/// shared non-blocking flock, released at once (a daemon that loses that
+/// race retries its own lock for seconds), and the connect is non-blocking,
+/// so a listener that has stopped accepting, or whose backlog is full, still
+/// counts as alive rather than hanging the probe or passing unseen.
+pub fn daemon_alive(sock: &Path) -> bool {
+    let mut lock = sock.as_os_str().to_owned();
+    lock.push(".lock");
+    if let Ok(f) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(Path::new(&lock))
+    {
+        // SAFETY: plain flock calls on a descriptor we own.
+        let held = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
+        if !held {
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+        if held {
+            return true;
+        }
+    }
+    listener_at(sock)
+}
+
+/// A non-blocking connect to the Unix socket at `path`: connected, or the
+/// listener is there but cannot take us yet.
+fn listener_at(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: a zeroed sockaddr_un filled within its bounds, and a socket
+    // closed on every path.
+    unsafe {
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        if bytes.len() >= addr.sun_path.len() {
+            return false;
+        }
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let r = libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, len);
+        let err = io::Error::last_os_error().raw_os_error();
+        libc::close(fd);
+        r == 0 || matches!(err, Some(libc::EINPROGRESS) | Some(libc::EAGAIN) | Some(libc::EALREADY))
+    }
+}
+
 /// Exits with status 97 at a named point when `T3_WATCH_TEST_FAULT` names
 /// it: crash-recovery tests stop the process exactly there.
 pub fn test_fault(point: &str) {
