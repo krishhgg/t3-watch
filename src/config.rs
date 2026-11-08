@@ -12,9 +12,7 @@
 //!   outbox-v2/, outbox-v3/ entries of engine-4 and engine-5 builds, delivered
 //!                     where they are, the way those builds' senders would;
 //!                     undelivered outbox-v2/ ones kept, held back from older
-//!                     senders, until their client is done (outbox-v2/
-//!                     sender.lock is a directory, a fence, while a receipt
-//!                     beside one is being taken back)
+//!                     senders, until their client is done
 //!   trace.jsonl       delivery trace: waits, proofs, events, HTTP attempts
 //!   hooks.log         output of --on-settle programs (0600)
 //!   daemon.log        daemon stderr

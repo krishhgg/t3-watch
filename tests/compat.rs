@@ -316,16 +316,23 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
     mock.set_thread(T, "running", 3);
     let env = mcp_env(&mock);
     fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
-    let served: Vec<_> = [(4, "0.2.0"), (5, "0.3.0"), (6, "0.4.0"), (7, "0.5.0"), (8, "0.6.0")]
-        .into_iter()
-        .map(|(engine, version)| {
-            fake_daemon(
-                &env.home.join(format!("daemon-e{engine}.sock")),
-                completed_by_old_engine(json!({ "event": "accepted", "pid": 4242, "version": version,
+    let served: Vec<_> = [
+        (4, "0.2.0"),
+        (5, "0.3.0"),
+        (6, "0.4.0"),
+        (7, "0.5.0"),
+        (8, "0.6.0"),
+        (9, "0.7.0"),
+    ]
+    .into_iter()
+    .map(|(engine, version)| {
+        fake_daemon(
+            &env.home.join(format!("daemon-e{engine}.sock")),
+            completed_by_old_engine(json!({ "event": "accepted", "pid": 4242, "version": version,
                                                 "engine": engine, "rev": "old" })),
-            )
-        })
-        .collect();
+        )
+    })
+    .collect();
     let out = env.run(&["wait", "--timeout", "1500ms", T]);
     assert_eq!(out.status.code(), Some(3), "{}", both(&out));
     let v = output_json(&out);
@@ -340,7 +347,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         "outbox-legacy-in-place",
         "outbox-legacy-retain",
         "outbox-legacy-retain-held",
-        "outbox-legacy-fence",
+        "outbox-legacy-checked-convert",
         "suspend-aware",
         "suspend-invalidation",
     ] {
@@ -563,37 +570,58 @@ fn exited_pid() -> u32 {
     pid
 }
 
-/// What an older sender does with an `outbox-v2/` entry on a forced pass,
-/// in its own order: engine 6 (83e013e) and engine 7 (4e3c16e) clean up an
-/// entry beside a receipt first; then every engine-4 (8f06a73 to fa10d88),
-/// engine-6 and engine-7 sender dead-letters an expired entry, defers one
-/// whose `notBefore` is ahead (forced or not), and sends the rest.
-fn older_sender_would(dir: &Path, e: &Value) -> &'static str {
+/// The leased older senders modelled below, each from its own source.
+const OLDER: [u32; 4] = [4, 6, 7, 8];
+
+/// Whether an older sender's forced pass takes an `outbox-v2/` entry out of
+/// the store without delivering it, while the engine-4 client that made it
+/// is still running (that client would then report it delivered):
+///
+/// - engine 4 (8f06a73 to fa10d88) reads no receipts: it dead-letters an
+///   expired entry, defers one whose `notBefore` is ahead, sends the rest;
+/// - engine 6 (83e013e) cleans up an entry beside a valid receipt, then
+///   does what engine 4 does;
+/// - engine 7 (4e3c16e) and engine 8 (26ee492) keep an expired entry, or
+///   one beside an undelivered receipt, for a client the trace shows
+///   running.
+fn older_sender_removes(engine: u32, dir: &Path, e: &Value) -> bool {
     let id = e["id"].as_str().unwrap();
-    // Every leased older build opens `sender.lock` as a file before it
-    // touches the store; a directory there stops them all.
-    if dir.join("sender.lock").is_dir() {
-        return "stay out (fence)";
+    let receipt: Option<Value> = fs::read_to_string(dir.join("receipts").join(format!("{id}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let valid_receipt = receipt.is_some_and(|r| {
+        r["id"] == id && ["delivered", "expired", "dropped"].contains(&r["disposition"].as_str().unwrap_or(""))
+    });
+    let expired = now_ms() >= e["expiresMs"].as_u64().unwrap();
+    match engine {
+        4 => expired,
+        6 => valid_receipt || expired,
+        7 | 8 => false,
+        _ => unreachable!(),
     }
-    if dir.join("receipts").join(format!("{id}.json")).exists() {
-        return "clean up beside its receipt";
-    }
-    let now = now_ms();
-    if now >= e["expiresMs"].as_u64().unwrap() {
-        return "dead-letter";
-    }
-    if e["notBeforeMs"].as_u64().is_some_and(|t| now < t) {
-        return "defer";
-    }
-    "send"
+}
+
+/// The older senders that would remove this entry without delivering it.
+fn exposed_to(dir: &Path, e: &Value) -> Vec<u32> {
+    OLDER.into_iter().filter(|n| older_sender_removes(*n, dir, e)).collect()
 }
 
 /// A retained entry: an engine-4 client reports it queued (a sender retry
-/// recorded) and every older sender defers it.
+/// recorded) and no modelled older sender removes it.
 fn assert_retained(dir: &Path, kept: &Value, how: &str) {
-    assert_eq!(older_sender_would(dir, kept), "defer", "{kept}");
+    assert_eq!(exposed_to(dir, kept), Vec::<u32>::new(), "{kept}");
     assert!(kept["retries"].as_u64().unwrap() >= 1, "{kept}");
     assert_eq!(kept["retainedAs"], how, "{kept}");
+}
+
+/// No step of this build leaves an entry exposed to an older sender it was
+/// not exposed to before.
+fn assert_no_more_exposed(before: &[u32], dir: &Path, e: &Value, when: &str) {
+    let after = exposed_to(dir, e);
+    assert!(
+        after.iter().all(|n| before.contains(n)),
+        "{when}: exposed to engines {after:?}, before only {before:?}: {e}"
+    );
 }
 
 fn receipt_in(dir: &Path, id: &str) -> Value {
@@ -701,16 +729,24 @@ fn a_dropped_engine_4_entry_stays_where_its_client_looks_until_that_client_is_do
 }
 
 #[test]
-fn a_running_engine_5_sender_is_reported_as_unsafe_for_retained_entries() {
+fn running_engine_5_and_6_senders_are_reported_as_unsafe_for_engine_4_entries() {
     // Engine 5 (0.3.0) moves outbox-v2 entries whatever their state, minding
-    // only the lease: nothing on disk keeps a retained entry from it.
+    // only the lease; engine 6 (0.4.0) removes one beside a receipt. No
+    // state on disk keeps such an entry from them.
     let env = Env::new();
     fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
     let list = output_json(&env.run(&["outbox", "list"]));
     assert_eq!(list["incompatibleSenders"], json!([]), "{list}");
     fake_daemon(&env.home.join("daemon-e5.sock"), vec![]);
+    fake_daemon(&env.home.join("daemon-e6.sock"), vec![]);
     let list = output_json(&env.run(&["outbox", "list"]));
-    assert_eq!(list["incompatibleSenders"][0]["engine"], 5, "{list}");
+    let engines: Vec<u64> = list["incompatibleSenders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["engine"].as_u64().unwrap())
+        .collect();
+    assert_eq!(engines, [5, 6], "{list}");
     assert!(list["incompatibleSenders"][0]["action"]
         .as_str()
         .unwrap()
@@ -766,16 +802,19 @@ fn left_by_engine_7(env: &Env, hook: &MockHook, id: &str) -> PathBuf {
 }
 
 #[test]
-fn a_receipt_conversion_cut_short_keeps_older_senders_out_until_it_is_done() {
-    // Sol's repro: this build died right before taking back the receipt
-    // beside an entry held for a live a92f977 client; restarted, it left the
-    // receipt; a real 83e013e sender then removed the entry beside it, and
-    // the client reported its event delivered.
+fn a_receipt_conversion_cut_short_never_leaves_an_entry_more_exposed_and_is_repaired() {
+    // Sol ordinals 10 and 12: this build died right before taking back the
+    // receipt beside an entry held for a live a92f977 client. No older
+    // sender can be kept out across that crash (one may already hold the
+    // lock file open), so what matters is what each would do with what is
+    // left: never more than with what was there before this build acted.
     let env = Env::new();
     let hook = MockHook::start();
     let id = "4a4a4a4a";
     let v2 = left_by_engine_7(&env, &hook, id);
     let receipt = v2.join("receipts").join(format!("{id}.json"));
+    let before = exposed_to(&v2, &entry_at(&v2, id).unwrap());
+    assert_eq!(before, [4, 6], "what 0.5.0 leaves is already exposed");
 
     let cut = env
         .cmd(&["outbox", "run", "--once"])
@@ -783,49 +822,51 @@ fn a_receipt_conversion_cut_short_keeps_older_senders_out_until_it_is_done() {
         .output()
         .unwrap();
     assert_eq!(cut.status.code(), Some(97), "{}", both(&cut));
-    // Cut short with both files there: held entry, receipt not yet back.
     let kept = entry_at(&v2, id).expect("the entry left outbox-v2");
     assert_eq!(kept["retainedAs"], "expired", "{kept}");
     assert!(receipt.exists());
-    // No leased older sender may touch outbox-v2 meanwhile.
-    assert_eq!(older_sender_would(&v2, &kept), "stay out (fence)");
-    let status = output_json(&env.run(&["outbox", "list"]));
-    assert!(status.to_string().contains(id), "{status}");
+    assert_no_more_exposed(&before, &v2, &kept, "cut short before the receipt went");
+    assert_eq!(exposed_to(&v2, &kept), [6], "an engine-4 sender no longer would");
+    assert!(
+        v2.join("sender.lock").is_file(),
+        "no fence: older senders lock it as before"
+    );
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert!(list["retained"].to_string().contains(id), "{list}");
 
-    // Restarted, it finishes the job and lowers the fence.
+    // Restarted, it finishes the job: exposed to none of them.
     let run = env.run(&["outbox", "run", "--once"]);
     let r = output_json(&run);
     assert_eq!(run.status.code(), Some(0), "{r}");
     assert!(r["results"].to_string().contains("\"converted\":true"), "{r}");
     assert!(!receipt.exists(), "{r}");
-    assert!(v2.join("sender.lock").is_file(), "the fence stayed up: {r}");
     let kept = entry_at(&v2, id).expect("the entry left outbox-v2");
     assert_retained(&v2, &kept, "expired");
     assert!(hook.requests().is_empty());
 }
 
 #[test]
-fn a_receipt_that_cannot_be_taken_back_is_reported_and_keeps_the_fence_up() {
-    // Sol: an ordinary failure to remove the receipt reproduced the same
-    // false delivery.
+fn a_receipt_that_cannot_be_taken_back_is_reported_and_never_more_exposed() {
+    // Sol ordinal 10: an ordinary failure to remove the receipt.
     let env = Env::new();
     let hook = MockHook::start();
     let id = "4b4b4b4b";
     let v2 = left_by_engine_7(&env, &hook, id);
+    let before = exposed_to(&v2, &entry_at(&v2, id).unwrap());
     let receipts = v2.join("receipts");
     fs::set_permissions(&receipts, fs::Permissions::from_mode(0o500)).unwrap();
 
     let run = env.run(&["outbox", "run", "--once"]);
     let r = output_json(&run);
     assert_eq!(run.status.code(), Some(4), "work is left: {r}");
-    assert!(r["results"].to_string().contains("conversionError"), "{r}");
+    let text = r["results"].to_string();
+    assert!(text.contains("conversionError") && text.contains("atRisk"), "{r}");
     let kept = entry_at(&v2, id).expect("the entry left outbox-v2");
-    assert_eq!(older_sender_would(&v2, &kept), "stay out (fence)");
+    assert_no_more_exposed(&before, &v2, &kept, "receipt removal refused");
     let mut daemon = env.spawn(&["daemon", "--idle-exit", "30s"]);
     env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
     let o = &env.status()["outbox"];
     assert_eq!(o["legacyConversionsIncomplete"], 1, "{o}");
-    assert_eq!(o["legacyFence"], true, "{o}");
     env.run(&["stop"]);
     daemon.wait().unwrap();
 
@@ -835,6 +876,53 @@ fn a_receipt_that_cannot_be_taken_back_is_reported_and_keeps_the_fence_up() {
     assert!(!receipts.join(format!("{id}.json")).exists());
     let kept = entry_at(&v2, id).expect("the entry left outbox-v2");
     assert_retained(&v2, &kept, "expired");
+}
+
+#[test]
+fn every_step_this_build_takes_on_an_engine_4_entry_leaves_it_no_more_exposed() {
+    // Each state this build can leave an outbox-v2 entry in, however it is
+    // interrupted, checked against what every modelled older sender would do
+    // with it: holding an expired entry (one write), and taking a receipt
+    // back from beside one (two writes, cut short between them or refused).
+    let now = now_ms();
+    for (case, receipt, cut) in [
+        ("expired, no receipt", false, false),
+        ("receipt beside, finished", true, false),
+        ("receipt beside, cut short", true, true),
+    ] {
+        let env = Env::new();
+        let hook = MockHook::start();
+        let id = "5a5a5a5a";
+        let v2 = left_by_engine_7(&env, &hook, id);
+        if !receipt {
+            fs::remove_file(v2.join("receipts").join(format!("{id}.json"))).unwrap();
+        }
+        let start = entry_at(&v2, id).unwrap();
+        assert!(start["expiresMs"].as_u64().unwrap() < now);
+        let before = exposed_to(&v2, &start);
+        let mut cmd = env.cmd(&["outbox", "run", "--once"]);
+        if cut {
+            cmd.env("T3_WATCH_TEST_FAULT", "before-receipt-unlink");
+        }
+        let out = cmd.output().unwrap();
+        let after = entry_at(&v2, id).unwrap_or_else(|| panic!("{case}: entry gone: {}", both(&out)));
+        assert_no_more_exposed(&before, &v2, &after, case);
+        if !cut {
+            assert_eq!(exposed_to(&v2, &after), Vec::<u32>::new(), "{case}: {after}");
+        }
+    }
+}
+
+#[test]
+fn a_fence_left_by_0_7_0_is_cleared_so_every_sender_can_lock_the_store() {
+    let env = Env::new();
+    let v2 = private_dir(&env, "outbox-v2");
+    fs::create_dir(v2.join("sender.lock")).unwrap();
+    fs::write(v2.join("sender.fenced.lock"), "").unwrap();
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", both(&run));
+    assert!(v2.join("sender.lock").is_file());
+    assert!(!v2.join("sender.fenced.lock").exists());
 }
 
 #[test]
@@ -878,7 +966,7 @@ fn a_held_entry_left_beside_its_receipt_is_repaired_on_the_next_pass() {
         held[k] = json!(4_102_444_800_000u64);
     }
     fs::write(&path, held.to_string()).unwrap();
-    assert_eq!(older_sender_would(&v2, &held), "clean up beside its receipt");
+    assert_eq!(exposed_to(&v2, &held), [6], "{held}");
 
     let run = env.run(&["outbox", "run", "--once"]);
     let r = output_json(&run);
@@ -890,4 +978,43 @@ fn a_held_entry_left_beside_its_receipt_is_repaired_on_the_next_pass() {
     let kept = entry_at(&v2, id).expect("the entry left outbox-v2");
     assert_retained(&v2, &kept, "expired");
     assert!(v2.join("sender.lock").is_file(), "{r}");
+}
+
+#[test]
+fn a_pass_cut_short_has_already_held_every_entry_it_had_not_reached() {
+    // Sol ordinal 12 shape, two entries: cut short while taking back the
+    // first receipt, the pass must not leave the other entry expired and
+    // unheld, which an engine-4 sender (a92f977's own, running beside its
+    // client) dead-letters, so that the client reports it delivered.
+    let env = Env::new();
+    let hook = MockHook::start();
+    let ids = ["6a6a6a6a", "6b6b6b6b"];
+    let mut v2 = PathBuf::new();
+    for id in ids {
+        v2 = left_by_engine_7(&env, &hook, id);
+    }
+    let before: Vec<Vec<u32>> = ids
+        .iter()
+        .map(|id| exposed_to(&v2, &entry_at(&v2, id).unwrap()))
+        .collect();
+    assert_eq!(before, [vec![4, 6], vec![4, 6]]);
+    let cut = env
+        .cmd(&["outbox", "run", "--once"])
+        .env("T3_WATCH_TEST_FAULT", "before-receipt-unlink")
+        .output()
+        .unwrap();
+    assert_eq!(cut.status.code(), Some(97), "{}", both(&cut));
+    for (id, before) in ids.iter().zip(&before) {
+        let e = entry_at(&v2, id).expect("an entry left outbox-v2");
+        assert_no_more_exposed(before, &v2, &e, "cut short");
+        assert!(
+            !exposed_to(&v2, &e).contains(&4),
+            "{id} is still what an engine-4 sender dead-letters: {e}"
+        );
+    }
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", both(&run));
+    for id in ids {
+        assert_retained(&v2, &entry_at(&v2, id).unwrap(), "expired");
+    }
 }

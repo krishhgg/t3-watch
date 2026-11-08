@@ -56,8 +56,9 @@
 //!   client is done with it: its `notify.result` for the entry, or the
 //!   process that created the entry gone. Without that evidence it stays
 //!   (`outbox list`, under `retained`); no age, absence or guess counts.
-//!   A receipt an older build left beside such an entry is taken back
-//!   behind a fence older senders cannot pass (see `Store::convert`).
+//!   A receipt an older build left beside such an entry is taken back in
+//!   steps that never leave it more exposed than before (see
+//!   `Store::convert`).
 //!   An engine-5 sender moves such entries whatever their state; it is
 //!   reported (`incompatibleSenders`) when its daemon is found.
 //! - Builds before engine 4 used `outbox/`, without leases; their clients
@@ -286,6 +287,11 @@ const RETAINED: &str = "an engine-4 client reads a missing entry as delivered; k
                         engine-4, engine-6 and engine-7 senders (not engine 5's, see incompatibleSenders), \
                         until the trace shows the client that made it is done with it";
 
+/// What an entry still beside its receipt is exposed to.
+const AT_RISK: &str = "an engine-5 or engine-6 sender would remove this entry beside its receipt, and its \
+                       engine-4 client would then report the event delivered; stop such senders until it is \
+                       taken back";
+
 /// Where a retained entry's expiry and next attempt are set, so that no
 /// build reading `outbox-v2/` treats it as expired or due:
 /// 2100-01-01T00:00:00Z.
@@ -494,11 +500,18 @@ impl Store {
     /// An entry beside a valid receipt that must stay for its engine-4
     /// client (an older build expired or dropped it, or a conversion was
     /// cut short): held, then the receipt taken back until it leaves, since
-    /// engine-6 and engine-7 senders remove an entry beside a receipt. Two
-    /// files cannot change at once, so this runs only behind the
-    /// `outbox-v2/` fence (see `raise_fence`), which keeps every leased older
-    /// sender out until the conversion is complete, crash or no crash. Each
-    /// step is checked; a failure leaves the fence up and is reported.
+    /// an engine-6 sender removes an entry beside a receipt. Call with the
+    /// store's sender lock and the entry's lease held.
+    ///
+    /// No older sender can be kept out across a crash of this process (its
+    /// locks die with it, and a sender that already opened a lock file keeps
+    /// it), so the steps are ordered so that every state they pass through
+    /// is no more exposed than the one before, under each older build's
+    /// rules: holding the entry first ends what an engine-4 sender would do
+    /// (dead-letter it once expired) and leaves only what an engine-6 sender
+    /// would already have done (clean up beside the receipt); taking the
+    /// receipt back then ends that too. Each step is checked and a failure
+    /// returned; whatever is left is repaired on the next pass.
     fn convert(&self, e: &Entry, how: Disposition) -> Result<(), String> {
         self.retain(e, how)?;
         util::test_fault("before-receipt-unlink");
@@ -534,41 +547,55 @@ impl Store {
         }
     }
 
-    /// `sender.lock` as a directory: every leased older build opens it as a
-    /// file (create, read-write), fails, and leaves the store alone, so none
-    /// of their senders runs here while it stands, even after this build
-    /// crashed. This build's senders lock `sender.fenced.lock` meanwhile,
-    /// the same file moved aside.
-    fn fenced(&self) -> bool {
-        fs::symlink_metadata(self.dir.join("sender.lock")).is_ok_and(|m| m.is_dir())
-    }
-
-    /// Raises the fence. Call holding the flock on `sender.lock`, which then
-    /// lives on as `sender.fenced.lock`.
-    fn raise_fence(&self) -> Result<(), String> {
-        let tmp = self.dir.join(".fence.tmp");
-        let _ = fs::remove_dir(&tmp);
-        util::ensure_private_dir(&tmp).map_err(|e| format!("cannot prepare the outbox-v2 fence: {e}"))?;
-        fs::rename(self.dir.join("sender.lock"), self.dir.join("sender.fenced.lock"))
-            .map_err(|e| format!("cannot raise the outbox-v2 fence: {e}"))?;
-        if let Err(e) = fs::rename(&tmp, self.dir.join("sender.lock")) {
-            // Something took the name in between: give the lock its name back.
-            let _ = fs::remove_dir(&tmp);
-            let _ = fs::rename(self.dir.join("sender.fenced.lock"), self.dir.join("sender.lock"));
-            return Err(format!("cannot raise the outbox-v2 fence: {e}"));
+    /// Before anything else in a pass over `outbox-v2/`, holds every entry
+    /// that must be kept for its engine-4 client: one beside an undelivered
+    /// receipt, an expired one, or one an older build moved while held. Each
+    /// hold is a single atomic write that ends what an engine-4 sender would
+    /// do with the entry, so doing them all first means that a pass cut
+    /// short later (taking a receipt back takes two writes) never leaves an
+    /// entry it had not reached yet in the state an engine-4 sender
+    /// dead-letters. Returns the ids it could not hold (reported).
+    fn hold_first(&self, results: &mut Vec<Value>) -> HashSet<String> {
+        let mut failed = HashSet::new();
+        if !self.absence_is_delivery {
+            return failed;
         }
-        trace::record("outbox.fence", json!({ "store": self.label, "raised": true }));
-        Ok(())
+        for listed in self.entries().0 {
+            let Ok(Some(_lease)) = self.try_lease(&listed.id) else {
+                continue;
+            };
+            let Some(e) = self.load(&listed.id) else {
+                continue;
+            };
+            let how = if let Some(how) = self.needs_conversion(&e) {
+                how
+            } else if e.retained_as.is_none()
+                && !self.finished(&e.id)
+                && (e.not_before_ms == Some(RETAINED_UNTIL_MS)
+                    || (util::now_ms() >= e.expires_ms && self.must_keep(&e, Disposition::Expired)))
+            {
+                Disposition::Expired
+            } else {
+                continue;
+            };
+            if let Err(why) = self.retain(&e, how) {
+                results.push(json!({ "id": e.id, "store": self.label, "conversionError": why,
+                                     "atRisk": AT_RISK }));
+                failed.insert(e.id.clone());
+            }
+        }
+        failed
     }
 
-    /// Lowers the fence once no conversion is left. Call holding the flock
-    /// on `sender.fenced.lock`.
-    fn lower_fence(&self) -> Result<(), String> {
-        fs::remove_dir(self.dir.join("sender.lock")).map_err(|e| format!("cannot lower the outbox-v2 fence: {e}"))?;
-        fs::rename(self.dir.join("sender.fenced.lock"), self.dir.join("sender.lock"))
-            .map_err(|e| format!("cannot lower the outbox-v2 fence: {e}"))?;
-        trace::record("outbox.fence", json!({ "store": self.label, "raised": false }));
-        Ok(())
+    /// A `sender.lock` directory left by the 0.7.0 fence: removed, and the
+    /// lock file it moved aside put back, so every sender can lock this
+    /// store again.
+    fn clear_old_fence(&self) {
+        let lock = self.dir.join("sender.lock");
+        if fs::symlink_metadata(&lock).is_ok_and(|m| m.is_dir()) && fs::remove_dir(&lock).is_ok() {
+            let _ = fs::rename(self.dir.join("sender.fenced.lock"), &lock);
+            trace::record("outbox.fence", json!({ "store": self.label, "cleared": true }));
+        }
     }
 
     /// Records how an entry left the store, then removes it (or, expired,
@@ -712,28 +739,19 @@ impl Store {
             return Ok(());
         }
         util::ensure_private_dir(&self.dir).map_err(|e| format!("cannot use the outbox directory: {e}"))?;
-        let lock_name = if self.fenced() {
-            "sender.fenced.lock"
-        } else {
-            "sender.lock"
-        };
-        let lock =
-            util::open_lock_file(&self.dir.join(lock_name)).map_err(|e| format!("cannot open the sender lock: {e}"))?;
+        self.clear_old_fence();
+        let lock = util::open_lock_file(&self.dir.join("sender.lock"))
+            .map_err(|e| format!("cannot open the sender lock: {e}"))?;
         if !util::try_flock(&lock).map_err(|e| format!("cannot lock the outbox: {e}"))? {
             results.push(json!({ "store": self.label, "skipped": "another sender is running" }));
             return Ok(());
         }
-        // Receipts to take back go behind the fence first; a fence left up
-        // (a conversion cut short) stays until they are all done.
-        let mut fenced = lock_name == "sender.fenced.lock";
-        if !fenced && self.entries().0.iter().any(|e| self.needs_conversion(e).is_some()) {
-            match self.raise_fence() {
-                Ok(()) => fenced = true,
-                Err(why) => results.push(json!({ "store": self.label, "error": why })),
-            }
-        }
+        let held_failed = self.hold_first(results);
         let mut jitter = Jitter::new();
         for listed in self.entries().0 {
+            if held_failed.contains(&listed.id) {
+                continue;
+            }
             let lease = match self.try_lease(&listed.id) {
                 Ok(Some(l)) => l,
                 Ok(None) => {
@@ -752,14 +770,11 @@ impl Store {
                 continue;
             };
             if let Some(how) = self.needs_conversion(&e) {
-                results.push(if !fenced {
-                    json!({ "id": e.id, "store": self.label, "conversionError": "the outbox-v2 fence is not up" })
-                } else {
-                    match self.convert(&e, how) {
-                        Ok(()) => json!({ "id": e.id, "store": self.label, "retained": how.as_str(),
-                                          "converted": true, "reason": RETAINED }),
-                        Err(why) => json!({ "id": e.id, "store": self.label, "conversionError": why }),
-                    }
+                results.push(match self.convert(&e, how) {
+                    Ok(()) => json!({ "id": e.id, "store": self.label, "retained": how.as_str(),
+                                      "converted": true, "reason": RETAINED }),
+                    Err(why) => json!({ "id": e.id, "store": self.label, "conversionError": why,
+                                        "atRisk": AT_RISK }),
                 });
                 continue;
             }
@@ -876,23 +891,6 @@ impl Store {
                 "nextAttemptAt": util::rfc3339_ms(e.next_attempt_ms),
                 "saveError": saved.err(),
             }));
-        }
-        if fenced {
-            let left = self
-                .entries()
-                .0
-                .iter()
-                .filter(|e| self.needs_conversion(e).is_some())
-                .count();
-            if left == 0 {
-                if let Err(why) = self.lower_fence() {
-                    results.push(json!({ "store": self.label, "error": why }));
-                }
-            } else {
-                results.push(json!({ "store": self.label, "fence": "up",
-                                     "reason": format!("{left} receipt(s) beside held entries still to take back; \
-                                                        older senders stay out of outbox-v2 until then") }));
-            }
         }
         self.prune_receipts();
         // Lease files whose entry is gone (a crash between the two removals).
@@ -1270,32 +1268,46 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
     }
 }
 
-/// Older senders that move `outbox-v2/` entries whatever their state,
-/// minding only the entry lease, so that no representation keeps a retained
-/// entry from them: engine 5 (`0.3.0`, never released). Found when its
-/// daemon answers at a default socket: where it would listen in this
-/// environment (`$XDG_RUNTIME_DIR/t3-watch/` or the state directory), and
-/// the state directory as well (a daemon started without
+/// Older senders whose own rules can remove an `outbox-v2/` entry an
+/// engine-4 client still needs, which no state this build writes can stop:
+/// engine 5 (`0.3.0`, never released) moves such entries whatever their
+/// state, minding only the entry lease; engine 6 (`0.4.0`) removes one that
+/// has a receipt beside it (`legacyConversionsIncomplete`). Found when a
+/// daemon of theirs answers at a default socket: where it would listen in
+/// this environment (`$XDG_RUNTIME_DIR/t3-watch/` or the state directory),
+/// and the state directory as well (a daemon started without
 /// `$XDG_RUNTIME_DIR`). A daemon on a custom `T3_WATCH_SOCKET`, or an
 /// `outbox run` without a daemon, is not found this way.
 pub fn incompatible_senders() -> Vec<Value> {
-    let mut places = vec![
-        config::default_socket_path(5),
-        config::state_dir().join("daemon-e5.sock"),
+    let risks = [
+        (
+            5,
+            "moves outbox-v2 entries an engine-4 client may still look for, so that client would report them delivered",
+        ),
+        (
+            6,
+            "removes an outbox-v2 entry that has a receipt beside it, so its engine-4 client would report it delivered",
+        ),
     ];
-    places.dedup();
-    places
-        .into_iter()
-        .filter(|sock| std::os::unix::net::UnixStream::connect(sock).is_ok())
-        .map(|sock| {
-            json!({
-                "engine": 5,
-                "socket": sock.display().to_string(),
-                "risk": "moves outbox-v2 entries an engine-4 client may still look for, so that client would report them delivered",
-                "action": "stop it with its own binary's `t3-watch stop`",
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for (engine, risk) in risks {
+        let mut places = vec![
+            config::default_socket_path(engine),
+            config::state_dir().join(format!("daemon-e{engine}.sock")),
+        ];
+        places.dedup();
+        for sock in places {
+            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                out.push(json!({
+                    "engine": engine,
+                    "socket": sock.display().to_string(),
+                    "risk": risk,
+                    "action": "stop it with its own binary's `t3-watch stop` while engine-4 clients may be running",
+                }));
+            }
+        }
+    }
+    out
 }
 
 pub fn summary_json() -> Value {
@@ -1311,7 +1323,6 @@ pub fn summary_json() -> Value {
         "legacyPending": legacy.len(),
         "legacyRetained": retained_public_json().len(),
         "legacyConversionsIncomplete": legacy_conversions_incomplete(),
-        "legacyFence": Store::leased_legacy(0).iter().any(Store::fenced),
         "incompatibleSenders": incompatible_senders(),
         "finishedAwaitingCleanup": entries.len() - pending.len(),
         "unreadable": bad.len(),
