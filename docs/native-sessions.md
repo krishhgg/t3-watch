@@ -171,6 +171,9 @@ Escape, which leaves the request open until the bot's next prompt.
    nothing; the print-mode sessions did leave one. What remains is the
    bot's own receipt and continuation, with timestamps and no user ping.
 
+Checks 3 and 4 are reproduced by `e2e/native/claude_interactive.py`; see
+`docs/acceptance-manifest.md` for the runs, logs and cleanup.
+
 ## Codex adapter
 
 ### How it works
@@ -301,7 +304,9 @@ the questions that gated the implementation:
 2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
    the probes above (fresh thread, needs-input with webhook, no changes,
    completion, pinned wake with webhook, unload, read after unload, two
-   requests in one turn).
+   requests in one turn), reproduced by `e2e/native/codex/run.sh`. The
+   default socket also worked through `codex app-server daemon start` in
+   an isolated `CODEX_HOME` (see `docs/acceptance-manifest.md`).
 3. **Open.** The desktop app on the MacBook: the read-only checks below,
    then a watch of the research thread, with no prompt sent.
 4. **Open.** A bot reusing a Codex thread is woken through its webhook,

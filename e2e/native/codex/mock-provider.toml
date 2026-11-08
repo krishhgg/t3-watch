@@ -1,0 +1,11 @@
+# CODEX_HOME/config.toml for the probes: a local mock of the Responses API
+# (mock_responses.py on port 18801), so no OpenAI request is made.
+model = "mock-model"
+model_provider = "mock"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+[model_providers.mock]
+name = "mock"
+base_url = "http://127.0.0.1:18801/v1"
+wire_api = "responses"

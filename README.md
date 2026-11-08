@@ -1099,6 +1099,13 @@ receiver to come back, an `--on-settle` hook whose output lands in
 and optionally strict OAuth discovery against a relay. The running thread
 must stay active for about two minutes.
 
+Three more harnesses run isolated, without T3 threads:
+`e2e/durable.sh` (receiver outage, daemon restart, SIGKILL during
+delivery), `e2e/native/codex/run.sh` (a real `codex app-server` with a
+mock model provider) and `e2e/native/claude_interactive.py` (a disposable
+interactive Claude Code session). `docs/acceptance-manifest.md` records
+their latest runs, each gate's status and the steps that need a person.
+
 ## Limitations
 
 - `--until workstream` needs the MCP transport and a T3 that returns
