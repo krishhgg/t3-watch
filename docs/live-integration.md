@@ -20,16 +20,16 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.10.0 (engine 12, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.11.0 (engine 13, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
 Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;
-`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0` to `0.9.0`, engines
-6 to 11): this build never talks to their daemons (sockets `daemon-e4.sock`
-to `daemon-e11.sock`, or older; on a shared `T3_WATCH_SOCKET` it refuses
+`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0` to `0.10.0`, engines
+6 to 12): this build never talks to their daemons (sockets `daemon-e4.sock`
+to `daemon-e12.sock`, or older; on a shared `T3_WATCH_SOCKET` it refuses
 them, by engine and by missing capabilities). It keeps its entries in
 `outbox-v4/`, which engine-4 and engine-5 senders never read; `0.4.0` to
-`0.9.0` use the same directory with the same rules. Their daemons keep
+`0.10.0` use the same directory with the same rules. Their daemons keep
 serving their own running clients and idle out afterwards; to retire one
 sooner, run its own binary's `t3-watch stop` once its clients are done.
 Entries older builds leave in `outbox-v2/` or `outbox-v3/` are never

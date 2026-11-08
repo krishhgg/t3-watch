@@ -679,7 +679,7 @@ neither counts as supported until its own acceptance checks pass.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e12.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e13.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -703,7 +703,7 @@ neither counts as supported until its own acceptance checks pass.
   (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
   `outbox-legacy-retain`, `outbox-legacy-retain-held`,
   `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
-  `native-claude-code-hooks`,
+  `native-claude-code-hooks`, `native-claude-code-requests`,
   `suspend-aware`,
   `suspend-invalidation`) in that
   line,
@@ -711,8 +711,9 @@ neither counts as supported until its own acceptance checks pass.
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 12 (this build) does not reach engine-11 daemons
-  (`0.9.0`, socket `daemon-e11.sock`), engine-10 ones (`0.8.0`,
+  `t3-watch stop`. Engine 13 (this build) does not reach engine-12 daemons
+  (`0.10.0`, socket `daemon-e12.sock`), engine-11 ones (`0.9.0`,
+  `daemon-e11.sock`), engine-10 ones (`0.8.0`,
   `daemon-e10.sock`), engine-9 ones (`0.7.0`,
   `daemon-e9.sock`), engine-8 ones (`0.6.0`,
   `daemon-e8.sock`), engine-7 ones (`0.5.0`,

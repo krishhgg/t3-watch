@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 12;
+pub const ENGINE: u32 = 13;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -48,6 +48,10 @@ pub const CAPABILITIES: &[&str] = &[
     // `claude-code:<session_id>` targets, watched through the session's
     // recorded hook events (experimental).
     "native-claude-code-hooks",
+    // Claude Code requests are tracked one by one (closed by their own
+    // answer, never by a tool event), and an idle session with no recorded
+    // turn never settles a wait.
+    "native-claude-code-requests",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

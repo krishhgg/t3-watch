@@ -23,19 +23,18 @@ const MAX_HOOK_INPUT: u64 = 4 << 20;
 /// Only the end of a long log is folded; a turn's events are near its end.
 const MAX_LOG_READ: u64 = 8 << 20;
 
-/// Notification types that mean the session waits on its user.
-const NEEDS_INPUT: [&str; 4] = [
-    "permission_prompt",
-    "elicitation_dialog",
-    "elicitation_url_dialog",
-    "agent_needs_input",
-];
-/// Events that end what a pending request was waiting on. Tool events are
-/// not among them: with tool ids deliberately not recorded, a later tool
-/// event (a parallel call, an async hook arriving late) cannot be told
-/// apart from the one that was waiting, so a request stays pending until
-/// it is denied, its elicitation is answered, or its turn ends.
-const ANSWERED: [&str; 2] = ["PermissionDenied", "ElicitationResult"];
+/// What an open request waits for. Tool events never close one: with tool
+/// inputs and ids deliberately not recorded, a later tool event (a parallel
+/// call, an async hook arriving late) cannot be told apart from the one
+/// that was waiting. A request stays open until its own kind is answered
+/// (`PermissionDenied` for a permission, `ElicitationResult` for an
+/// elicitation), one at a time, or its turn ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Waits {
+    Permission,
+    Elicitation,
+    Input,
+}
 
 pub fn valid_session_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -57,6 +56,19 @@ fn token(v: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty() && t.len() <= 64)
         .filter(|t| t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        .map(str::to_string)
+}
+
+/// A tool's name (`Bash`, `mcp__server__tool`): metadata, recorded so a
+/// denial closes that tool's request. Never its input.
+fn tool_name(v: &Value) -> Option<String> {
+    v.get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && t.len() <= 128)
+        .filter(|t| {
+            t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.'))
+        })
         .map(str::to_string)
 }
 
@@ -82,6 +94,7 @@ pub fn record_claude_hook(input: impl Read) -> Result<(), String> {
         "at": util::rfc3339_ms(util::now_ms()),
         "event": event,
         "type": kind,
+        "tool": tool_name(&v),
         "subagent": v.get("agent_id").is_some_and(|a| !a.is_null()),
     })
     .to_string();
@@ -128,55 +141,86 @@ fn shell_quote(s: &str) -> String {
 
 /// The session as its recorded hook events describe it, in the shape the
 /// engine reads for any thread: a status, the latest run (one per prompt)
-/// and how many requests are pending.
+/// and its open requests, each with its own id.
 pub fn claude_state(session: &str, observed_at: Instant) -> ThreadState {
     let tid = claude_thread_id(session);
-    // `pending` counts the requests seen since the last event that ended
-    // them, so each new one gives the wait a new pendingKey.
-    let (mut turn, mut status, mut pending, mut events) = (0u64, None::<&str>, 0u64, 0usize);
-    for line in read_log_tail(&claude_log(session)).lines() {
+    let (mut turn, mut status, mut events) = (0u64, None::<&str>, 0usize);
+    // (id, what it waits for, tool) for each open request: independent, so
+    // one answered request leaves the others open.
+    let mut open: Vec<(String, Waits, Option<String>)> = Vec::new();
+    for (n, line) in read_log_tail(&claude_log(session)).lines().enumerate() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         events += 1;
         let event = v.get("event").and_then(Value::as_str).unwrap_or("");
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let tool = v.get("tool").and_then(Value::as_str).map(str::to_string);
         // A subagent's stop or end is not the session's.
         let subagent = v.get("subagent").and_then(Value::as_bool) == Some(true);
+        let id = format!("cc-{turn}-{n}");
         match event {
             "UserPromptSubmit" => {
                 turn += 1;
                 status = Some("running");
-                pending = 0;
+                open.clear();
             }
             "Stop" | "StopFailure" | "SessionEnd" if subagent => {}
             "Stop" => {
                 status = Some("completed");
-                pending = 0;
+                open.clear();
             }
             "StopFailure" => {
                 status = Some("failed");
-                pending = 0;
+                open.clear();
             }
-            "PermissionRequest" => pending += 1,
-            "Notification" if NEEDS_INPUT.contains(&kind) => pending += 1,
-            "Notification" if kind == "idle_prompt" && status.is_none() => status = Some("completed"),
-            e if ANSWERED.contains(&e) => pending = 0,
             "SessionEnd" => {
                 if status == Some("running") {
                     status = Some("cancelled");
                 }
-                pending = 0;
+                open.clear();
             }
+            "PermissionRequest" => open.push((id, Waits::Permission, tool)),
+            // The dialog's own notification: the same request as an open
+            // PermissionRequest, a new one only if none is open.
+            "Notification" if kind == "permission_prompt" => {
+                if !open.iter().any(|(_, w, _)| *w == Waits::Permission) {
+                    open.push((id, Waits::Permission, None));
+                }
+            }
+            "Notification" if kind == "elicitation_dialog" || kind == "elicitation_url_dialog" => {
+                open.push((id, Waits::Elicitation, None))
+            }
+            "Notification" if kind == "agent_needs_input" => open.push((id, Waits::Input, None)),
+            "PermissionDenied" => {
+                // That tool's oldest open permission request, else the
+                // oldest one.
+                let at = open
+                    .iter()
+                    .position(|(_, w, t)| *w == Waits::Permission && tool.is_some() && *t == tool)
+                    .or_else(|| open.iter().position(|(_, w, _)| *w == Waits::Permission));
+                if let Some(at) = at {
+                    open.remove(at);
+                }
+            }
+            "ElicitationResult" => {
+                if let Some(at) = open.iter().position(|(_, w, _)| *w == Waits::Elicitation) {
+                    open.remove(at);
+                }
+            }
+            // No turn recorded yet: idle proves nothing about one, so it
+            // never counts as a completion.
             _ => {}
         }
     }
     let mut thread = json!({
         "threadId": tid,
         "status": status,
-        "pendingRequestCount": pending,
+        "pendingRequestCount": open.len(),
         "title": if events == 0 {
             "Claude Code session (no hook events recorded yet)"
+        } else if turn == 0 {
+            "Claude Code session (no turn recorded yet)"
         } else {
             "Claude Code session"
         },
@@ -189,7 +233,9 @@ pub fn claude_state(session: &str, observed_at: Instant) -> ThreadState {
             thread["activeRunId"] = json!(run);
         }
     }
-    ThreadState::from_thread_json(&json!({ "thread": thread }), &tid, observed_at)
+    let mut state = ThreadState::from_thread_json(&json!({ "thread": thread }), &tid, observed_at);
+    state.pending_ids = open.into_iter().map(|(id, _, _)| id).collect();
+    state
 }
 
 /// The end of the log, from its first whole line: empty when there is no

@@ -151,7 +151,7 @@ fn a_permission_prompt_stays_needs_input_until_its_turn_settles() {
         let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
         assert_eq!(out.status.code(), Some(5), "{e} cleared the request");
     }
-    // A second prompt in the same turn is a new pendingKey.
+    // The dialog's own notification is the same request, not a new one.
     hook(
         &env,
         event(
@@ -160,16 +160,45 @@ fn a_permission_prompt_stays_needs_input_until_its_turn_settles() {
         ),
     );
     let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+    assert_eq!(output_json(&out)["threads"][0]["pendingKey"], first);
+    // A second request in the same turn is its own, with a new pendingKey.
+    hook(&env, event("PermissionRequest", json!({ "tool_name": "Edit" })));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
     assert_eq!(out.status.code(), Some(5));
-    assert_ne!(output_json(&out)["threads"][0]["pendingKey"], first);
-    // Denied: running again.
+    let both_open = output_json(&out)["threads"][0]["pendingKey"].clone();
+    assert_ne!(both_open, first);
+    // Follow-up review: one denial zeroed every open request. Denying
+    // Write leaves Edit's request open.
     hook(&env, event("PermissionDenied", json!({ "tool_name": "Write" })));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+    assert_eq!(out.status.code(), Some(5), "the other request was closed too");
+    let v = output_json(&out);
+    assert_ne!(v["threads"][0]["pendingKey"], both_open, "{v}");
+    // Denying Edit too: running again.
+    hook(&env, event("PermissionDenied", json!({ "tool_name": "Edit" })));
     let out = env.run(&["wait", "--no-daemon", "--timeout", "1500ms", &target()]);
     assert_eq!(out.status.code(), Some(3), "running again, not needs-input");
     hook(&env, event("PermissionRequest", json!({ "tool_name": "Write" })));
     hook(&env, event("Stop", json!({})));
     let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn an_answered_elicitation_closes_only_itself() {
+    let env = Env::new();
+    hook(&env, event("UserPromptSubmit", json!({ "prompt": "x" })));
+    hook(
+        &env,
+        event("Notification", json!({ "notification_type": "elicitation_dialog" })),
+    );
+    hook(&env, event("PermissionRequest", json!({ "tool_name": "Bash" })));
+    hook(&env, event("ElicitationResult", json!({})));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+    assert_eq!(out.status.code(), Some(5), "the permission request was closed too");
+    hook(&env, event("PermissionDenied", json!({ "tool_name": "Bash" })));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "1500ms", &target()]);
+    assert_eq!(out.status.code(), Some(3));
 }
 
 #[test]
@@ -272,11 +301,18 @@ fn a_session_with_no_events_yet_keeps_waiting_and_says_why() {
     assert_eq!(out.status.code(), Some(3));
     let v = output_json(&out);
     assert!(v.to_string().contains("no hook events recorded yet"), "{v}");
-    // Idle with nothing seen before: settled.
+    // Follow-up review: an idle session with no turn recorded settled an
+    // unpinned wait. Idle proves nothing about a turn: still waiting.
     hook(
         &env,
         event("Notification", json!({ "notification_type": "idle_prompt" })),
     );
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "1500ms", &target()]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(output_json(&out).to_string().contains("no turn recorded yet"));
+    // Once a turn is recorded and ends, it settles.
+    hook(&env, event("UserPromptSubmit", json!({ "prompt": "x" })));
+    hook(&env, event("Stop", json!({})));
     let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
     assert_eq!(out.status.code(), Some(0));
 }

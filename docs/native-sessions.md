@@ -62,8 +62,10 @@ the session.
 
 `t3-watch hook claude-code` is that hook. It reads the JSON and appends one
 line to `<state>/native/claude-code/<session_id>.jsonl` (0600, fsynced). The
-line holds only the time, the event name and its type (`notification_type`,
-`source` or `reason`), never a prompt, message, tool input or path. The
+line holds only the time, the event name, its type (`notification_type`,
+`source` or `reason`) and the tool's name (`Bash`, `mcp__server__tool`, so a
+denial closes that tool's request), never a prompt, message, tool input or
+path. The
 hook always exits 0 and prints nothing, whatever the input. It never
 returns a decision.
 
@@ -78,10 +80,12 @@ costs a file read every half second and no model calls.
 | `UserPromptSubmit` | A new turn (run ordinal + 1) is running |
 | `Stop` | The turn completed |
 | `StopFailure` | The turn failed (API error) |
-| `Notification` with `permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog` or `agent_needs_input`; `PermissionRequest` | Input is needed (one more pending request, so each gets its own `pendingKey`) until the turn ends or one of the next two rows |
-| `PermissionDenied`, `ElicitationResult` | The pending request was answered |
+| `PermissionRequest`; `Notification` with `elicitation_dialog`, `elicitation_url_dialog` or `agent_needs_input` | Input is needed: one more open request, with its own id (so each gets its own `pendingKey`), until the turn ends or the next rows close it |
+| `Notification` with `permission_prompt` | The dialog of an open `PermissionRequest`: no new request; a new one only if none is open |
+| `PermissionDenied` | Closes one open permission request: that tool's oldest, else the oldest. Others stay open |
+| `ElicitationResult` | Closes the oldest open elicitation. Others stay open |
 | `Stop`, `StopFailure`, `SessionEnd` from a subagent (`agent_id` set) | No change: not the session's own |
-| `Notification` with `idle_prompt` | Idle and waiting for a prompt: settled if no turn was seen yet |
+| `Notification` with `idle_prompt` | No change. With no turn recorded yet, idle proves nothing about one, so it never settles a wait |
 | `SessionEnd` | A running turn ends as `cancelled` |
 | `SessionStart`, anything else | No change |
 
@@ -102,8 +106,9 @@ shell, so a path with a space works.
 submits a prompt the log may still show the previous turn as finished.
 A bot reusing a session reads the current `runOrdinal` before it
 submits, then waits with `--expect-min-run-ordinal <that + 1>`. An unpinned
-wait in that gap exits 0 on the old turn. For the same reason an
-`idle_prompt` with no turn seen yet settles an unpinned wait right away.
+wait in that gap exits 0 on the old turn. An `idle_prompt` with no turn
+recorded never settles a wait, and the thread title then says "no turn
+recorded yet".
 
 ### Limits of the first increment
 
