@@ -17,7 +17,7 @@ adapter is "supported" until its acceptance checks below have passed.
 
 | Adapter | Status |
 |---|---|
-| Claude Code (`claude-code:<session_id>`) | Planned. First increment: hook ingestion and waiting, tested with synthetic hook input. |
+| Claude Code (`claude-code:<session_id>`) | First increment implemented (hook ingestion and waiting). Acceptance checks 1 and 2 passed; 3 and 4 open. Not yet accepted. |
 | Codex (`codex://threads/<id>`) | Not implemented. The target is refused with an explicit "not supported yet" error. The protocol facts are verified below; the open questions are listed. |
 
 ## Rules for both adapters
@@ -102,17 +102,28 @@ merge into `~/.claude/settings.json` or a project's `.claude/settings.json`.
 
 ### Acceptance checks (not yet passed)
 
-1. Synthetic hook input: running, completed, failed, needs-input,
-   answered, cancelled; the hook never blocks, never prints, never stores
-   prompt text; webhook and `--durable` delivery.
-2. A real Claude Code process in an isolated temporary project, with the
-   hook loaded only from that test's settings, completes a trivial prompt.
-   t3-watch then reports `completed` for its `session_id`, and no user
-   settings or hooks are touched.
-3. The same for a permission prompt (needs-input), answered by a human in
-   an interactive session, not by t3-watch.
-4. A bot reusing an existing session is woken through its webhook, with
-   receipt and continuation timestamps and no user ping.
+1. **Passed.** Synthetic hook input: running, completed, failed,
+   needs-input, answered, cancelled; the hook never blocks, never prints,
+   never stores prompt text; webhook delivery, with and without the
+   daemon (`tests/native.rs`).
+2. **Passed** on the Mac mini with Claude Code 2.1.312. A real Claude Code
+   process ran in an isolated temporary project, in print mode, with
+   `--setting-sources local --settings <the hooks only> --tools ""
+   --strict-mcp-config --no-session-persistence --session-id <uuid>`, so
+   neither the user's settings nor their hooks were loaded. It fired
+   `SessionStart`, `UserPromptSubmit`, `Stop` and `SessionEnd` through
+   the async hook. A `t3-watch wait` registered before the prompt (through
+   the daemon, `--durable`) reported `completed` for run 1, and its
+   webhook delivered `settled` for `claude-code:<uuid>` about 4.5 s after
+   the prompt started. Side effect: Claude Code created an empty project
+   entry under `~/.claude/projects` for the temporary path (removed
+   afterwards). It may also list that path in `~/.claude.json`, which was
+   not edited.
+3. **Open.** A permission prompt in an interactive session (needs-input),
+   answered by a human, not by t3-watch. Print mode cannot show a prompt,
+   so this needs a person at an interactive session.
+4. **Open.** A bot reusing an existing session is woken through its
+   webhook, with receipt and continuation timestamps and no user ping.
 
 ## Codex adapter
 

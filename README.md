@@ -641,11 +641,18 @@ same rules: watch only, never answer an approval, official interfaces
 only. They are experimental and outside the T3 acceptance gates, and
 neither counts as supported until its own acceptance checks pass.
 
+- Claude Code: `t3-watch hook claude-code` is an async Claude Code hook
+  (print the block to install with `--print-settings`; t3-watch never
+  edits Claude Code settings), and `t3-watch wait claude-code:<session_id>`
+  waits on what it records: completion, failure and needs-input, with the
+  usual webhooks and `--durable`. First increment; not yet accepted.
+- Codex: `codex://threads/<id>` is refused as not supported yet.
+
 ## How it works
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e10.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e11.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -668,15 +675,17 @@ neither counts as supported until its own acceptance checks pass.
   wait ends too. The client also requires every capability it depends on
   (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
   `outbox-legacy-retain`, `outbox-legacy-retain-held`,
-  `outbox-legacy-checked-convert`, `suspend-aware`,
+  `outbox-legacy-checked-convert`, `native-claude-code-hooks`,
+  `suspend-aware`,
   `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 10 (this build) does not reach engine-9 daemons
-  (`0.7.0`, socket `daemon-e9.sock`), engine-8 ones (`0.6.0`,
+  `t3-watch stop`. Engine 11 (this build) does not reach engine-10 daemons
+  (`0.8.0`, socket `daemon-e10.sock`), engine-9 ones (`0.7.0`,
+  `daemon-e9.sock`), engine-8 ones (`0.6.0`,
   `daemon-e8.sock`), engine-7 ones (`0.5.0`,
   `daemon-e7.sock`), engine-6 ones (`0.4.0`,
   `daemon-e6.sock`), engine-5 ones (`0.3.0`, `daemon-e5.sock`) or
