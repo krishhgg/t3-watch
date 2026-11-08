@@ -1,9 +1,10 @@
 """Two approval requests in one turn on a real `codex app-server` (mock
 provider with MOCK_CALLS=2; MOCK_DELAY sets the model's pause before the
 second). A wait that acknowledged the first runs while the owner (client A)
-declines it; it must wake for the second under its own pendingKey. With no
-pause the flag never goes off between polls and the second is missed until
-the turn ends (docs/native-sessions.md, "Limits"). t3-watch answers neither.
+declines it; it must wake for the second under its own pendingKey. The
+status notifications every connection gets show the second request even
+with no pause. Then the same through the daemon, with the second request
+opening between two waits. t3-watch answers neither.
 
 usage: probe_two_requests.py <fixture dir> <t3-watch binary>
 """
@@ -49,4 +50,27 @@ done = A.until(lambda m: m.get("method") == "turn/completed", 30)
 code, k, ids, n = watch("--timeout", "10s", target)
 report("turn end", {"turn": done and done["params"]["turn"]["status"], "exit": code, "runOrdinal": n})
 report("A saw serverRequest/resolved for both", sum(1 for m in A.seen if m.get("method") == "serverRequest/resolved"))
+
+# The bot pattern through the daemon: the wait that reported request 1 has
+# ended when the owner answers it and request 2 opens; the bot then waits
+# again, acknowledging request 1.
+def watchd(*args):
+    p = subprocess.run([BIN, "wait", *args], env=ENV, capture_output=True, text=True, timeout=60)
+    v = json.loads(p.stdout or "{}")
+    t = (v.get("threads") or [{}])[0]
+    return p.returncode, t.get("pendingKey"), t.get("pendingRequestIds"), v.get("via")
+tid2 = A.call("thread/start", {"cwd": X + "/proj", "approvalPolicy": "on-request", "sandbox": "read-only"})["result"]["thread"]["id"]
+target2 = "codex://threads/" + tid2
+A.call("turn/start", {"threadId": tid2, "input": [{"type": "text", "text": "two checks"}]})
+q1 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"] and m["params"]["threadId"] == tid2, 30)
+code, j1, ids, via = watchd("--timeout", "5s", target2)
+report("daemon: request 1", {"exit": code, "pendingKey": j1, "ids": ids, "via": via})
+A.w.send({"jsonrpc": "2.0", "id": q1["id"], "result": {"decision": "decline"}})
+q2 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"] and m["params"]["threadId"] == tid2 and m["id"] != q1["id"], 30)
+time.sleep(0.5)
+code, j2, ids, via = watchd("--timeout", "10s", "--acknowledge", j1, target2)
+report("daemon: request 2, opened between the waits", {"exit": code, "pendingKey": j2, "ids": ids, "via": via,
+       "distinct": j2 is not None and j2 != j1})
+A.w.send({"jsonrpc": "2.0", "id": q2["id"], "result": {"decision": "decline"}})
+A.until(lambda m: m.get("method") == "turn/completed" and m["params"].get("threadId") == tid2, 30)
 A.close()

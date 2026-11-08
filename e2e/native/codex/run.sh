@@ -27,6 +27,10 @@ mock() {
   MOCK_TOOL_ARGS='{"sandbox_permissions":"require_escalated","justification":"probe"}' \
     python3 -I "$HERE/mock_responses.py" 18801 "$X/mock.log" > "$X/mock.out" 2>&1 & MOCK=$!
   sleep 0.5
+  # Another mock on the port would answer instead, with other settings.
+  if ! kill -0 "$MOCK" 2>/dev/null; then
+    echo "the mock provider did not start (is port 18801 taken?):" >&2; cat "$X/mock.out" >&2; exit 2
+  fi
 }
 echo "== $("$BIN" --version); $(codex --version); $(date -u +%FT%TZ)"
 mock 1 0
