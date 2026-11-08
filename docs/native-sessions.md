@@ -17,7 +17,7 @@ adapter is "supported" until its acceptance checks below have passed.
 
 | Adapter | Status |
 |---|---|
-| Claude Code (`claude-code:<session_id>`) | First increment implemented (hook ingestion and waiting). Acceptance checks 1 and 2 passed; 3 and 4 open. Not yet accepted. |
+| Claude Code (`claude-code:<session_id>`) | First increment implemented (hook ingestion and waiting). Acceptance checks 1 to 3 passed; 4 passed with a local receiver, the bot's own continuation still open. Not yet accepted. |
 | Codex (`codex://threads/<id>`) | Implemented (read-only polling of a Codex app-server). Acceptance checks 1 and 2 passed against a real codex-cli 0.166.0 app-server; 3 (the desktop app) and 4 open. Not yet accepted. |
 
 ## Rules for both adapters
@@ -87,6 +87,7 @@ costs a file read every half second and no model calls.
 | `Stop`, `StopFailure`, `SessionEnd` from a subagent (`agent_id` set) | No change: not the session's own |
 | `Notification` with `idle_prompt` | No change. With no turn recorded yet, idle proves nothing about one, so it never settles a wait |
 | `SessionEnd` | A running turn ends as `cancelled` |
+| A permission dialog rejected with Escape | No hook runs (Claude Code 2.1.319: neither `PermissionDenied` nor `Stop`), so the request stays open until the next `UserPromptSubmit` or `SessionEnd` |
 | `SessionStart`, anything else | No change |
 
 Install the hook yourself; t3-watch never edits Claude Code settings.
@@ -108,7 +109,11 @@ A bot reusing a session reads the current `runOrdinal` before it
 submits, then waits with `--expect-min-run-ordinal <that + 1>`. An unpinned
 wait in that gap exits 0 on the old turn. An `idle_prompt` with no turn
 recorded never settles a wait, and the thread title then says "no turn
-recorded yet".
+recorded yet". A pin does not hide an open request from an older turn: a
+waiting request blocks the session, so it is reported first. A bot that
+already relayed one (its `pendingKey` from the earlier `needs_input`)
+passes `--acknowledge <pendingKey>` with the pin. That matters after an
+Escape, which leaves the request open until the bot's next prompt.
 
 ### Limits of the first increment
 
@@ -141,11 +146,30 @@ recorded yet".
    entry under `~/.claude/projects` for the temporary path (removed
    afterwards). It may also list that path in `~/.claude.json`, which was
    not edited.
-3. **Open.** A permission prompt in an interactive session (needs-input),
-   answered by a human, not by t3-watch. Print mode cannot show a prompt,
-   so this needs a person at an interactive session.
-4. **Open.** A bot reusing an existing session is woken through its
-   webhook, with receipt and continuation timestamps and no user ping.
+3. **Passed** on the Mac mini with Claude Code 2.1.319, in a disposable
+   interactive session on a pseudo-terminal (temporary project,
+   `--setting-sources local --settings <the hooks only> --strict-mcp-config
+   --model haiku --tools Bash --permission-mode manual`). The prompt asked
+   for one Bash command outside the project, so a real permission dialog
+   appeared. `PermissionRequest` (tool `Bash`) reached a wait registered
+   before the session started (through the daemon): exit 5, `needs_input`
+   webhook for run 1. The operator rejected the dialog with Escape; nobody
+   approved it, and the command did not run. No hook ran for the
+   rejection (see the table). In the default permission mode, the same
+   command inside the project ran without any dialog, so `manual` mode
+   was needed to get one. The folder-trust dialog for the temporary
+   project was answered "yes", which Claude Code records in its own
+   configuration.
+4. **Passed with a local receiver; the bot's continuation is open.** In
+   the same live session, a wait pinned to run 2 and acknowledging the
+   relayed request was registered first, then a second prompt was typed:
+   `settled` webhook for run 2, 1.5 s after the prompt. A print-mode
+   session (`--session-id`, then `--resume` of it, pinned the same way)
+   woke with `settled` for run 2, 4.1 s after the resume started (the
+   model's reply included). The interactive sessions left no transcript
+   under `~/.claude/projects` in these runs, so `--resume` of one found
+   nothing; the print-mode sessions did leave one. What remains is the
+   bot's own receipt and continuation, with timestamps and no user ping.
 
 ## Codex adapter
 
