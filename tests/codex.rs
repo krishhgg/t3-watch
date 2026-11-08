@@ -46,6 +46,9 @@ struct Codex {
     /// No user message yet: `thread/turns/list` is refused, as codex-cli
     /// 0.166.0 refuses it.
     unmaterialized: bool,
+    /// `thread/turns/list` answers "not supported yet" this many times
+    /// first, as codex-cli 0.166.0 can while a thread materializes.
+    unsupported: usize,
     /// Every open connection, for the status notifications the app-server
     /// sends each initialized connection.
     writers: Vec<Arc<Mutex<UnixStream>>>,
@@ -263,6 +266,10 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
                     "code": -32600, "message": format!("thread not found: {}", m["params"]["threadId"]) } }),
                 "thread/read" => json!({ "id": id, "result": { "thread": {
                     "id": T, "status": g.status, "preview": "PREVIEW_CANARY first message" } } }),
+                "thread/turns/list" if g.unsupported > 0 => {
+                    g.unsupported -= 1;
+                    json!({ "id": id, "error": { "code": -32600, "message": "list_turns is not supported yet" } })
+                }
                 "thread/turns/list" if g.unmaterialized => json!({ "id": id, "error": { "code": -32600,
                     "message": format!("thread {T} is not materialized yet; thread/turns/list is unavailable \
                                         before first user message") } }),
@@ -772,4 +779,25 @@ fn with_no_connection_open_a_request_in_between_is_not_seen() {
     .output()
     .unwrap();
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn a_thread_that_cannot_list_its_turns_yet_is_retried_not_failed() {
+    // Seen once in six real runs: while the first message materializes the
+    // thread, the app-server answered "list_turns is not supported yet",
+    // and the wait failed with exit 2.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    cx.with(|c| c.unsupported = 2);
+    cx.set(
+        json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }),
+        &[("turn-1", "inProgress")],
+    );
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "15s", &t])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(cx.st.lock().unwrap().unsupported, 0);
+    assert_read_only(&cx);
 }

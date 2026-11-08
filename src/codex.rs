@@ -426,6 +426,10 @@ impl Watcher {
             // A thread with no user message yet has no turns to list:
             // codex-cli 0.166.0 answers "not materialized yet".
             Err(CallError::Fatal(m)) if m.contains("not materialized") => json!({ "data": [] }),
+            // While the first message materializes the thread, 0.166.0 can
+            // answer "list_turns is not supported yet" (1 run in 6): retried,
+            // with the reason in `upstream.lastError`, never settled on.
+            Err(CallError::Fatal(m)) if m.contains("not supported yet") => return Err(transient(m)),
             page => page?,
         };
         let turns: Vec<Value> = page["data"].as_array().cloned().unwrap_or_default();
