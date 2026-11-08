@@ -200,7 +200,12 @@ poll), it sends:
   are counted once by paging, then kept up from the newest page.
 
 The connection's `initialize` names the client `t3-watch`. Those three
-methods are all it sends. It never sends `thread/resume`, `thread/start`,
+methods are all it sends. It also keeps the `thread/status/changed`
+notifications the app-server sends every initialized connection, for every
+thread and without any subscription (checked with codex-cli 0.166.0: a
+connection that only initialized, even one that sent no capabilities and
+connected while the thread was already waiting, got every change of the
+owner's thread, and no server request). It never sends `thread/resume`, `thread/start`,
 `turn/*` or `thread/unsubscribe`, and it never answers a server request:
 one that arrives is skipped. Watching costs two local socket calls per
 poll and no model calls.
@@ -215,15 +220,26 @@ poll and no model calls.
 | Not active, latest turn `inProgress` | Running (the turn runs on another app-server) |
 | No turn yet (also "not materialized yet", before the first user message) | No state: the wait keeps waiting |
 
-**Requests are numbered.** A reader sees only the flag, and nothing it can
-read changes between two requests of one turn: with codex-cli 0.166.0,
-`thread/read`, the turn and the thread's items were identical while a
-first and a second approval were pending, and a pending request's item is
-not persisted. So `<n>` counts the times a t3-watch process saw the flag
-come on in that turn. The count is kept in
-`<state>/native/codex/<thread>.json` (under a lock), so every process that
-watches the thread uses the same numbers, and a bot that acknowledged
-request 1 is woken for request 2.
+**Requests are numbered.** Nothing a reader can read tells two requests of
+one turn apart: with codex-cli 0.166.0, `thread/read`, the turn and the
+thread's items were identical while a first and a second approval were
+pending, and a pending request's item is not persisted. The status
+notifications do show each one: between two requests the flag goes off,
+however briefly (5 ms in a test with no model latency). So `<n>` counts
+the times the flag came on in that turn, from the notifications that
+arrived since the last read, then the read itself. A notification is
+counted once: one connection per thread holds a counter lock
+(`<state>/native/codex/<thread>.counter`) and stores the count in
+`<thread>.json`; any other connection watching the thread reads it. A
+bot that acknowledged request 1 is woken for request 2 even when both
+reads in between said "waiting".
+
+**Between waits.** When a watch ends while its turn is still running (a
+bot relayed a request and is about to wait again), the daemon keeps its
+connection and goes on counting from its notifications, until the turn
+ends, the connection closes, or 15 minutes pass. The next wait on that
+thread takes the connection over. The daemon stays up meanwhile, and
+`t3-watch status` shows such connections as `codexKept`.
 
 The run ordinal is the turn count. A bot that reuses a thread reads the
 current `runOrdinal`, starts its turn, and waits with
@@ -267,13 +283,12 @@ the questions that gated the implementation:
 8. **Latency.** The needs-input webhook arrived 62 ms after the owner got
    the approval request. A pinned wait's `settled` webhook arrived 1.0 s
    after `turn/completed`, one poll interval.
-9. **Two requests in one turn.** A wait that acknowledged the first
-   approval and kept running while the owner declined it woke for the
-   second under its own key (`…-approval-2`) when the model took 3 s or
-   0.5 s before asking again. When the second request followed at once (a
-   mock model with no latency), the flag never went off between polls, so
-   the second request shared the first one's key and the wait woke only at
-   the end of the turn.
+9. **Two requests in one turn.** Before engine 14 counted notifications, a
+   wait that acknowledged the first approval woke for the second only when
+   the model paused 0.5 s or more before asking again; with no pause it
+   missed it until the turn ended. Counting notifications, see
+   `docs/acceptance-manifest.md` for the runs with no pause, and with the
+   second request opening between two waits through the daemon.
 
 ### Limits
 
@@ -282,12 +297,22 @@ the questions that gated the implementation:
   the shared daemon while the desktop app runs the thread in its own
   process) shows only persisted turns. Completion is then seen once the
   rollout records it, and needs-input is not seen at all.
-- Polling, not push: a wake can lag the event by up to one interval. Live
-  events need `thread/resume`, which point 3 rules out.
-- A request that opens within about 250 ms of the previous one's answer,
-  or while no t3-watch process watches the thread, shares the previous
-  one's number. A wait that acknowledged that one is then woken only when
-  the turn ends; the owner still sees the request in their own client.
+- Wakes come from polls: a wake can lag the event by up to one interval
+  (1 s, 250 ms while a request is open). Notifications are read at each
+  poll, so they make the count exact but do not make the wake sooner.
+  Turn events (`turn/completed`) reach only subscribers, which needs
+  `thread/resume`, ruled out by point 3.
+- **Not covered: a request that opens while nothing is connected.** The
+  app-server keeps no record of past requests, so one that follows its
+  predecessor while no t3-watch connection is open (no wait running and
+  no daemon keeping one: `--no-daemon`, a stopped daemon, a connection
+  that dropped, or more than 15 minutes after the last wait), or during
+  the handover from one counting connection to the next, shares its
+  predecessor's number. A wait that acknowledged that one is then woken
+  only when the turn ends; the owner still sees the request in their own
+  client. Bots that relay requests should use the daemon (the default).
+  `tests/codex.rs` states this as a test
+  (`with_no_connection_open_a_request_in_between_is_not_seen`).
 - A rollback (`thread/rollback`) lowers the turn count, so the ordinal
   goes down with it.
 - `--until workstream` and `--final-marker` are T3 contracts and are
@@ -298,8 +323,9 @@ the questions that gated the implementation:
 1. **Passed.** Mock app-server (`tests/codex.rs`): only the three read
    methods are sent; a server request is never answered; frames are
    masked; fragmented and 64-bit-length messages; reconnect; turn paging;
-   pinned waits; one `pendingKey` per request, and successive requests in
-   a turn counted across processes; unknown thread; no app-server;
+   pinned waits; one `pendingKey` per request; successive requests counted
+   from notifications, including one that comes and goes between two reads,
+   and between two waits through the daemon; unknown thread; no app-server;
    refused T3 contracts.
 2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
    the probes above (fresh thread, needs-input with webhook, no changes,

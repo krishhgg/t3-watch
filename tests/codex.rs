@@ -46,6 +46,9 @@ struct Codex {
     /// No user message yet: `thread/turns/list` is refused, as codex-cli
     /// 0.166.0 refuses it.
     unmaterialized: bool,
+    /// Every open connection, for the status notifications the app-server
+    /// sends each initialized connection.
+    writers: Vec<Arc<Mutex<UnixStream>>>,
 }
 
 struct MockCodex {
@@ -71,10 +74,30 @@ impl MockCodex {
         MockCodex { sock, st }
     }
 
+    /// The thread's state; a status change is also announced, as a real
+    /// app-server does.
     fn set(&self, status: Value, turns: &[(&str, &str)]) {
-        let mut s = self.st.lock().unwrap();
-        s.status = status;
-        s.turns = turns.iter().map(|(id, st)| json!({ "id": id, "status": st })).collect();
+        let changed = {
+            let mut s = self.st.lock().unwrap();
+            let changed = s.status != status;
+            s.status = status.clone();
+            s.turns = turns.iter().map(|(id, st)| json!({ "id": id, "status": st })).collect();
+            changed
+        };
+        if changed {
+            self.push(status);
+        }
+    }
+
+    /// A `thread/status/changed` to every open connection, without changing
+    /// what `thread/read` answers: a status that came and went between two
+    /// reads.
+    fn push(&self, status: Value) {
+        let writers = self.st.lock().unwrap().writers.clone();
+        let note = json!({ "method": "thread/status/changed", "params": { "threadId": T, "status": status } });
+        for w in writers {
+            let _ = send(&mut w.lock().unwrap(), &note, false);
+        }
     }
 
     fn with(&self, f: impl FnOnce(&mut Codex)) {
@@ -199,7 +222,12 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
         )
         .as_bytes(),
     );
-    st.lock().unwrap().connections += 1;
+    let w = Arc::new(Mutex::new(s.try_clone().unwrap()));
+    {
+        let mut g = st.lock().unwrap();
+        g.connections += 1;
+        g.writers.push(w.clone());
+    }
     let mut requests = 0usize;
     while let Some((opcode, payload, masked)) = read_frame(&mut s) {
         if !masked {
@@ -264,26 +292,29 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
             };
             (g.fragment, reply)
         };
-        // Noise first, as a real app-server sends: a notification, a ping,
-        // and (once) its own approval request, which no watcher may answer.
+        // Noise first, as a real app-server sends: another thread's status,
+        // a ping, and (once) its own approval request, which no watcher may
+        // answer.
+        let mut out = w.lock().unwrap();
         let _ = send(
-            &mut s,
+            &mut out,
             &json!({ "method": "thread/status/changed",
-            "params": { "threadId": T, "status": { "type": "active", "activeFlags": [] } } }),
+            "params": { "threadId": "01a1-another-thread", "status": { "type": "active", "activeFlags": ["waitingOnApproval"] } } }),
             fragment,
         );
-        let _ = frame(&mut s, true, 0x9, b"hi");
+        let _ = frame(&mut out, true, 0x9, b"hi");
         if method == "initialize" {
             let _ = send(
-                &mut s,
+                &mut out,
                 &json!({ "id": "srv-approval-1", "method": "item/commandExecution/requestApproval",
                 "params": { "threadId": T, "turnId": "t1", "itemId": "i1", "command": "true" } }),
                 fragment,
             );
         }
-        if send(&mut s, &reply, fragment).is_err() {
+        if send(&mut out, &reply, fragment).is_err() {
             return;
         }
+        drop(out);
         if st.lock().unwrap().drop_after.is_some_and(|n| requests >= n) {
             let _ = s.shutdown(std::net::Shutdown::Both);
             return;
@@ -638,4 +669,107 @@ fn successive_requests_in_one_turn_each_wake_once() {
     let ids = out["threads"][0]["pendingRequestIds"].to_string();
     assert!(ids.contains("turn-1-approval-3"), "{ids}");
     assert_read_only(&cx);
+}
+
+#[test]
+fn a_request_that_opens_between_two_reads_is_still_counted() {
+    // Review ordinal 15: polling the flag missed a second request whose
+    // predecessor closed and reopened between two reads. Every connection
+    // gets the thread's status notifications, so the off-and-on is seen
+    // even though both reads say "waiting".
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "5s", &t])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut child = wait(
+        &env,
+        &cx,
+        &["--no-daemon", "--timeout", "20s", "--acknowledge", &first, &t],
+    )
+    .spawn()
+    .unwrap();
+    still_running(&mut child, Duration::from_millis(1200));
+    cx.push(json!({ "type": "active", "activeFlags": [] }));
+    cx.push(asks);
+    let (code, out, err) = finish(child, Duration::from_secs(15));
+    assert_eq!(code, 5, "the second request was missed: {out} {err}");
+    let ids = out["threads"][0]["pendingRequestIds"].to_string();
+    assert!(ids.contains("turn-1-approval-2"), "{ids}");
+    assert_read_only(&cx);
+}
+
+#[test]
+fn the_daemon_keeps_counting_requests_between_waits() {
+    // A bot relays request 1 and waits again; request 2 opens in between.
+    // The daemon keeps the connection of a watch that ended mid-turn, so
+    // the next wait knows it is a new request.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    let out = wait(&env, &cx, &["--timeout", "5s", &t]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.wait_status("the connection kept", Duration::from_secs(5), |s| s["codexKept"] == 1);
+    cx.push(json!({ "type": "active", "activeFlags": [] }));
+    cx.push(asks);
+    std::thread::sleep(Duration::from_millis(600));
+    let out = wait(&env, &cx, &["--timeout", "5s", "--acknowledge", &first, &t])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    assert!(
+        v["threads"][0]["pendingRequestIds"].to_string().contains("approval-2"),
+        "{v}"
+    );
+    // The turn ends: nothing is kept, and the daemon may idle out.
+    cx.set(json!({ "type": "idle" }), &[("turn-1", "completed")]);
+    env.wait_status("nothing kept", Duration::from_secs(10), |s| {
+        s["running"] == false || s["codexKept"] == 0
+    });
+    assert_read_only(&cx);
+}
+
+#[test]
+fn with_no_connection_open_a_request_in_between_is_not_seen() {
+    // The limit, stated as a test: Codex keeps no record of past requests,
+    // so one that follows its predecessor while nothing is connected (no
+    // daemon, no wait) shares its number, and an acknowledged wait is only
+    // woken when the turn ends.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "5s", &t])
+        .output()
+        .unwrap();
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cx.push(json!({ "type": "active", "activeFlags": [] }));
+    cx.push(asks);
+    let out = wait(
+        &env,
+        &cx,
+        &["--no-daemon", "--timeout", "1500ms", "--acknowledge", &first, &t],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
 }

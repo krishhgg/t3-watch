@@ -187,6 +187,7 @@ pub fn run(idle_exit: Duration) -> Result<(), String> {
             if connections.load(Ordering::SeqCst) == 0
                 && hub.idle_for().is_some_and(|d| d >= idle_exit)
                 && outbox::pending_count() == 0
+                && crate::codex::lingering() == 0
             {
                 log("idle; exiting");
                 shutdown(&sock);

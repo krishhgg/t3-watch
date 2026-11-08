@@ -20,7 +20,7 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.12.0 (engine 14, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.13.0 (engine 15, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
 Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;
@@ -53,7 +53,8 @@ such a daemon answers at a default socket, `outbox run --once` and
 `outbox list` and `status` exit 4 with `upgradePrecondition`. Entries in
 `outbox/` (before engine 4) move over after the 90 s inline grace. The
 daemon stays up while it has entries it may send (until each is delivered
-or expires). A blocked `outbox-v2/`, retained entries and dead letters do
+or expires), and while it keeps a native Codex watch's connection after
+that watch ended mid-turn (at most 15 minutes, until the turn ends). A blocked `outbox-v2/`, retained entries and dead letters do
 not keep it up, and nothing is sent while the daemon is not running or
 the host is asleep.
 

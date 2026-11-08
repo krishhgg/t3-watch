@@ -322,7 +322,10 @@ With `--durable`, a webhook is never fire-and-forget:
    still has to take back. Entries it may not touch (a blocked
    `outbox-v2/`, item 8), retained entries and dead letters do not keep it
    up, and an entry stops being retried once it expires, delivered or
-   not. A daemon that is killed, or a host that is off or asleep, sends
+   not. It also stays up while it keeps the connection of a native Codex
+   watch that ended mid-turn (at most 15 minutes, and only until that
+   turn ends; `status` shows `codexKept`, docs/native-sessions.md). A
+   daemon that is killed, or a host that is off or asleep, sends
    nothing until a t3-watch command starts the daemon again (any `wait`
    does) or a supervised `t3-watch outbox run` is running. One sender runs
    at a time (`outbox-v4/sender.lock`).
@@ -683,9 +686,11 @@ neither counts as supported until its own acceptance checks pass.
 - Codex: `t3-watch wait codex://threads/<id>` reads the thread from a
   Codex app-server over its Unix socket (`$T3_WATCH_CODEX_SOCKET`, default
   `$CODEX_HOME/app-server-control/app-server-control.sock`) once a
-  second, with `thread/read` and `thread/turns/list` only. It never
-  resumes the thread, because with codex-cli 0.166.0 a resuming client
-  also receives the owner's approval requests. Completion, failure and
+  second, with `thread/read` and `thread/turns/list` only, and counts
+  requests from the `thread/status/changed` notifications every
+  connection receives. It never resumes the thread, because with
+  codex-cli 0.166.0 a resuming client also receives the owner's approval
+  requests. Completion, failure and
   needs-input (`waitingOnApproval`, `waitingOnUserInput`), with the usual
   webhooks and `--durable`. Verified against a real codex-cli 0.166.0
   app-server with disposable threads; the desktop app is not yet checked.
@@ -694,7 +699,7 @@ neither counts as supported until its own acceptance checks pass.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e14.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e15.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -719,15 +724,17 @@ neither counts as supported until its own acceptance checks pass.
   `outbox-legacy-retain`, `outbox-legacy-retain-held`,
   `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
   `native-claude-code-hooks`, `native-claude-code-requests`,
-  `native-codex-app-server`, `suspend-aware`,
+  `native-codex-app-server`, `native-codex-notifications`,
+  `suspend-aware`,
   `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 14 (this build) does not reach engine-13 daemons
-  (`0.11.0`, socket `daemon-e13.sock`), engine-12 ones (`0.10.0`,
+  `t3-watch stop`. Engine 15 (this build) does not reach engine-14 daemons
+  (`0.12.0`, socket `daemon-e14.sock`), engine-13 ones (`0.11.0`,
+  `daemon-e13.sock`), engine-12 ones (`0.10.0`,
   `daemon-e12.sock`), engine-11 ones (`0.9.0`,
   `daemon-e11.sock`), engine-10 ones (`0.8.0`,
   `daemon-e10.sock`), engine-9 ones (`0.7.0`,

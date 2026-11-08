@@ -334,6 +334,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         (11, "0.9.0"),
         (12, "0.10.0"),
         (13, "0.11.0"),
+        (14, "0.12.0"),
     ]
     .into_iter()
     .map(|(engine, version)| {
@@ -363,6 +364,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         "outbox-legacy-ack",
         "native-claude-code-requests",
         "native-codex-app-server",
+        "native-codex-notifications",
         "suspend-aware",
         "suspend-invalidation",
     ] {

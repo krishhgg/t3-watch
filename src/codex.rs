@@ -6,6 +6,9 @@
 //!
 //! Only `initialize`, `thread/read` and `thread/turns/list` are sent, the
 //! latter with `itemsView: "notLoaded"` so that no message text is read.
+//! The app-server also sends every initialized connection each thread's
+//! `thread/status/changed` notifications, without any subscription; they
+//! are what tells one request from the next (see `record_requests`).
 //! t3-watch never resumes, subscribes, starts, steers or interrupts a turn,
 //! and never answers a server request. With codex-cli 0.166.0 a
 //! `thread/resume` makes the caller a recipient of the owner's approval
@@ -23,6 +26,7 @@ use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +35,9 @@ pub const CODEX_PREFIX: &str = "codex://threads/";
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MESSAGE: usize = 16 << 20;
 const TURN_PAGE: u32 = 50;
+/// How long a connection is kept after its thread's last wait ended while a
+/// turn was running, so that requests opened in between are still counted.
+const LINGER: Duration = Duration::from_secs(15 * 60);
 
 pub fn valid_thread_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -112,6 +119,10 @@ impl Ws {
             return Err("the Codex app-server refused the WebSocket handshake".into());
         }
         Ok(ws)
+    }
+
+    fn set_read_timeout(&self, d: Duration) {
+        let _ = self.s.set_read_timeout(Some(d));
     }
 
     /// Reads what is there into the buffer. A read timeout is not an error.
@@ -235,6 +246,14 @@ impl Ws {
 struct Conn {
     ws: Ws,
     next: u64,
+    /// The watched thread: its status notifications are kept.
+    thread: String,
+    /// Its `thread/status/changed` statuses, in the order they arrived,
+    /// not yet taken.
+    events: Vec<Value>,
+    /// The thread's counter lock, when this connection is the one that
+    /// counts its requests (see `record_requests`).
+    counter: Option<std::fs::File>,
 }
 
 fn transient(message: String) -> CallError {
@@ -242,9 +261,15 @@ fn transient(message: String) -> CallError {
 }
 
 impl Conn {
-    fn open(socket: &Path, cancel: &Cancel) -> Result<Conn, CallError> {
+    fn open(socket: &Path, thread: &str, cancel: &Cancel) -> Result<Conn, CallError> {
         let ws = Ws::connect(socket).map_err(transient)?;
-        let mut c = Conn { ws, next: 0 };
+        let mut c = Conn {
+            ws,
+            next: 0,
+            thread: thread.to_string(),
+            events: Vec::new(),
+            counter: None,
+        };
         c.call(
             "initialize",
             json!({ "clientInfo": { "name": "t3-watch", "title": "t3-watch (read-only watcher)",
@@ -256,9 +281,41 @@ impl Conn {
         Ok(c)
     }
 
-    /// One request, answered before `CALL_TIMEOUT`. Notifications are
-    /// skipped, and so is any server request: t3-watch never answers one,
-    /// so it can never approve or decline anything.
+    /// Keeps a status notification of the watched thread. Any other
+    /// notification is dropped, and so is any server request: t3-watch never
+    /// answers one, so it can never approve or decline anything.
+    fn take_notification(&mut self, m: &Value) {
+        if m["method"] == "thread/status/changed" && m["params"]["threadId"].as_str() == Some(self.thread.as_str()) {
+            self.events.push(m["params"]["status"].clone());
+            if self.events.len() > 10_000 {
+                self.events.drain(..5_000);
+            }
+        }
+    }
+
+    /// Reads what has arrived, waiting at most `wait`, for a connection no
+    /// wait is using. `Err` when it is closed.
+    fn drain(&mut self, wait: Duration) -> Result<(), String> {
+        let never = Cancel::new();
+        self.ws.set_read_timeout(Duration::from_millis(20));
+        let deadline = Instant::now() + wait;
+        let result = loop {
+            match self.ws.recv(deadline, &never) {
+                Ok(Some(raw)) => {
+                    if let Ok(m) = serde_json::from_slice::<Value>(&raw) {
+                        self.take_notification(&m);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        self.ws.set_read_timeout(Duration::from_millis(250));
+        result
+    }
+
+    /// One request, answered before `CALL_TIMEOUT`. What arrives before the
+    /// answer goes to `take_notification`.
     fn call(&mut self, method: &str, params: Value, cancel: &Cancel) -> Result<Value, CallError> {
         self.next += 1;
         let id = self.next;
@@ -276,7 +333,11 @@ impl Conn {
             let Ok(m) = serde_json::from_slice::<Value>(&raw) else {
                 continue;
             };
-            if m.get("method").is_some() || m.get("id").and_then(Value::as_u64) != Some(id) {
+            if m.get("method").is_some() {
+                self.take_notification(&m);
+                continue;
+            }
+            if m.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
             if let Some(e) = m.get("error") {
@@ -304,6 +365,9 @@ pub struct Watcher {
     conn: Mutex<Option<Conn>>,
     /// The latest turn id seen and how many turns there were then.
     counted: Mutex<Option<(String, u64)>>,
+    /// The thread was active when last read: its connection is kept for a
+    /// while after this watch ends (see `park`).
+    active: AtomicBool,
 }
 
 impl Watcher {
@@ -313,6 +377,7 @@ impl Watcher {
             thread,
             conn: Mutex::new(None),
             counted: Mutex::new(None),
+            active: AtomicBool::new(false),
         }
     }
 
@@ -321,7 +386,12 @@ impl Watcher {
         let observed_at = Instant::now();
         let mut guard = util::lock(&self.conn);
         if guard.is_none() {
-            *guard = Some(Conn::open(&self.socket, cancel)?);
+            // A connection kept since an earlier wait has every status
+            // notification since then; a new one starts from now.
+            *guard = Some(match unpark(&self.socket, &self.thread) {
+                Some(conn) => conn,
+                None => Conn::open(&self.socket, &self.thread, cancel)?,
+            });
         }
         let conn = guard.as_mut().expect("connected");
         let result = self.read(conn, cancel, observed_at);
@@ -335,6 +405,19 @@ impl Watcher {
     fn read(&self, conn: &mut Conn, cancel: &Cancel, observed_at: Instant) -> Result<ThreadState, CallError> {
         let thread = conn.call("thread/read", json!({ "threadId": self.thread }), cancel)?;
         let status = thread["thread"]["status"].clone();
+        // Notifications that arrived before this read's answer, in order;
+        // the read itself is the latest.
+        let mut seen = std::mem::take(&mut conn.events);
+        seen.push(status.clone());
+        if conn.counter.is_none() {
+            if let Some(lock) = take_counter(&self.thread) {
+                // Taking over from another connection, which may have
+                // counted what this one has seen so far: only the read.
+                conn.counter = Some(lock);
+                seen = vec![status.clone()];
+            }
+        }
+        self.active.store(status["type"] == "active", Ordering::Relaxed);
         let page = match conn.call(
             "thread/turns/list",
             json!({ "threadId": self.thread, "limit": TURN_PAGE, "sortDirection": "desc", "itemsView": "notLoaded" }),
@@ -357,7 +440,12 @@ impl Watcher {
             Some(id) => self.ordinal_of(conn, cancel, id, &turns)?,
         };
         let turn = latest.and_then(|t| t["id"].as_str()).filter(|t| valid_thread_id(t));
-        let numbers = request_numbers(&self.thread, turn.unwrap_or("none"), &flags_of(&status));
+        let turn = turn.unwrap_or("none");
+        let numbers = if conn.counter.is_some() {
+            record_requests(&self.thread, Some(turn), &seen)
+        } else {
+            read_requests(&self.thread, turn, &status)
+        };
         Ok(state_of(&self.thread, &status, latest, ordinal, numbers, observed_at))
     }
 
@@ -396,6 +484,94 @@ impl Watcher {
     }
 }
 
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let conn = self.conn.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(conn) = conn.filter(|_| self.active.load(Ordering::Relaxed)) {
+            park(self.socket.clone(), conn);
+        }
+    }
+}
+
+// ---- connections kept between waits -----------------------------------------
+
+/// A connection whose watch ended while its thread's turn was running. A
+/// bot that relayed a request waits again moments later; until then this
+/// keeps reading the thread's status notifications into the request count,
+/// so a request that opens in between is not mistaken for the one already
+/// relayed. Dropped when the turn ends (the status is no longer `active`),
+/// the connection closes, or after `LINGER`.
+struct Parked {
+    socket: PathBuf,
+    conn: Conn,
+    since: Instant,
+}
+
+static PARKED: Mutex<Vec<Parked>> = Mutex::new(Vec::new());
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+fn park(socket: PathBuf, conn: Conn) {
+    let mut parked = util::lock(&PARKED);
+    parked.retain(|p| !(p.socket == socket && p.conn.thread == conn.thread));
+    parked.push(Parked {
+        socket,
+        conn,
+        since: Instant::now(),
+    });
+    drop(parked);
+    if !DRAINING.swap(true, Ordering::SeqCst) && util::spawn_thread("t3-watch-codex", 128 * 1024, drain_parked).is_err()
+    {
+        DRAINING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn unpark(socket: &Path, thread: &str) -> Option<Conn> {
+    let mut parked = util::lock(&PARKED);
+    let at = parked
+        .iter()
+        .position(|p| p.socket == socket && p.conn.thread == thread)?;
+    Some(parked.remove(at).conn)
+}
+
+/// Connections kept between waits; the daemon stays up while there are any.
+pub fn lingering() -> usize {
+    util::lock(&PARKED).len()
+}
+
+fn drain_parked() {
+    loop {
+        let batch: Vec<Parked> = std::mem::take(&mut *util::lock(&PARKED));
+        let mut keep = Vec::new();
+        for mut p in batch {
+            let open = p.conn.drain(Duration::from_millis(50)).is_ok();
+            let seen = std::mem::take(&mut p.conn.events);
+            if !seen.is_empty() && p.conn.counter.is_some() {
+                record_requests(&p.conn.thread, None, &seen);
+            }
+            let turn_over = seen.iter().any(|s| s["type"] != "active");
+            if open && !turn_over && p.since.elapsed() < LINGER {
+                keep.push(p);
+            }
+        }
+        let mut parked = util::lock(&PARKED);
+        // A watch may have taken or parked one meanwhile: those stand.
+        for p in keep {
+            if !parked
+                .iter()
+                .any(|q| q.socket == p.socket && q.conn.thread == p.conn.thread)
+            {
+                parked.push(p);
+            }
+        }
+        if parked.is_empty() {
+            DRAINING.store(false, Ordering::SeqCst);
+            return;
+        }
+        drop(parked);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn flags_of(status: &Value) -> Vec<&str> {
     status["activeFlags"]
         .as_array()
@@ -403,43 +579,110 @@ fn flags_of(status: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+fn codex_dir() -> PathBuf {
+    config::state_dir().join("native").join("codex")
+}
+
+/// The thread's counter lock, if no other connection holds it. One
+/// connection at a time counts a thread's requests, so that two of them
+/// never count the same notification twice; the others read the count.
+fn take_counter(thread: &str) -> Option<std::fs::File> {
+    let dir = codex_dir();
+    util::ensure_private_dir(&dir).ok()?;
+    let f = util::open_lock_file(&dir.join(format!("{thread}.counter"))).ok()?;
+    util::try_flock(&f).ok()?.then_some(f)
+}
+
+/// The request numbers as the counting connection last stored them, for a
+/// connection that does not count: a flag that is on but not yet counted
+/// as open is the next request.
+fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
+    let stored = util::open_private_read(&codex_dir().join(format!("{thread}.json")))
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok())
+        .filter(|v| v["turn"] == turn);
+    let flags = flags_of(status);
+    let number = |kind: &str, flag: &str| {
+        if !flags.contains(&flag) {
+            return 0;
+        }
+        let k = stored.as_ref().map_or(&Value::Null, |v| &v[kind]);
+        let n = k["n"].as_u64().unwrap_or(0);
+        if k["open"] == true {
+            n.max(1)
+        } else {
+            n + 1
+        }
+    };
+    (
+        number("approval", "waitingOnApproval"),
+        number("input", "waitingOnUserInput"),
+    )
+}
+
 /// The number of the open approval and user-input request in the latest
-/// turn, counted from 1 (0: none open).
+/// turn, counted from 1 (0: none open), after the statuses in `seen` (in
+/// the order they were observed; the last is the newest).
 ///
 /// The app-server tells a reader only that the thread waits
 /// (`waitingOnApproval`, `waitingOnUserInput`), not on which request: with
-/// codex-cli 0.166.0, nothing a reader can see changes between two
-/// requests of one turn, and a pending request's item is not persisted.
-/// So each time a t3-watch process sees a flag come on, it counts one more
-/// request, in `<state>/native/codex/<thread>.json` (under a lock), where
-/// every process that watches the thread keeps the same count. A request
-/// that opens while no watcher saw its predecessor close shares that one's
-/// number (see docs/native-sessions.md, "Limits").
-fn request_numbers(thread: &str, turn: &str, flags: &[&str]) -> (u64, u64) {
-    let dir = config::state_dir().join("native").join("codex");
+/// codex-cli 0.166.0 nothing a reader can read changes between two requests
+/// of one turn, and a pending request's item is not persisted. Every
+/// initialized connection does receive each `thread/status/changed`, so
+/// every time a flag comes on while some t3-watch connection is open,
+/// however briefly it was off, one more request is counted. Only the
+/// connection holding the thread's counter lock counts (`take_counter`);
+/// the count is kept in `<state>/native/codex/<thread>.json`, shared by
+/// every process watching the thread and by connections kept between
+/// waits. A request that opens while no connection is open, or during the
+/// handover from one counting connection to the next, shares its
+/// predecessor's number (docs/native-sessions.md, "Limits").
+///
+/// `turn` is the latest turn's id, from a read; `None` (a kept connection,
+/// which reads nothing) continues the stored turn.
+fn record_requests(thread: &str, turn: Option<&str>, seen: &[Value]) -> (u64, u64) {
+    let dir = codex_dir();
     let path = dir.join(format!("{thread}.json"));
     let _lock = util::ensure_private_dir(&dir)
         .and_then(|_| util::open_lock_file(&dir.join(format!("{thread}.lock"))))
         .ok()
         .filter(|f| util::flock_within(f, Duration::from_secs(2)).unwrap_or(false));
-    let mut kept = util::open_private_read(&path)
+    let stored = util::open_private_read(&path)
         .ok()
-        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok())
-        .filter(|v| v["turn"] == turn)
-        .unwrap_or_else(|| json!({ "turn": turn }));
+        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok());
+    let same_turn = match (turn, &stored) {
+        (None, _) => true,
+        (Some(t), Some(v)) => v["turn"] == t,
+        (Some(_), None) => false,
+    };
+    let mut kept = match stored {
+        Some(v) if same_turn => v,
+        _ => json!({ "turn": turn.unwrap_or("none") }),
+    };
+    // A new turn: only what came after the last status that ended a turn
+    // belongs to it.
+    let from = if same_turn {
+        0
+    } else {
+        seen.iter().rposition(|s| s["type"] != "active").map_or(0, |i| i + 1)
+    };
     let before = kept.clone();
     let mut numbers = [0u64; 2];
     for (i, (kind, flag)) in [("approval", "waitingOnApproval"), ("input", "waitingOnUserInput")]
         .into_iter()
         .enumerate()
     {
-        let on = flags.contains(&flag);
         let mut n = kept[kind]["n"].as_u64().unwrap_or(0);
-        if on && kept[kind]["open"] != true {
-            n += 1;
+        let mut open = kept[kind]["open"] == true;
+        for status in &seen[from.min(seen.len())..] {
+            let on = flags_of(status).contains(&flag);
+            if on && !open {
+                n += 1;
+            }
+            open = on;
         }
-        kept[kind] = json!({ "n": n, "open": on });
-        numbers[i] = if on { n } else { 0 };
+        kept[kind] = json!({ "n": n, "open": open });
+        numbers[i] = if open { n } else { 0 };
     }
     if kept != before {
         // Best effort: without the file, a later process counts afresh.

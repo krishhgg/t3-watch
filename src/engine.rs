@@ -1373,6 +1373,8 @@ impl Hub {
             },
             "watches": watches,
             "machines": machines,
+            // Codex connections kept after their last wait, mid-turn.
+            "codexKept": crate::codex::lingering(),
         })
     }
 }
