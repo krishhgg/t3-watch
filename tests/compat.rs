@@ -1274,8 +1274,22 @@ fn a_live_engine_6_daemon_that_does_not_accept_is_still_found() {
     let env = Env::new();
     fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
     let sock = env.home.join("daemon-e6.sock");
-    // A socket file nobody accepts on: connect is refused.
-    drop(UnixListener::bind(&sock).unwrap());
+    // A socket file nobody accepts on, as a dead daemon leaves it: bound,
+    // never listening. (A listener bound and dropped here could stay
+    // accepting in a child that a parallel test forks before it execs.)
+    unsafe {
+        use std::os::unix::ffi::OsStrExt;
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in sock.as_os_str().as_bytes().iter().enumerate() {
+            addr.sun_path[i] = *b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        assert_eq!(libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len), 0);
+        libc::close(fd);
+    }
     assert!(UnixStream::connect(&sock).is_err());
     let list = output_json(&env.run(&["outbox", "list"]));
     assert_eq!(
