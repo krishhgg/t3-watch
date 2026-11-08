@@ -61,6 +61,9 @@ pub enum Transport {
     /// A native Claude Code session, through its hook event log
     /// (experimental, see `native`).
     ClaudeCode,
+    /// A native Codex thread, read from a Codex app-server (experimental,
+    /// see `codex`).
+    Codex,
 }
 
 impl Transport {
@@ -69,6 +72,7 @@ impl Transport {
             Transport::Mcp => "mcp",
             Transport::Local => "local",
             Transport::ClaudeCode => "claude-code",
+            Transport::Codex => "codex",
         }
     }
 }
@@ -85,6 +89,8 @@ pub struct TargetSpec {
     pub t3_bin: Option<PathBuf>,
     /// Absolute T3 data directory (local only).
     pub base_dir: Option<PathBuf>,
+    /// Absolute path of the Codex app-server socket (Codex only).
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +121,7 @@ impl WaitRequest {
                     "environmentId": t.environment_id,
                     "t3Bin": t.t3_bin.as_ref().map(|p| p.to_string_lossy()),
                     "baseDir": t.base_dir.as_ref().map(|p| p.to_string_lossy()),
+                    "socket": t.socket.as_ref().map(|p| p.to_string_lossy()),
                 })
             })
             .collect();
@@ -146,6 +153,7 @@ impl WaitRequest {
                     Some("local") => Transport::Local,
                     Some("mcp") => Transport::Mcp,
                     Some("claude-code") => Transport::ClaudeCode,
+                    Some("codex") => Transport::Codex,
                     _ => return Err("target has no valid transport".into()),
                 },
                 machine: s(t, "machine").ok_or("target missing machine")?,
@@ -153,6 +161,7 @@ impl WaitRequest {
                 environment_id: s(t, "environmentId"),
                 t3_bin: s(t, "t3Bin").map(PathBuf::from),
                 base_dir: s(t, "baseDir").map(PathBuf::from),
+                socket: s(t, "socket").map(PathBuf::from),
             });
         }
         let until_delegated = match s(v, "until").as_deref() {
@@ -241,6 +250,22 @@ impl WaitRequest {
                 if self.predicate.until_delegated || self.predicate.final_marker.is_some() {
                     return Err(
                         "--until workstream and --final-marker are T3 contracts; a Claude Code session \
+                         is watched turn by turn (see docs/native-sessions.md)"
+                            .into(),
+                    );
+                }
+            }
+            if t.transport == Transport::Codex {
+                let thread = t.thread_id.strip_prefix(crate::codex::CODEX_PREFIX).unwrap_or("");
+                if !crate::codex::valid_thread_id(thread) {
+                    return Err("a Codex target is codex://threads/<thread_id>".into());
+                }
+                if !t.socket.as_ref().is_some_and(|p| p.is_absolute()) {
+                    return Err("Codex targets need an absolute app-server socket path".into());
+                }
+                if self.predicate.until_delegated || self.predicate.final_marker.is_some() {
+                    return Err(
+                        "--until workstream and --final-marker are T3 contracts; a Codex thread \
                          is watched turn by turn (see docs/native-sessions.md)"
                             .into(),
                     );
@@ -359,6 +384,9 @@ enum WatchKey {
     },
     /// Keyed by the session id (`thread_id` is `claude-code:<id>`).
     ClaudeCode { thread_id: String },
+    /// Keyed by the app-server socket and the thread
+    /// (`thread_id` is `codex://threads/<id>`).
+    Codex { socket: PathBuf, thread_id: String },
 }
 
 impl WatchKey {
@@ -366,14 +394,15 @@ impl WatchKey {
         match self {
             WatchKey::Mcp { thread_id, .. }
             | WatchKey::Local { thread_id, .. }
-            | WatchKey::ClaudeCode { thread_id } => thread_id,
+            | WatchKey::ClaudeCode { thread_id }
+            | WatchKey::Codex { thread_id, .. } => thread_id,
         }
     }
 
     fn final_marker(&self) -> Option<&str> {
         match self {
             WatchKey::Mcp { final_marker, .. } | WatchKey::Local { final_marker, .. } => final_marker.as_deref(),
-            WatchKey::ClaudeCode { .. } => None,
+            WatchKey::ClaudeCode { .. } | WatchKey::Codex { .. } => None,
         }
     }
 }
@@ -391,6 +420,8 @@ enum Backend {
     ClaudeCode {
         session: String,
     },
+    /// Reads the thread from a Codex app-server, never resuming it.
+    Codex(Arc<crate::codex::Watcher>),
 }
 
 struct Sub {
@@ -875,6 +906,24 @@ impl Hub {
                         Backend::ClaudeCode { session },
                     )
                 }
+                Transport::Codex => {
+                    let socket = t
+                        .socket
+                        .clone()
+                        .ok_or_else(|| error_json("usage", "missing Codex app-server socket"))?;
+                    let thread = t
+                        .thread_id
+                        .strip_prefix(crate::codex::CODEX_PREFIX)
+                        .unwrap_or_default()
+                        .to_string();
+                    (
+                        WatchKey::Codex {
+                            socket: socket.clone(),
+                            thread_id: t.thread_id.clone(),
+                        },
+                        Backend::Codex(Arc::new(crate::codex::Watcher::new(socket, thread))),
+                    )
+                }
             };
             out.push(entry);
         }
@@ -1218,11 +1267,21 @@ impl Hub {
             }
         }
         if event == "needs_input" {
-            out["action"] = json!(
+            let native = |t: &TargetSpec| matches!(t.transport, Transport::ClaudeCode | Transport::Codex);
+            out["action"] = json!(if req.targets.iter().all(native) {
+                "An approval or input request is waiting in a native Claude Code or Codex session. \
+                 Whoever runs that session answers it there; t3-watch never answers one. To keep \
+                 waiting past these requests, run again with --acknowledge <pendingKey>."
+            } else if req.targets.iter().any(native) {
+                "A question or approval is waiting. Questions (userOnly false) may be answered with \
+                 t3_pending_request; approvals (userOnly true) need the user in T3. Requests in a \
+                 native Claude Code or Codex session are answered there by whoever runs it. To keep \
+                 waiting past these requests, run again with --acknowledge <pendingKey>."
+            } else {
                 "A question or approval is waiting. Questions (userOnly false) may be answered with \
                  t3_pending_request; approvals (userOnly true) need the user in T3. To keep waiting \
                  past these requests, run again with --acknowledge <pendingKey>."
-            );
+            });
         }
         if let Some(e) = error {
             out["error"] = e;
@@ -1272,6 +1331,11 @@ impl Hub {
                     WatchKey::ClaudeCode { .. } => {
                         v["transport"] = json!("claude-code");
                         v["until"] = json!("turn");
+                    }
+                    WatchKey::Codex { socket, .. } => {
+                        v["transport"] = json!("codex");
+                        v["until"] = json!("turn");
+                        v["socket"] = json!(socket.to_string_lossy());
                     }
                 }
                 v
@@ -1455,10 +1519,16 @@ impl Watch {
             .min()
             .unwrap_or(Duration::from_secs(5));
         // Reading a hook log is a local file read: look twice a second.
-        if matches!(self.backend, Backend::ClaudeCode { .. }) {
-            every.min(Duration::from_millis(500))
-        } else {
-            every
+        // A Codex app-server read is a local socket call: once a second, and
+        // four times a second while a request is open, so that its answer
+        // and a next request in the same turn are seen apart.
+        match self.backend {
+            Backend::ClaudeCode { .. } => every.min(Duration::from_millis(500)),
+            Backend::Codex(_) => {
+                let asking = matches!(&g.last, Some(Observation::State(s)) if !s.pending_ids.is_empty());
+                every.min(Duration::from_millis(if asking { 250 } else { 1000 }))
+            }
+            _ => every,
         }
     }
 
@@ -1638,6 +1708,14 @@ impl Watch {
                 state: crate::native::claude_state(session, Instant::now()),
                 next: Next::Interval,
             }),
+            // Two read-only calls on a local socket, no model.
+            Backend::Codex(watcher) => {
+                self.upstream_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Cycle {
+                    state: watcher.observe(cancel)?,
+                    next: Next::Interval,
+                })
+            }
             Backend::Local { t3_bin, base_dir } => {
                 let bin = t3_bin
                     .clone()
@@ -2276,6 +2354,7 @@ mod tests {
             environment_id: None,
             t3_bin: bin,
             base_dir: Some(base.to_path_buf()),
+            socket: None,
         }
     }
 

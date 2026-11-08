@@ -20,7 +20,7 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.11.0 (engine 13, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.12.0 (engine 14, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
 Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;

@@ -1,6 +1,6 @@
 # Native sessions: Codex and Claude Code (experimental)
 
-t3-watch was built to watch T3 threads. This document scopes two more kinds
+t3-watch was built to watch T3 threads. This document covers two more kinds
 of target: existing native **Codex** threads (desktop app or CLI) and
 existing native **Claude Code** sessions. The goal is the same as for T3:
 a bot that manages or reuses one of these sessions gets a deterministic
@@ -18,7 +18,7 @@ adapter is "supported" until its acceptance checks below have passed.
 | Adapter | Status |
 |---|---|
 | Claude Code (`claude-code:<session_id>`) | First increment implemented (hook ingestion and waiting). Acceptance checks 1 and 2 passed; 3 and 4 open. Not yet accepted. |
-| Codex (`codex://threads/<id>`) | Not implemented. The target is refused with an explicit "not supported yet" error. The protocol facts are verified below; the open questions are listed. |
+| Codex (`codex://threads/<id>`) | Implemented (read-only polling of a Codex app-server). Acceptance checks 1 and 2 passed against a real codex-cli 0.166.0 app-server; 3 (the desktop app) and 4 open. Not yet accepted. |
 
 ## Rules for both adapters
 
@@ -48,7 +48,7 @@ adapter is "supported" until its acceptance checks below have passed.
 target: no prompts are sent to it, its files are never modified, and it is
 not used as a fixture. The Mac mini does not have that project, and nothing
 is migrated or duplicated to it. Checking it at all needs access to the
-MacBook, which the parent controls (see "MacBook integration needs").
+MacBook, which the parent controls (see "Checking the desktop target on the MacBook").
 
 ## Claude Code adapter
 
@@ -149,90 +149,154 @@ recorded yet".
 
 ## Codex adapter
 
-### Verified (codex-cli 0.166.0 on the Mac mini, read-only)
+### How it works
 
-The official app-server documentation and the protocol schema this CLI
-generates (`codex app-server generate-json-schema`) agree on the following.
+`t3-watch wait codex://threads/<id>` reads the thread from a Codex
+app-server through its documented JSON-RPC protocol. It uses the
+WebSocket-over-Unix-socket transport, the one `codex app-server --listen
+unix://PATH` and the shared daemon's control socket serve. `codex
+app-server proxy` only relays stdio bytes to that same socket, so t3-watch
+connects to the socket itself and starts no extra process. The socket is
+`$T3_WATCH_CODEX_SOCKET`, else
+`$CODEX_HOME/app-server-control/app-server-control.sock` (`CODEX_HOME`
+defaults to `~/.codex`). The client resolves it and sends it with the wait,
+so the daemon reads the socket the caller meant.
 
-- Messages are JSON-RPC over stdio (JSONL), plus WebSocket over `ws://`
-  (experimental) or a Unix socket (`unix://`). Each connection sends
-  `initialize` then `initialized`.
-- `codex app-server daemon` manages a shared local app-server, and
-  `codex app-server proxy [--sock PATH]` connects stdio to its control
-  socket. This is the CLI's own way for a second client to reach a running
-  app-server. The default socket is
-  `~/.codex/app-server-control/app-server-control.sock`.
-  `codex app-server daemon version` (read-only) found no daemon running on
-  the Mac mini, so whether a second client can attach there depends on a
-  daemon being started, which is a change this work did not make.
-- Read-only methods: `thread/read` (stored metadata and runtime `status`;
-  it does not load the thread or emit `thread/started`), `thread/list`,
-  `thread/loaded/list`, `thread/turns/list`, `thread/items/list`.
-- No subscribe method exists. A connection receives a thread's events
-  after `thread/start` or `thread/resume`; `thread/unsubscribe` ends that.
-  A thread unloads after its last subscriber leaves and 60 s pass, with
-  `thread/status/changed` (`notLoaded`) and `thread/closed`.
-- Watch notifications: `turn/started`, `turn/completed` (status
-  `completed` or `interrupted`), `thread/status/changed` (`notLoaded`,
-  `idle`, `systemError`, `active` with `activeFlags` such as
-  `waitingOnApproval`), `item/started`, `item/completed`.
-- Requests from the server that mean "needs input":
-  `item/commandExecution/requestApproval`,
-  `item/fileChange/requestApproval`, `item/permissions/requestApproval`,
-  `item/tool/requestUserInput`, `mcpServer/elicitation/request`. The
-  notification `serverRequest/resolved` (`threadId`, `requestId`) says one
-  was answered or cleared.
+Once a second (four times a second while a request is open), on a
+connection kept between polls (a dropped one is reopened on the next
+poll), it sends:
 
-### Planned design
+- `thread/read {threadId}`: the stored thread and its runtime `status`;
+- `thread/turns/list {threadId, limit: 50, sortDirection: "desc",
+  itemsView: "notLoaded"}`: the latest turn and its status, without item
+  content, so no message text is read. With more than 50 turns, the turns
+  are counted once by paging, then kept up from the newest page.
 
-`codex://threads/<id>` targets are watched by a t3-watch process on the
-machine that runs the thread:
+The connection's `initialize` names the client `t3-watch`. Those three
+methods are all it sends. It never sends `thread/resume`, `thread/start`,
+`turn/*` or `thread/unsubscribe`, and it never answers a server request:
+one that arrives is skipped. Watching costs two local socket calls per
+poll and no model calls.
 
-1. Connect through `codex app-server proxy` and initialize as
-   `t3-watch`, opting out of delta notifications.
-2. Read the thread (`thread/read`, `thread/turns/list`) for its status and
-   latest turn.
-3. Follow live events only through a mechanism verified not to change the
-   thread (see the open questions).
-4. Report `turn/completed` as completed or interrupted, and any pending
-   server request or `waitingOnApproval` as needs-input. Never answer a
-   request.
-5. On every reconnect, re-read and compare the latest turn id and status
-   with the last one seen, so that a turn finished while disconnected is
-   still reported.
+| App-server state | Effect on the watched thread |
+|---|---|
+| `active`, no flags | The latest turn is running |
+| `active` with `waitingOnApproval` or `waitingOnUserInput` | Input is needed: one open request per flag (`codex-<turn>-approval-<n>`, `codex-<turn>-input-<n>`), each with its own `pendingKey` |
+| `systemError` | Failed (`error`) |
+| Not active, latest turn `completed` | Completed |
+| Not active, latest turn `interrupted` or `failed` | Failed (`interrupted`, `failed`) |
+| Not active, latest turn `inProgress` | Running (the turn runs on another app-server) |
+| No turn yet (also "not materialized yet", before the first user message) | No state: the wait keeps waiting |
 
-### Open questions, which gate any implementation
+**Requests are numbered.** A reader sees only the flag, and nothing it can
+read changes between two requests of one turn: with codex-cli 0.166.0,
+`thread/read`, the turn and the thread's items were identical while a
+first and a second approval were pending, and a pending request's item is
+not persisted. So `<n>` counts the times a t3-watch process saw the flag
+come on in that turn. The count is kept in
+`<state>/native/codex/<thread>.json` (under a lock), so every process that
+watches the thread uses the same numbers, and a bot that acknowledged
+request 1 is woken for request 2.
 
-1. **Ids.** Does the UUID in `codex://threads/<uuid>` equal the
-   app-server's `threadId`? The documentation's examples show `thr_…` ids.
-2. **Second client.** Does the desktop app on the MacBook run its threads
-   in the shared daemon that `proxy` reaches, or in its own private
-   app-server? If it is private, no second client can see live events,
-   and only `thread/read` polling (no model involved) remains.
-3. **Attaching without changes.** Does `thread/resume` with no overrides
-   on a thread that is already loaded only subscribe? No rollout write, no
-   settings change, no change of owner, and no `updatedAt` change (the
-   documentation says it does not update `updatedAt`). To be verified with
-   a synthetic thread in an isolated `CODEX_HOME`, with a local mock model
-   provider so that no OpenAI request is made.
-4. **Approval routing.** Are approval and user-input requests sent to every
-   subscribed connection, or only to the owner? An unanswered request on
-   t3-watch's connection must never block or cancel the owner's.
-5. **Unload.** Does t3-watch's subscription keep a thread loaded that would
-   otherwise unload? It must not change how the app behaves.
-6. **Gaps.** What do `thread/turns/list` cursors guarantee across a
-   reconnect?
+The run ordinal is the turn count. A bot that reuses a thread reads the
+current `runOrdinal`, starts its turn, and waits with
+`--expect-min-run-ordinal <that + 1>`. An unknown thread ends the wait
+with an error (exit 2). An unreachable socket is retried until the
+timeout, with the reason in `upstream.lastError`.
 
-### MacBook integration needs (parent-controlled)
+### Verified (codex-cli 0.166.0 on the Mac mini)
 
-- On `MacBook-Pro-724` as `krishgarg`, read-only:
-  - `codex --version` and `codex app-server daemon version`;
-  - whether `~/.codex/app-server-control/app-server-control.sock` exists
-    while the desktop app has the thread open;
-  - over `proxy`: `initialize`, then `thread/read` of
-    `01a1b891-e945-7f70-b755-db5ece6dcaff` and `thread/loaded/list`.
-  
-  None of these sends a prompt or touches the project.
+These checks used disposable threads on a real `codex app-server --listen
+unix://…`, in an isolated `CODEX_HOME` whose model provider was a local mock
+of the Responses API, so no OpenAI request was made. A second client
+(client A) owned each thread and got its approval requests. They answer
+the questions that gated the implementation:
+
+1. **Ids.** App-server thread ids are UUIDv7 (`01a1ba84-154c-7be3-…`), the
+   same shape as the desktop target's id. Whether an app-server on the
+   MacBook accepts that id is still unchecked.
+2. **Second client.** A second connection that only reads sees the
+   owner's live status (`active` with `waitingOnApproval`, the turn
+   `inProgress`) through `thread/read`, and receives no server request.
+3. **Attaching.** `thread/resume` with no overrides on a loaded thread
+   changed no file, but it made the second client a recipient of the
+   owner's pending approval request (`item/commandExecution/requestApproval`)
+   and of the thread's notifications. A watcher that resumed could answer
+   for the owner, so t3-watch never resumes.
+4. **Approval routing.** Without a resume, only the owner received the
+   request. While t3-watch held a needs-input wait (acknowledged, still
+   polling), the owner's request stayed open: no `serverRequest/resolved`
+   until the owner declined it.
+5. **Unload.** With the owner gone, the thread unloaded after 60 s while
+   t3-watch polled it once a second. Reading an unloaded thread did not load
+   it, took no writer lock and left its rollout file unchanged.
+6. **Gaps.** Polling reads the persisted turns, so a turn that ended while
+   t3-watch was disconnected or not running is reported by the next read.
+   t3-watch read the unloaded thread as completed run 2.
+7. **No changes.** Over the same 8 s with and without t3-watch polling, the
+   only files that changed in `CODEX_HOME` were the app-server's own log
+   database (`logs_2.sqlite-wal`, `-shm`), in both windows. No session,
+   rollout, state or lock file changed.
+8. **Latency.** The needs-input webhook arrived 62 ms after the owner got
+   the approval request. A pinned wait's `settled` webhook arrived 1.0 s
+   after `turn/completed`, one poll interval.
+9. **Two requests in one turn.** A wait that acknowledged the first
+   approval and kept running while the owner declined it woke for the
+   second under its own key (`…-approval-2`) when the model took 3 s or
+   0.5 s before asking again. When the second request followed at once (a
+   mock model with no latency), the flag never went off between polls, so
+   the second request shared the first one's key and the wait woke only at
+   the end of the turn.
+
+### Limits
+
+- Needs-input and the live running status come from the app-server that
+  runs the thread. A socket that reaches another app-server (for example
+  the shared daemon while the desktop app runs the thread in its own
+  process) shows only persisted turns. Completion is then seen once the
+  rollout records it, and needs-input is not seen at all.
+- Polling, not push: a wake can lag the event by up to one interval. Live
+  events need `thread/resume`, which point 3 rules out.
+- A request that opens within about 250 ms of the previous one's answer,
+  or while no t3-watch process watches the thread, shares the previous
+  one's number. A wait that acknowledged that one is then woken only when
+  the turn ends; the owner still sees the request in their own client.
+- A rollback (`thread/rollback`) lowers the turn count, so the ordinal
+  goes down with it.
+- `--until workstream` and `--final-marker` are T3 contracts and are
+  refused for this target.
+
+### Acceptance checks (not yet passed)
+
+1. **Passed.** Mock app-server (`tests/codex.rs`): only the three read
+   methods are sent; a server request is never answered; frames are
+   masked; fragmented and 64-bit-length messages; reconnect; turn paging;
+   pinned waits; one `pendingKey` per request, and successive requests in
+   a turn counted across processes; unknown thread; no app-server;
+   refused T3 contracts.
+2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
+   the probes above (fresh thread, needs-input with webhook, no changes,
+   completion, pinned wake with webhook, unload, read after unload, two
+   requests in one turn).
+3. **Open.** The desktop app on the MacBook: the read-only checks below,
+   then a watch of the research thread, with no prompt sent.
+4. **Open.** A bot reusing a Codex thread is woken through its webhook,
+   with receipt and continuation timestamps.
+
+### Checking the desktop target on the MacBook
+
+The target stays read-only (see "The concrete Codex target"). Checking it
+needs, under the parent's control:
+
+- On that MacBook, as `krishgarg`: `codex --version`; whether
+  `~/.codex/app-server-control/app-server-control.sock` exists while the
+  desktop app has the thread open; then
+  `t3-watch wait --no-daemon --timeout 5s codex://threads/01a1b891-e945-7f70-b755-db5ece6dcaff`,
+  which sends `initialize`, `thread/read` and `thread/turns/list` only. If
+  no socket exists, the desktop app runs its threads in a private
+  app-server. Starting `codex app-server daemon` would then be a change
+  on that machine that needs the user's approval, and it would see only
+  persisted turns (see "Limits").
 - A t3-watch build for that Mac's architecture, installed for that user.
 - The bot's webhook URL and secret available there, with the receiver
   reachable from that machine.

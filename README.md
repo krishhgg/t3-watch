@@ -673,13 +673,21 @@ neither counts as supported until its own acceptance checks pass.
   edits Claude Code settings), and `t3-watch wait claude-code:<session_id>`
   waits on what it records: completion, failure and needs-input, with the
   usual webhooks and `--durable`. First increment; not yet accepted.
-- Codex: `codex://threads/<id>` is refused as not supported yet.
+- Codex: `t3-watch wait codex://threads/<id>` reads the thread from a
+  Codex app-server over its Unix socket (`$T3_WATCH_CODEX_SOCKET`, default
+  `$CODEX_HOME/app-server-control/app-server-control.sock`) once a
+  second, with `thread/read` and `thread/turns/list` only. It never
+  resumes the thread, because with codex-cli 0.166.0 a resuming client
+  also receives the owner's approval requests. Completion, failure and
+  needs-input (`waitingOnApproval`, `waitingOnUserInput`), with the usual
+  webhooks and `--durable`. Verified against a real codex-cli 0.166.0
+  app-server with disposable threads; the desktop app is not yet checked.
 
 ## How it works
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e13.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e14.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -704,15 +712,16 @@ neither counts as supported until its own acceptance checks pass.
   `outbox-legacy-retain`, `outbox-legacy-retain-held`,
   `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
   `native-claude-code-hooks`, `native-claude-code-requests`,
-  `suspend-aware`,
+  `native-codex-app-server`, `suspend-aware`,
   `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 13 (this build) does not reach engine-12 daemons
-  (`0.10.0`, socket `daemon-e12.sock`), engine-11 ones (`0.9.0`,
+  `t3-watch stop`. Engine 14 (this build) does not reach engine-13 daemons
+  (`0.11.0`, socket `daemon-e13.sock`), engine-12 ones (`0.10.0`,
+  `daemon-e12.sock`), engine-11 ones (`0.9.0`,
   `daemon-e11.sock`), engine-10 ones (`0.8.0`,
   `daemon-e10.sock`), engine-9 ones (`0.7.0`,
   `daemon-e9.sock`), engine-8 ones (`0.6.0`,

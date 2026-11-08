@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 13;
+pub const ENGINE: u32 = 14;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -52,6 +52,9 @@ pub const CAPABILITIES: &[&str] = &[
     // answer, never by a tool event), and an idle session with no recorded
     // turn never settles a wait.
     "native-claude-code-requests",
+    // `codex://threads/<id>` targets, read from a Codex app-server with
+    // `thread/read` and `thread/turns/list` only, never resumed (experimental).
+    "native-codex-app-server",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

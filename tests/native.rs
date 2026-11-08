@@ -318,17 +318,22 @@ fn a_session_with_no_events_yet_keeps_waiting_and_says_why() {
 }
 
 #[test]
-fn t3_contracts_and_codex_targets_are_refused() {
+fn t3_contracts_and_malformed_native_targets_are_refused() {
+    // Codex targets are watched since engine 14 (tests/codex.rs); only a
+    // malformed one is refused here.
     let env = Env::new();
     let out = env.run(&["wait", "--until", "workstream", &target()]);
     assert_eq!(out.status.code(), Some(2));
     assert!(output_json(&out).to_string().contains("T3 contracts"));
     let out = env.run(&["wait", "--final-marker", "DONE", &target()]);
     assert_eq!(out.status.code(), Some(2));
-    let out = env.run(&["wait", "codex://threads/01a1b891-e945-7f70-b755-db5ece6dcaff"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(output_json(&out).to_string().contains("not supported yet"));
-    for bad in ["claude-code:", "claude-code:../x", "claude-code:a b"] {
+    for bad in [
+        "claude-code:",
+        "claude-code:../x",
+        "claude-code:a b",
+        "codex://threads/",
+        "codex://threads/a/b",
+    ] {
         let out = env.run(&["wait", bad]);
         assert_eq!(out.status.code(), Some(2), "{bad}");
     }

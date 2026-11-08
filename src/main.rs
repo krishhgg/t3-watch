@@ -1,6 +1,7 @@
 //! t3-watch: wait for T3 Code threads to settle without spending AI tokens.
 
 mod cancel;
+mod codex;
 mod config;
 mod daemon;
 mod engine;
@@ -56,7 +57,9 @@ USAGE
 THREAD is a thread id, a T3 thread URL (https://<relay>/<envId>/<threadId>),
 or a t3-thread://v2/<envId>/<threadId> link. URLs pick the saved machine
 with the same origin. Experimental: claude-code:<session_id> watches a native
-Claude Code session through `t3-watch hook claude-code` (docs/native-sessions.md).
+Claude Code session through `t3-watch hook claude-code`, and
+codex://threads/<id> reads a Codex thread from a Codex app-server socket
+($T3_WATCH_CODEX_SOCKET, default under $CODEX_HOME) (docs/native-sessions.md).
 
 WAIT OPTIONS
   -m, --machine <NAME>             saved machine to use (`local` for the local CLI)
@@ -280,7 +283,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
     // fragment: any of them can carry a credential.
     let shown = util::without_secrets(arg);
     // Native sessions (experimental): a Claude Code session through its
-    // hook event log. Native Codex threads are not supported yet.
+    // hook event log, or a Codex thread read from its app-server.
     if let Some(session) = arg.strip_prefix(native::CLAUDE_PREFIX) {
         if !native::valid_session_id(session) {
             return Err("a Claude Code target is claude-code:<session_id> (letters, digits, '-' and '_')".into());
@@ -292,14 +295,23 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
             environment_id: None,
             t3_bin: None,
             base_dir: None,
+            socket: None,
         });
     }
     if arg.to_ascii_lowercase().starts_with("codex://") {
-        return Err(
-            "codex:// targets are not supported yet: the native Codex adapter is still being verified \
-             (docs/native-sessions.md)"
-                .into(),
-        );
+        let thread = arg
+            .strip_prefix(codex::CODEX_PREFIX)
+            .filter(|t| codex::valid_thread_id(t))
+            .ok_or("a Codex target is codex://threads/<thread_id> (letters, digits, '-' and '_')")?;
+        return Ok(TargetSpec {
+            transport: Transport::Codex,
+            machine: "codex".into(),
+            thread_id: codex::codex_thread_id(thread),
+            environment_id: None,
+            t3_bin: None,
+            base_dir: None,
+            socket: Some(config::absolute(&codex::default_socket())?),
+        });
     }
     let mut origin: Option<(String, String)> = None; // (origin, host)
     let (thread_id, env) = if let Some((scheme, rest)) = arg.split_once("://") {
@@ -362,6 +374,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
         environment_id: None,
         t3_bin: d.t3_bin.clone(),
         base_dir: Some(d.base_dir.clone()),
+        socket: None,
     };
     let mcp = |name: &str, thread_id: String, env: Option<String>| TargetSpec {
         transport: Transport::Mcp,
@@ -370,6 +383,7 @@ fn resolve_target(arg: &str, d: &WaitDefaults, cfg: &Config) -> Result<TargetSpe
         environment_id: env,
         t3_bin: None,
         base_dir: None,
+        socket: None,
     };
 
     if d.transport == Some(Transport::Local) || d.machine == Some(LOCAL_MACHINE) {
