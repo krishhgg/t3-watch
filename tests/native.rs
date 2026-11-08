@@ -9,7 +9,7 @@ use common::*;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const S: &str = "00893aaf-19fa-41d2-8238-13269b9b3ca0";
@@ -134,29 +134,100 @@ fn a_turn_is_watched_from_its_hook_events_with_and_without_the_daemon() {
 }
 
 #[test]
-fn a_permission_prompt_is_needs_input_until_answered() {
+fn a_permission_prompt_stays_needs_input_until_its_turn_settles() {
+    // Cursor review (ordinal 13): a later tool event cleared the request.
+    // With tool ids not recorded, nothing tells the waiting tool apart from
+    // a parallel one or a late async hook, so only a denial, an answered
+    // elicitation or the end of the turn clears it.
     let env = Env::new();
     hook(&env, event("UserPromptSubmit", json!({ "prompt": "x" })));
+    hook(&env, event("PermissionRequest", json!({ "tool_name": "Write" })));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let first = output_json(&out)["threads"][0]["pendingKey"].clone();
+    // A different tool finishes: still needs input.
+    for e in ["PostToolUse", "PostToolUseFailure"] {
+        hook(&env, event(e, json!({ "tool_name": "Bash" })));
+        let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+        assert_eq!(out.status.code(), Some(5), "{e} cleared the request");
+    }
+    // A second prompt in the same turn is a new pendingKey.
     hook(
         &env,
         event(
             "Notification",
-            json!({ "message": "Claude needs your permission", "notification_type": "permission_prompt" }),
+            json!({ "notification_type": "permission_prompt", "message": "m" }),
         ),
     );
     let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
-    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
-    assert_eq!(output_json(&out)["event"], "needs_input");
-    // Answered by its user (never by t3-watch): the tool ran.
-    hook(&env, event("PostToolUse", json!({ "tool_name": "Bash" })));
+    assert_eq!(out.status.code(), Some(5));
+    assert_ne!(output_json(&out)["threads"][0]["pendingKey"], first);
+    // Denied: running again.
+    hook(&env, event("PermissionDenied", json!({ "tool_name": "Write" })));
     let out = env.run(&["wait", "--no-daemon", "--timeout", "1500ms", &target()]);
     assert_eq!(out.status.code(), Some(3), "running again, not needs-input");
     hook(&env, event("PermissionRequest", json!({ "tool_name": "Write" })));
-    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
-    assert_eq!(out.status.code(), Some(5));
     hook(&env, event("Stop", json!({})));
     let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn a_subagent_stop_is_not_the_session_stopping() {
+    let env = Env::new();
+    hook(&env, event("UserPromptSubmit", json!({ "prompt": "x" })));
+    for e in ["Stop", "StopFailure", "SessionEnd"] {
+        hook(
+            &env,
+            event(e, json!({ "agent_id": "agent-1", "agent_type": "reviewer" })),
+        );
+    }
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "1500ms", &target()]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(output_json(&out)["threads"][0]["status"], "running");
+    hook(&env, event("Stop", json!({})));
+    let out = env.run(&["wait", "--no-daemon", "--timeout", "5s", &target()]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn the_printed_hook_command_runs_from_a_path_with_a_space() {
+    // Cursor review, P2: the binary path went into the shell command
+    // unquoted, so a path with a space never started.
+    let env = Env::new();
+    let dir = env.home.join("with space");
+    fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("t3-watch");
+    fs::copy(BIN, &bin).unwrap();
+    let out = Command::new(&bin)
+        .args(["hook", "claude-code", "--print-settings"])
+        .env("T3_WATCH_HOME", &env.home)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let command = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Claude Code runs a command hook through the shell.
+    let mut sh = Command::new("/bin/sh")
+        .args(["-c", &command])
+        .env("T3_WATCH_HOME", &env.home)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sh.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            event("UserPromptSubmit", json!({ "prompt": "x" }))
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(sh.wait().unwrap().success(), "{command}");
+    assert!(log(&env).contains("UserPromptSubmit"), "{command}");
+    let _ = fs::remove_file(&bin);
 }
 
 #[test]

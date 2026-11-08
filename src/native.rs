@@ -30,13 +30,12 @@ const NEEDS_INPUT: [&str; 4] = [
     "elicitation_url_dialog",
     "agent_needs_input",
 ];
-/// Events that come after a pending request was answered.
-const ANSWERED: [&str; 4] = [
-    "PostToolUse",
-    "PostToolUseFailure",
-    "PermissionDenied",
-    "ElicitationResult",
-];
+/// Events that end what a pending request was waiting on. Tool events are
+/// not among them: with tool ids deliberately not recorded, a later tool
+/// event (a parallel call, an async hook arriving late) cannot be told
+/// apart from the one that was waiting, so a request stays pending until
+/// it is denied, its elicitation is answered, or its turn ends.
+const ANSWERED: [&str; 2] = ["PermissionDenied", "ElicitationResult"];
 
 pub fn valid_session_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -97,8 +96,8 @@ pub fn record_claude_hook(input: impl Read) -> Result<(), String> {
 /// The hook entries to merge into a Claude Code settings file, running
 /// `bin` asynchronously on every event the adapter folds.
 pub fn claude_settings(bin: &str) -> Value {
-    let handler =
-        json!([{ "hooks": [{ "type": "command", "command": format!("{bin} hook claude-code"), "async": true }] }]);
+    let command = format!("{} hook claude-code", shell_quote(bin));
+    let handler = json!([{ "hooks": [{ "type": "command", "command": command, "async": true }] }]);
     let mut hooks = serde_json::Map::new();
     for event in [
         "SessionStart",
@@ -106,8 +105,6 @@ pub fn claude_settings(bin: &str) -> Value {
         "Notification",
         "PermissionRequest",
         "PermissionDenied",
-        "PostToolUse",
-        "PostToolUseFailure",
         "ElicitationResult",
         "Stop",
         "StopFailure",
@@ -118,12 +115,25 @@ pub fn claude_settings(bin: &str) -> Value {
     json!({ "hooks": hooks })
 }
 
+/// `s` as one word for the POSIX shell that runs command hooks.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'='))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The session as its recorded hook events describe it, in the shape the
 /// engine reads for any thread: a status, the latest run (one per prompt)
-/// and whether a request is pending.
+/// and how many requests are pending.
 pub fn claude_state(session: &str, observed_at: Instant) -> ThreadState {
     let tid = claude_thread_id(session);
-    let (mut turn, mut status, mut pending, mut events) = (0u64, None::<&str>, false, 0usize);
+    // `pending` counts the requests seen since the last event that ended
+    // them, so each new one gives the wait a new pendingKey.
+    let (mut turn, mut status, mut pending, mut events) = (0u64, None::<&str>, 0u64, 0usize);
     for line in read_log_tail(&claude_log(session)).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -131,29 +141,32 @@ pub fn claude_state(session: &str, observed_at: Instant) -> ThreadState {
         events += 1;
         let event = v.get("event").and_then(Value::as_str).unwrap_or("");
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        // A subagent's stop or end is not the session's.
+        let subagent = v.get("subagent").and_then(Value::as_bool) == Some(true);
         match event {
             "UserPromptSubmit" => {
                 turn += 1;
                 status = Some("running");
-                pending = false;
+                pending = 0;
             }
+            "Stop" | "StopFailure" | "SessionEnd" if subagent => {}
             "Stop" => {
                 status = Some("completed");
-                pending = false;
+                pending = 0;
             }
             "StopFailure" => {
                 status = Some("failed");
-                pending = false;
+                pending = 0;
             }
-            "PermissionRequest" => pending = true,
-            "Notification" if NEEDS_INPUT.contains(&kind) => pending = true,
+            "PermissionRequest" => pending += 1,
+            "Notification" if NEEDS_INPUT.contains(&kind) => pending += 1,
             "Notification" if kind == "idle_prompt" && status.is_none() => status = Some("completed"),
-            e if ANSWERED.contains(&e) => pending = false,
+            e if ANSWERED.contains(&e) => pending = 0,
             "SessionEnd" => {
                 if status == Some("running") {
                     status = Some("cancelled");
                 }
-                pending = false;
+                pending = 0;
             }
             _ => {}
         }
@@ -161,7 +174,7 @@ pub fn claude_state(session: &str, observed_at: Instant) -> ThreadState {
     let mut thread = json!({
         "threadId": tid,
         "status": status,
-        "pendingRequestCount": u64::from(pending),
+        "pendingRequestCount": pending,
         "title": if events == 0 {
             "Claude Code session (no hook events recorded yet)"
         } else {
@@ -211,6 +224,20 @@ mod tests {
         for bad in ["", "a/b", "../x", "a b", "a?b", &"x".repeat(129)] {
             assert!(!valid_session_id(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn hook_commands_quote_the_binary_path_for_the_shell() {
+        assert_eq!(shell_quote("/usr/local/bin/t3-watch"), "/usr/local/bin/t3-watch");
+        assert_eq!(shell_quote("/Users/a b/t3-watch"), "'/Users/a b/t3-watch'");
+        assert_eq!(shell_quote("/x/it's"), r"'/x/it'\''s'");
+        assert_eq!(
+            claude_settings("/Users/a b/t3-watch")["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/Users/a b/t3-watch' hook claude-code"
+        );
+        // Tool events no longer change the folded state, so no hook for them.
+        let s = claude_settings("/x");
+        assert!(s["hooks"].get("PostToolUse").is_none() && s["hooks"].get("PostToolUseFailure").is_none());
     }
 
     #[test]

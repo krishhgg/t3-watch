@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 11;
+pub const ENGINE: u32 = 12;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -37,9 +37,14 @@ pub const CAPABILITIES: &[&str] = &[
     // beside them, so older senders leave them alone too.
     "outbox-legacy-retain-held",
     // Receipts beside held engine-4 entries are taken back in checked steps
-    // that never leave an entry more exposed to an older sender than
-    // before, and repaired after a crash.
+    // that never leave an entry more exposed than before to an older sender
+    // the upgrade precondition leaves running (engines 4, 7 and 8), and
+    // repaired after a crash; a 0.7.0 fence stays up until they are done.
     "outbox-legacy-checked-convert",
+    // outbox-v2 is left untouched until an operator acknowledges that no
+    // engine-5 or engine-6 sender runs, and while one answers at a default
+    // socket; a refusal fails closed (`upgradePrecondition`, non-zero exit).
+    "outbox-legacy-ack",
     // `claude-code:<session_id>` targets, watched through the session's
     // recorded hook events (experimental).
     "native-claude-code-hooks",

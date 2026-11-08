@@ -203,10 +203,13 @@ impl Entry {
 
     /// What `outbox list` shows: no URL path or query, header or secret.
     pub fn public_json(&self) -> Value {
-        self.public_json_in(&Store::current())
+        self.public_json_in(&Store::current(), true)
     }
 
-    fn public_json_in(&self, store: &Store) -> Value {
+    /// `probe`: whether `inFlight` may be found out by trying the entry's
+    /// lease, which opens (creates) its lock file. Never in a blocked
+    /// outbox-v2: listing it must not touch it.
+    fn public_json_in(&self, store: &Store, probe: bool) -> Value {
         json!({
             "id": self.id,
             "event": self.event,
@@ -222,7 +225,7 @@ impl Entry {
             "lastError": self.last_error,
             "lastStatus": self.last_status,
             "lastAttemptAt": self.last_attempt_ms.map(util::rfc3339_ms),
-            "inFlight": matches!(store.try_lease(&self.id), Ok(None)),
+            "inFlight": if probe { json!(matches!(store.try_lease(&self.id), Ok(None))) } else { Value::Null },
         })
     }
 }
@@ -554,20 +557,24 @@ impl Store {
     /// do with the entry, so doing them all first means that a pass cut
     /// short later (taking a receipt back takes two writes) never leaves an
     /// entry it had not reached yet in the state an engine-4 sender
-    /// dead-letters. Returns the ids it could not hold (reported).
-    fn hold_first(&self, results: &mut Vec<Value>) -> HashSet<String> {
+    /// dead-letters. Returns the ids it could not hold (reported), and the
+    /// leases of entries whose receipt is still to be taken back: kept, so
+    /// that each entry's hold and receipt removal happen under one lease.
+    fn hold_first(&self, results: &mut Vec<Value>) -> (HashSet<String>, HashMap<String, Lease>) {
         let mut failed = HashSet::new();
+        let mut kept = HashMap::new();
         if !self.absence_is_delivery {
-            return failed;
+            return (failed, kept);
         }
         for listed in self.entries().0 {
-            let Ok(Some(_lease)) = self.try_lease(&listed.id) else {
+            let Ok(Some(lease)) = self.try_lease(&listed.id) else {
                 continue;
             };
             let Some(e) = self.load(&listed.id) else {
                 continue;
             };
-            let how = if let Some(how) = self.needs_conversion(&e) {
+            let converting = self.needs_conversion(&e);
+            let how = if let Some(how) = converting {
                 how
             } else if e.retained_as.is_none()
                 && !self.finished(&e.id)
@@ -582,14 +589,39 @@ impl Store {
                 results.push(json!({ "id": e.id, "store": self.label, "conversionError": why,
                                      "atRisk": AT_RISK }));
                 failed.insert(e.id.clone());
+            } else if converting.is_some() {
+                kept.insert(e.id.clone(), lease);
             }
         }
-        failed
+        (failed, kept)
     }
 
-    /// A `sender.lock` directory left by the 0.7.0 fence: removed, and the
-    /// lock file it moved aside put back, so every sender can lock this
-    /// store again.
+    /// Whether a `sender.lock` directory left by the 0.7.0 fence stands. No
+    /// leased older build can open it, so it keeps their senders out; it
+    /// stays until nothing here is left to hold or take back.
+    fn old_fence(&self) -> bool {
+        self.absence_is_delivery && fs::symlink_metadata(self.dir.join("sender.lock")).is_ok_and(|m| m.is_dir())
+    }
+
+    /// Entries that still need holding or their receipt taken back.
+    fn unsettled_legacy(&self) -> usize {
+        self.entries()
+            .0
+            .iter()
+            .filter(|e| {
+                self.needs_conversion(e).is_some()
+                    || (e.retained_as.is_none()
+                        && !self.finished(&e.id)
+                        && util::now_ms() >= e.expires_ms
+                        && self.must_keep(e, Disposition::Expired))
+            })
+            .count()
+    }
+
+    /// Lowers a 0.7.0 fence: the directory removed and the lock file it
+    /// moved aside put back, so every sender can lock this store again. Call
+    /// holding the flock on `sender.fenced.lock`, once nothing is left to
+    /// hold or take back.
     fn clear_old_fence(&self) {
         let lock = self.dir.join("sender.lock");
         if fs::symlink_metadata(&lock).is_ok_and(|m| m.is_dir()) && fs::remove_dir(&lock).is_ok() {
@@ -739,20 +771,38 @@ impl Store {
             return Ok(());
         }
         util::ensure_private_dir(&self.dir).map_err(|e| format!("cannot use the outbox directory: {e}"))?;
-        self.clear_old_fence();
-        let lock = util::open_lock_file(&self.dir.join("sender.lock"))
-            .map_err(|e| format!("cannot open the sender lock: {e}"))?;
+        // While a 0.7.0 fence stands it stays, and senders of this build
+        // lock the file it moved aside; it comes down only once nothing is
+        // left to hold or take back.
+        let fenced = self.old_fence();
+        let lock_name = if fenced { "sender.fenced.lock" } else { "sender.lock" };
+        let lock =
+            util::open_lock_file(&self.dir.join(lock_name)).map_err(|e| format!("cannot open the sender lock: {e}"))?;
         if !util::try_flock(&lock).map_err(|e| format!("cannot lock the outbox: {e}"))? {
+            // In outbox-v2 that other sender may be an older build's: this
+            // pass did not happen, which is an error, not an empty outbox.
+            if fenced {
+                return Err("another sender holds outbox-v2; its 0.7.0 fence stays up".into());
+            }
+            if self.absence_is_delivery {
+                return Err("another sender holds outbox-v2; nothing there was handled".into());
+            }
             results.push(json!({ "store": self.label, "skipped": "another sender is running" }));
             return Ok(());
         }
-        let held_failed = self.hold_first(results);
+        let (held_failed, mut leases) = self.hold_first(results);
         let mut jitter = Jitter::new();
         for listed in self.entries().0 {
             if held_failed.contains(&listed.id) {
                 continue;
             }
-            let lease = match self.try_lease(&listed.id) {
+            // An entry held by `hold_first` keeps that lease through its
+            // receipt removal; any other is leased here.
+            let leased = match leases.remove(&listed.id) {
+                Some(l) => Ok(Some(l)),
+                None => self.try_lease(&listed.id),
+            };
+            let lease = match leased {
                 Ok(Some(l)) => l,
                 Ok(None) => {
                     results.push(json!({ "id": listed.id, "store": self.label, "inFlight": true,
@@ -891,6 +941,16 @@ impl Store {
                 "nextAttemptAt": util::rfc3339_ms(e.next_attempt_ms),
                 "saveError": saved.err(),
             }));
+        }
+        if fenced {
+            let left = self.unsettled_legacy();
+            if left > 0 {
+                return Err(format!(
+                    "{left} outbox-v2 entr{} still to hold or take a receipt back from; the 0.7.0 fence stays up",
+                    if left == 1 { "y" } else { "ies" }
+                ));
+            }
+            self.clear_old_fence();
         }
         self.prune_receipts();
         // Lease files whose entry is gone (a crash between the two removals).
@@ -1127,34 +1187,21 @@ fn migrate_v1(results: &mut Vec<Value>) {
     }
 }
 
-/// Entries older builds left that are still to be sent: `outbox/` ones
-/// waiting for migration, and `outbox-v2/` and `outbox-v3/` ones without a
-/// valid receipt.
-pub fn legacy_entries() -> Vec<Entry> {
-    let mut out: Vec<Entry> = entry_files(&config::legacy_outbox_dir())
-        .into_iter()
-        .filter_map(|(_, p)| read_entry(&p))
-        .collect();
-    for store in Store::leased_legacy(0) {
-        out.extend(store.pending());
-    }
-    out.sort_by_key(|e| e.created_ms);
-    out
-}
-
 /// Legacy entries with the store they live in, for `outbox list`.
 pub fn legacy_public_json() -> Vec<Value> {
     let mut out: Vec<Value> = entry_files(&config::legacy_outbox_dir())
         .into_iter()
         .filter_map(|(_, p)| read_entry(&p))
         .map(|e| {
-            let mut v = e.public_json_in(&Store::current());
+            let mut v = e.public_json_in(&Store::current(), true);
             v["store"] = json!("outbox");
             v
         })
         .collect();
+    let probe_v2 = !legacy_v2_blocked();
     for store in Store::leased_legacy(0) {
-        out.extend(store.pending().iter().map(|e| e.public_json_in(&store)));
+        let probe = probe_v2 || !store.absence_is_delivery;
+        out.extend(store.pending().iter().map(|e| e.public_json_in(&store, probe)));
     }
     out
 }
@@ -1163,9 +1210,10 @@ pub fn legacy_public_json() -> Vec<Value> {
 /// `outbox list`.
 pub fn retained_public_json() -> Vec<Value> {
     let mut out = Vec::new();
+    let probe = !legacy_v2_blocked();
     for store in Store::leased_legacy(0) {
         for (e, how) in store.retained() {
-            let mut v = e.public_json_in(&store);
+            let mut v = e.public_json_in(&store, probe);
             v["disposition"] = json!(how.as_str());
             v["reason"] = json!(RETAINED);
             out.push(v);
@@ -1185,6 +1233,14 @@ pub fn drop_entry(id: &str) -> Result<Option<Value>, String> {
     for store in stores {
         if !store.path_of(id).exists() {
             continue;
+        }
+        if store.absence_is_delivery {
+            if let Some(p) = legacy_v2_precondition() {
+                return Err(format!(
+                    "outbox-v2 is left untouched: {}",
+                    p["reason"].as_str().unwrap_or("upgrade precondition not met")
+                ));
+            }
         }
         let Some(lease) = store.try_lease(id)? else {
             return Err("that entry is being delivered right now; try again".into());
@@ -1206,12 +1262,127 @@ pub fn drop_entry(id: &str) -> Result<Option<Value>, String> {
 /// Everything still to be sent, this build's entries and older builds'. The
 /// daemon stays up while this is not zero.
 pub fn pending_count() -> usize {
-    Store::current().pending().len() + legacy_entries().len() + legacy_conversions_incomplete()
+    let (legacy, _) = legacy_pending();
+    Store::current().pending().len() + legacy.len()
+}
+
+/// Older builds' entries this build is to send, and how many it leaves
+/// alone because `outbox-v2/` is blocked (see `legacy_v2_precondition`): a
+/// blocked store is not this build's to deliver, is reported as
+/// `upgradePrecondition` instead, and does not keep the daemon up.
+fn legacy_pending() -> (Vec<Entry>, usize) {
+    let mut out: Vec<Entry> = entry_files(&config::legacy_outbox_dir())
+        .into_iter()
+        .filter_map(|(_, p)| read_entry(&p))
+        .collect();
+    let blocked = legacy_v2_blocked();
+    let [v2, v3] = Store::leased_legacy(0);
+    let v2_pending = v2.pending();
+    let left = if blocked {
+        v2_pending.len()
+    } else {
+        // A receipt still to take back is work too.
+        out.extend(v2_pending);
+        out.extend(v2.entries().0.into_iter().filter(|e| v2.needs_conversion(e).is_some()));
+        0
+    };
+    out.extend(v3.pending());
+    (out, left)
+}
+
+/// Where an operator records that no engine-5 or engine-6 sender can run
+/// beside this build (`outbox legacy-ack --senders-stopped`).
+fn legacy_ack_path() -> PathBuf {
+    config::state_dir().join("outbox-v2-ack.json")
+}
+
+fn legacy_acknowledged() -> bool {
+    util::open_private_read(&legacy_ack_path())
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(64 << 10)).ok())
+        .is_some_and(|v| v["sendersStopped"] == true)
+}
+
+/// Whether `outbox-v2/` holds anything this build would act on: an entry
+/// file, or a 0.7.0 fence.
+fn legacy_v2_has_work() -> bool {
+    let store = &Store::leased_legacy(0)[0];
+    store.dir.is_dir() && (!entry_files(&store.dir).is_empty() || store.old_fence())
+}
+
+/// Why this build may not touch `outbox-v2/` now, if it may not. Engine-5
+/// and engine-6 senders remove entries an engine-4 client still needs (a
+/// held entry moved by engine 5, one beside a receipt removed by engine 6),
+/// and nothing this build writes can stop them, so it touches nothing in
+/// that store until an operator acknowledges that none runs. A daemon of
+/// theirs answering at a default socket refuses even then. Their absence
+/// there proves nothing: an `outbox run` without a daemon, or a daemon on a
+/// custom `T3_WATCH_SOCKET`, cannot be seen from here.
+pub fn legacy_v2_precondition() -> Option<Value> {
+    if !legacy_v2_has_work() {
+        return None;
+    }
+    let senders = incompatible_senders();
+    let action = "stop every engine-5 (0.3.0) and engine-6 (0.4.0) sender with access to this state directory \
+                  (daemons, including any on a custom T3_WATCH_SOCKET, and `t3-watch outbox run` without a \
+                  daemon), then run `t3-watch outbox legacy-ack --senders-stopped`";
+    if !senders.is_empty() {
+        return Some(json!({
+            "store": "outbox-v2",
+            "reason": "an engine-5 or engine-6 sender is running",
+            "incompatibleSenders": senders,
+            "action": action,
+        }));
+    }
+    if !legacy_acknowledged() {
+        return Some(json!({
+            "store": "outbox-v2",
+            "reason": "no acknowledgement that engine-5 and engine-6 senders are stopped",
+            "action": action,
+        }));
+    }
+    None
+}
+
+fn legacy_v2_blocked() -> bool {
+    legacy_v2_precondition().is_some()
+}
+
+/// `outbox legacy-ack`: records (or, with `revoke`, removes) the operator's
+/// statement that no engine-5 or engine-6 sender can run beside this build.
+/// Refused while one answers at a default socket.
+pub fn legacy_acknowledge(revoke: bool) -> Result<Value, String> {
+    let path = legacy_ack_path();
+    if revoke {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot remove {}: {e}", path.display())),
+        }
+        trace::record("outbox.legacy_ack", json!({ "revoked": true }));
+        return Ok(json!({ "acknowledged": false }));
+    }
+    let senders = incompatible_senders();
+    if !senders.is_empty() {
+        return Err(format!(
+            "an engine-5 or engine-6 sender is still running: {}",
+            Value::Array(senders)
+        ));
+    }
+    let ack = json!({
+        "sendersStopped": true,
+        "at": util::rfc3339_ms(util::now_ms()),
+        "statement": "no engine-5 (0.3.0) or engine-6 (0.4.0) sender, daemon or `outbox run`, runs with access \
+                      to this state directory",
+    });
+    util::ensure_private_dir(&config::state_dir()).map_err(|e| format!("cannot prepare the state directory: {e}"))?;
+    util::write_private(&path, ack.to_string().as_bytes()).map_err(|e| format!("cannot record it: {e}"))?;
+    trace::record("outbox.legacy_ack", json!({ "revoked": false }));
+    Ok(json!({ "acknowledged": true, "ack": ack }))
 }
 
 /// Receipts in `outbox-v2/` still to be taken back from beside entries held
-/// for engine-4 clients (see `Store::convert`): work for the sender, so they
-/// count as pending.
+/// for engine-4 clients (see `Store::convert`).
 fn legacy_conversions_incomplete() -> usize {
     Store::leased_legacy(0)
         .iter()
@@ -1239,6 +1410,20 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
         now.saturating_sub(RETIRE_RESCAN.as_millis() as u64)
     };
     for store in Store::leased_legacy(fresh_after) {
+        if store.absence_is_delivery {
+            // Nothing in outbox-v2 is touched (no lock file, hold, receipt
+            // or fence change) unless it has something to act on and the
+            // upgrade precondition holds. Checked in that order, so an
+            // entry that appears after an empty look waits for the next
+            // pass and its own check.
+            if !legacy_v2_has_work() {
+                continue;
+            }
+            if let Some(p) = legacy_v2_precondition() {
+                results.push(json!({ "store": store.label, "upgradePrecondition": p }));
+                continue;
+            }
+        }
         if let Err(e) = store.send_pass(force, &mut results) {
             results.push(json!({ "store": store.label, "error": e }));
         }
@@ -1250,9 +1435,20 @@ pub fn pass(force: bool) -> Result<Vec<Value>, String> {
 /// The supervised sender: passes forever, every couple of seconds. Logs a
 /// line per attempt through `log` (never URLs or secrets).
 pub fn run_forever(log: &dyn Fn(&str)) -> ! {
+    let mut refused: Option<String> = None;
     loop {
         match pass(false) {
             Ok(results) => {
+                let now = results
+                    .iter()
+                    .find_map(|r| r.get("upgradePrecondition"))
+                    .map(Value::to_string);
+                if now != refused {
+                    if let Some(p) = &now {
+                        log(&format!("outbox: outbox-v2 left untouched: {p}"));
+                    }
+                    refused = now;
+                }
                 for r in results.iter().filter(|r| {
                     r.get("id").is_some()
                         && r.get("deferred").is_none()
@@ -1316,13 +1512,15 @@ pub fn summary_json() -> Value {
     // are in it or not, never counted as pending but not as entries.
     let (entries, bad) = store.entries();
     let pending: Vec<&Entry> = entries.iter().filter(|e| !store.finished(&e.id)).collect();
-    let legacy = legacy_entries();
+    let (legacy, blocked) = legacy_pending();
     let oldest = pending.iter().copied().chain(&legacy).map(|e| e.created_ms).min();
     json!({
         "pending": pending.len() + legacy.len(),
         "legacyPending": legacy.len(),
+        "legacyBlocked": blocked,
         "legacyRetained": retained_public_json().len(),
         "legacyConversionsIncomplete": legacy_conversions_incomplete(),
+        "upgradePrecondition": legacy_v2_precondition(),
         "incompatibleSenders": incompatible_senders(),
         "finishedAwaitingCleanup": entries.len() - pending.len(),
         "unreadable": bad.len(),

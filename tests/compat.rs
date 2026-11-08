@@ -71,6 +71,13 @@ fn completed_by_old_engine(accepted: Value) -> Vec<Value> {
     ]
 }
 
+/// What an operator runs once no engine-5 or engine-6 sender can run:
+/// until then this build leaves outbox-v2 untouched.
+fn acknowledge(env: &Env) {
+    let out = env.run(&["outbox", "legacy-ack", "--senders-stopped"]);
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+}
+
 fn private_dir(env: &Env, name: &str) -> PathBuf {
     let d = env.home.join(name);
     fs::create_dir_all(&d).unwrap();
@@ -324,6 +331,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         (8, "0.6.0"),
         (9, "0.7.0"),
         (10, "0.8.0"),
+        (11, "0.9.0"),
     ]
     .into_iter()
     .map(|(engine, version)| {
@@ -350,6 +358,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         "outbox-legacy-retain-held",
         "outbox-legacy-checked-convert",
         "native-claude-code-hooks",
+        "outbox-legacy-ack",
         "suspend-aware",
         "suspend-invalidation",
     ] {
@@ -382,6 +391,7 @@ fn older_builds_entries_are_delivered_where_they_are_never_moved() {
         let env = Env::new();
         let hook = MockHook::start();
         let dir = private_dir(&env, store);
+        acknowledge(&env);
         let now = now_ms();
         let (waiting, held, finished) = ("0a0a0a01", "0c0c0c03", "0d0d0d04");
         // Never attempted, 91 s old: its client is still held back.
@@ -484,6 +494,7 @@ fn a_receipt_that_cannot_be_trusted_never_discards_an_event() {
             let env = Env::new();
             let hook = MockHook::start();
             let dir = private_dir(&env, store);
+            acknowledge(&env);
             let id = "0f0f0f06";
             fs::write(
                 dir.join(format!("{id}.json")),
@@ -638,6 +649,7 @@ fn an_expired_engine_4_entry_stays_where_its_client_looks_until_that_client_is_d
     let env = Env::new();
     let hook = MockHook::start();
     let v2 = private_dir(&env, "outbox-v2");
+    acknowledge(&env);
     let now = now_ms();
     let (live, finished, crashed, untraced) = ("1a1a1a01", "1b1b1b02", "1c1c1c03", "1d1d1d04");
     for id in [live, finished, crashed, untraced] {
@@ -702,6 +714,7 @@ fn a_dropped_engine_4_entry_stays_where_its_client_looks_until_that_client_is_do
     let env = Env::new();
     let hook = MockHook::start();
     let v2 = private_dir(&env, "outbox-v2");
+    acknowledge(&env);
     let now = now_ms();
     let id = "1e1e1e05";
     let mut e = v2_entry(id, &hook.url, now - 5_000, 0);
@@ -785,6 +798,7 @@ fn a_held_entry_another_build_moved_out_of_outbox_v2_is_finished_not_stuck() {
 /// receipt beside it.
 fn left_by_engine_7(env: &Env, hook: &MockHook, id: &str) -> PathBuf {
     let v2 = private_dir(env, "outbox-v2");
+    acknowledge(env);
     let now = now_ms();
     let mut e = v2_entry(id, &hook.url, now - 5_000, 0);
     e["expiresMs"] = json!(now - 1_000);
@@ -917,10 +931,11 @@ fn every_step_this_build_takes_on_an_engine_4_entry_leaves_it_no_more_exposed() 
 
 #[test]
 fn a_fence_left_by_0_7_0_is_cleared_so_every_sender_can_lock_the_store() {
+    // With nothing left to hold or take back, the fence comes down.
     let env = Env::new();
     let v2 = private_dir(&env, "outbox-v2");
-    fs::create_dir(v2.join("sender.lock")).unwrap();
-    fs::write(v2.join("sender.fenced.lock"), "").unwrap();
+    acknowledge(&env);
+    fenced_by_0_7_0(&v2);
     let run = env.run(&["outbox", "run", "--once"]);
     assert_eq!(run.status.code(), Some(0), "{}", both(&run));
     assert!(v2.join("sender.lock").is_file());
@@ -1018,5 +1033,194 @@ fn a_pass_cut_short_has_already_held_every_entry_it_had_not_reached() {
     assert_eq!(run.status.code(), Some(0), "{}", both(&run));
     for id in ids {
         assert_retained(&v2, &entry_at(&v2, id).unwrap(), "expired");
+    }
+}
+
+// ---- Cursor review (ordinal 13) of aaa5516 -----------------------------------
+
+/// Engine 5 (9fcc2f8, ac91a64) on an `outbox-v2/` entry whose lease is free:
+/// it never opens the store's sender lock; it cleans up beside a valid
+/// receipt, leaves an entry alone only while attempts and retries are 0
+/// and it is within 90 s of its creation, and otherwise moves it out of the
+/// store, which an engine-4 client then reads as delivered.
+fn engine_5_moves(dir: &Path, e: &Value) -> bool {
+    let id = e["id"].as_str().unwrap();
+    let receipt = dir.join("receipts").join(format!("{id}.json")).exists();
+    let fresh = e["attempts"].as_u64() == Some(0)
+        && e["retries"].as_u64() == Some(0)
+        && now_ms() < e["createdMs"].as_u64().unwrap() + 90_000;
+    receipt || !fresh
+}
+
+/// Every file under `dir`, with its bytes: what "untouched" is checked
+/// against.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for f in fs::read_dir(&d).unwrap().flatten() {
+            let p = f.path();
+            if p.is_dir() {
+                out.push((p.clone(), Vec::new()));
+                stack.push(p);
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap_or_default()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The reviewer's state: expired, never attempted, created 2 s ago, no
+/// receipt. Engine 5 leaves it alone for now; holding it (a retry recorded)
+/// would make engine 5 move it.
+fn fresh_unattempted_entry(env: &Env, id: &str) -> PathBuf {
+    let v2 = private_dir(env, "outbox-v2");
+    let now = now_ms();
+    let mut e = v2_entry(id, "http://127.0.0.1:9/hook", now - 2_000, 0);
+    e["expiresMs"] = json!(now - 1_000);
+    e["nextAttemptMs"] = json!(now + 88_000);
+    fs::write(v2.join(format!("{id}.json")), e.to_string()).unwrap();
+    old_trace(env, "outbox.created", id, std::process::id());
+    v2
+}
+
+#[test]
+fn outbox_v2_is_left_untouched_until_the_upgrade_precondition_holds() {
+    let id = "7a7a7a7a";
+    // An engine-6 daemon answers at its default socket: refused, and even
+    // the acknowledgement is refused.
+    let env = Env::new();
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let v2 = fresh_unattempted_entry(&env, id);
+    fake_daemon(&env.home.join("daemon-e6.sock"), vec![]);
+    let before = snapshot(&v2);
+    let run = env.run(&["outbox", "run", "--once"]);
+    let r = output_json(&run);
+    assert_eq!(run.status.code(), Some(4), "{r}");
+    assert_eq!(r["upgradePrecondition"]["incompatibleSenders"][0]["engine"], 6, "{r}");
+    assert_eq!(snapshot(&v2), before, "outbox-v2 changed");
+    assert!(!engine_5_moves(&v2, &entry_at(&v2, id).unwrap()));
+    let list = env.run(&["outbox", "list"]);
+    assert_eq!(list.status.code(), Some(4));
+    assert!(output_json(&list)["upgradePrecondition"].is_object());
+    let ack = env.run(&["outbox", "legacy-ack", "--senders-stopped"]);
+    assert_eq!(ack.status.code(), Some(2), "{}", both(&ack));
+    let drop = env.run(&["outbox", "drop", id]);
+    assert_eq!(drop.status.code(), Some(2), "{}", both(&drop));
+    assert_eq!(snapshot(&v2), before, "outbox-v2 changed");
+
+    // No such daemon, but no acknowledgement either: an `outbox run`
+    // without a daemon, or a custom-socket daemon, would not show.
+    let env = Env::new();
+    let v2 = fresh_unattempted_entry(&env, id);
+    let before = snapshot(&v2);
+    let run = env.run(&["outbox", "run", "--once"]);
+    let r = output_json(&run);
+    assert_eq!(run.status.code(), Some(4), "{r}");
+    assert!(
+        r["upgradePrecondition"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("acknowledgement"),
+        "{r}"
+    );
+    assert_eq!(snapshot(&v2), before, "outbox-v2 changed");
+
+    // The daemon refuses the same way, and a blocked store does not keep
+    // it up.
+    let mut daemon = env.spawn(&["daemon", "--idle-exit", "30s"]);
+    env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+    std::thread::sleep(Duration::from_millis(2_500));
+    let o = &env.status()["outbox"];
+    assert!(o["upgradePrecondition"].is_object(), "{o}");
+    assert_eq!(o["legacyBlocked"], 1, "{o}");
+    assert_eq!(o["pending"], 0, "{o}");
+    env.run(&["stop"]);
+    daemon.wait().unwrap();
+    assert_eq!(snapshot(&v2), before, "the daemon changed outbox-v2");
+
+    // Acknowledged: now it is held. That is exactly what engine 5 would
+    // then move, which is why the acknowledgement says engine 5 is stopped.
+    acknowledge(&env);
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", both(&run));
+    let kept = entry_at(&v2, id).unwrap();
+    assert_retained(&v2, &kept, "expired");
+    assert!(engine_5_moves(&v2, &kept));
+}
+
+/// A store as 0.7.0 leaves it after its fence went up: `sender.lock` a
+/// directory, the lock file moved aside.
+fn fenced_by_0_7_0(v2: &Path) {
+    let _ = fs::remove_file(v2.join("sender.lock"));
+    fs::create_dir(v2.join("sender.lock")).unwrap();
+    fs::write(v2.join("sender.fenced.lock"), "").unwrap();
+}
+
+#[test]
+fn a_0_7_0_fence_stays_up_until_every_receipt_is_taken_back() {
+    // The review's repro: cut short at the receipt removal, the fence was
+    // already down and an engine-6 sender could start a pass.
+    let env = Env::new();
+    let hook = MockHook::start();
+    let id = "7b7b7b7b";
+    let v2 = left_by_engine_7(&env, &hook, id);
+    fenced_by_0_7_0(&v2);
+    let cut = env
+        .cmd(&["outbox", "run", "--once"])
+        .env("T3_WATCH_TEST_FAULT", "before-receipt-unlink")
+        .output()
+        .unwrap();
+    assert_eq!(cut.status.code(), Some(97), "{}", both(&cut));
+    assert!(
+        v2.join("sender.lock").is_dir(),
+        "the fence came down before the receipt went"
+    );
+    assert!(v2.join("receipts").join(format!("{id}.json")).exists());
+    assert_eq!(entry_at(&v2, id).unwrap()["retainedAs"], "expired");
+
+    let run = env.run(&["outbox", "run", "--once"]);
+    assert_eq!(run.status.code(), Some(0), "{}", both(&run));
+    assert!(!v2.join("receipts").join(format!("{id}.json")).exists());
+    assert!(
+        v2.join("sender.lock").is_file(),
+        "the fence stayed up when nothing was left"
+    );
+    assert!(!v2.join("sender.fenced.lock").exists());
+    assert_retained(&v2, &entry_at(&v2, id).unwrap(), "expired");
+}
+
+#[test]
+fn a_busy_outbox_v2_lock_is_an_error_and_the_fence_stays() {
+    use std::os::fd::AsRawFd;
+    for fenced in [true, false] {
+        let env = Env::new();
+        let hook = MockHook::start();
+        let id = "7c7c7c7c";
+        let v2 = left_by_engine_7(&env, &hook, id);
+        if fenced {
+            fenced_by_0_7_0(&v2);
+        }
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(v2.join(if fenced { "sender.fenced.lock" } else { "sender.lock" }))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let before = snapshot(&v2);
+        let run = env.run(&["outbox", "run", "--once"]);
+        let r = output_json(&run);
+        assert_eq!(run.status.code(), Some(4), "fenced={fenced}: {r}");
+        assert!(
+            r["results"].to_string().contains("another sender holds outbox-v2"),
+            "{r}"
+        );
+        assert_eq!(snapshot(&v2), before, "fenced={fenced}: outbox-v2 changed");
+        drop(held);
     }
 }

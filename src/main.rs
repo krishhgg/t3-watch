@@ -42,6 +42,9 @@ USAGE
   t3-watch daemon [--idle-exit 60s]       run the multiplexer in the foreground
   t3-watch outbox list | run [--once] | drop <ID>
                                           durable notifications not yet delivered
+  t3-watch outbox legacy-ack --senders-stopped | --revoke
+                                          allow (or stop) work on engine-4 entries in
+                                          outbox-v2/ once no engine-5/6 sender runs
   t3-watch auth login <ORIGIN|URL>        pair with a T3 MCP server (browser on this machine)
   t3-watch auth oauth-start <ORIGIN|URL>  pair from a headless machine, step 1
   t3-watch auth oauth-finish <CALLBACK>   pair from a headless machine, step 2
@@ -911,34 +914,64 @@ fn hostname() -> String {
 
 fn cmd_outbox(raw: &[String]) -> ! {
     let Some(sub) = raw.first() else {
-        usage_error("outbox needs a subcommand: list, run, drop")
+        usage_error("outbox needs a subcommand: list, run, drop, legacy-ack")
     };
-    let a = parse_args(&raw[1..], &[], &["once", "pretty"]).unwrap_or_else(|e| usage_error(&e));
+    let a = parse_args(&raw[1..], &[], &["once", "pretty", "senders-stopped", "revoke"])
+        .unwrap_or_else(|e| usage_error(&e));
     let pretty = a.has("pretty");
     match sub.as_str() {
         "list" => {
             let (entries, bad) = outbox::entries();
+            let precondition = outbox::legacy_v2_precondition();
+            let blocked = precondition.is_some();
             print_json(
                 &json!({
                     "entries": entries.iter().map(outbox::Entry::public_json).collect::<Vec<_>>(),
                     "legacy": outbox::legacy_public_json(),
                     "retained": outbox::retained_public_json(),
                     "incompatibleSenders": outbox::incompatible_senders(),
+                    "upgradePrecondition": precondition,
                     "unreadable": bad,
                     "dir": config::outbox_dir().display().to_string(),
                 }),
                 pretty,
             );
-            exit(0)
+            exit(if blocked { EXIT_NOTIFY_FAILED } else { 0 })
         }
         "run" if a.has("once") => match outbox::pass(true) {
             Ok(results) => {
                 let left = outbox::pending_count();
-                print_json(&json!({ "results": results, "pending": left }), pretty);
-                exit(if left == 0 { 0 } else { EXIT_NOTIFY_FAILED })
+                let precondition = results.iter().find_map(|r| r.get("upgradePrecondition")).cloned();
+                // Any error, refused precondition or failed conversion is
+                // work left undone, whatever the pending count says.
+                let failed = results.iter().any(|r| {
+                    r.get("error").is_some()
+                        || r.get("conversionError").is_some()
+                        || r.get("upgradePrecondition").is_some()
+                });
+                print_json(
+                    &json!({ "results": results, "pending": left, "upgradePrecondition": precondition }),
+                    pretty,
+                );
+                exit(if left == 0 && !failed { 0 } else { EXIT_NOTIFY_FAILED })
             }
             Err(e) => fail_json("outbox", &e),
         },
+        "legacy-ack" => {
+            if !a.has("senders-stopped") && !a.has("revoke") {
+                usage_error(
+                    "outbox legacy-ack --senders-stopped records that no engine-5 or engine-6 sender runs \
+                     (daemon, custom-socket daemon or `outbox run`); --revoke removes that",
+                )
+            }
+            match outbox::legacy_acknowledge(a.has("revoke")) {
+                Ok(v) => {
+                    print_json(&v, pretty);
+                    exit(0)
+                }
+                Err(e) => fail_json("outbox", &e),
+            }
+        }
         "run" => outbox::run_forever(&|line| util::warn(&format!("t3-watch: {line}"))),
         "drop" => {
             let [id] = a.positional.as_slice() else {
