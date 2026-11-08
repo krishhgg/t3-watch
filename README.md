@@ -404,9 +404,13 @@ With `--durable`, a webhook is never fire-and-forget:
    that order. No build can keep an older sender out of `outbox-v2/` across
    its own crash: its locks die with it, and a sender that already opened
    the lock file keeps it. So instead each step leaves the entry no more
-   exposed than before, under every older build's rules: holding it ends
-   what an engine-4 sender would do (dead-letter it once expired), and
-   taking the receipt back ends what an engine-6 sender would do. Each pass
+   exposed than before to engine-4, engine-6, engine-7 and engine-8
+   senders: holding it ends what an engine-4 sender would do (dead-letter
+   it once expired), and taking the receipt back ends what an engine-6
+   sender would do. No step protects it from an engine-5 sender, which
+   moves `outbox-v2/` entries whatever their state, held ones included;
+   the upgrade precondition (item 8) requires engine-5 senders stopped
+   before this build touches `outbox-v2/` at all. Each pass
    holds every entry that must be kept (one write each) before it takes
    any receipt back, so a pass cut short never leaves an entry it had not
    reached yet for an engine-4 sender to dead-letter. A step
@@ -431,8 +435,11 @@ With `--durable`, a webhook is never fire-and-forget:
    - no engine-5 or engine-6 daemon answers at a default socket
      (`$XDG_RUNTIME_DIR/t3-watch/`, or the state directory, which is also
      checked). A daemon counts as alive if it holds its socket lock
-     (`<socket>.lock`, held by every build since engine 4) or accepts or
-     queues a connection, so one that has stopped accepting is still found.
+     (`<socket>.lock`): engine-5 and engine-6 daemons take it before they
+     bind and keep it until they exit, so one that has stopped accepting is
+     found by the lock alone. As a fallback, a connect that succeeds or is
+     queued counts too. That fallback cannot see a listener whose backlog is
+     full: macOS refuses the connect (`ECONNREFUSED`).
      One that is alive refuses even an acknowledged store, and refuses the
      acknowledgement itself.
 

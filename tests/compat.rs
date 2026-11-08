@@ -1269,6 +1269,55 @@ fn status_fails_closed_like_list_and_a_blocked_store_does_not_keep_the_daemon_up
 }
 
 #[test]
+fn a_hung_engine_5_daemon_with_a_full_backlog_is_found_by_its_lock() {
+    // Review ordinal 15: on macOS a listener whose backlog is full refuses a
+    // connect (ECONNREFUSED), so connecting proves nothing about a hung
+    // daemon. Engine-5 and engine-6 daemons hold their socket lock from
+    // before they bind until they exit, and the lock is what finds them.
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let env = Env::new();
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = env.home.join("daemon-e5.sock");
+    // A listener that never accepts, with a backlog of one, filled.
+    let fd = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in sock.as_os_str().as_bytes().iter().enumerate() {
+            addr.sun_path[i] = *b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        assert_eq!(libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len), 0);
+        assert_eq!(libc::listen(fd, 1), 0);
+        fd
+    };
+    let queued: Vec<_> = (0..3).filter_map(|_| UnixStream::connect(&sock).ok()).collect();
+    if cfg!(target_os = "macos") {
+        // The backlog is full: further connects are refused, as a hung
+        // daemon's would be.
+        assert!(UnixStream::connect(&sock).is_err(), "the backlog is not full");
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.home.join("daemon-e5.sock.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let list = output_json(&env.run(&["outbox", "list"]));
+    assert_eq!(list["incompatibleSenders"][0]["engine"], 5, "{list}");
+    let ack = env.run(&["outbox", "legacy-ack", "--senders-stopped"]);
+    assert_eq!(ack.status.code(), Some(2), "{}", both(&ack));
+    drop(queued);
+    unsafe { libc::close(fd) };
+}
+
+#[test]
 fn a_live_engine_6_daemon_that_does_not_accept_is_still_found() {
     // A single connect missed a daemon that holds its lock but does not
     // accept (hung, stopped, or its backlog full).

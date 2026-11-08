@@ -557,14 +557,16 @@ pub fn open_private_read(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
-/// Whether a t3-watch daemon (of any build) is alive at `sock`: it holds the
-/// flock on `<sock>.lock` (every build since engine 4 does for its whole
-/// life), or something accepts or queues a connection there. Never blocks
-/// and never creates a file: the lock is opened read-only and probed with a
-/// shared non-blocking flock, released at once (a daemon that loses that
-/// race retries its own lock for seconds), and the connect is non-blocking,
-/// so a listener that has stopped accepting, or whose backlog is full, still
-/// counts as alive rather than hanging the probe or passing unseen.
+/// Whether a t3-watch daemon (of any build) is alive at `sock`. The lock is
+/// what decides: every build since engine 4 takes the flock on
+/// `<sock>.lock` before it binds and keeps it until it exits (checked in
+/// the engine-5 and engine-6 sources), whether or not it still accepts.
+/// As a fallback, a connect that succeeds or is queued also counts; it
+/// cannot see a listener whose backlog is full, which macOS refuses with
+/// ECONNREFUSED. Never blocks and never creates a file: the lock is opened
+/// read-only and probed with a shared non-blocking flock, released at once
+/// (a daemon that loses that race retries its own lock for seconds), and
+/// the connect is non-blocking.
 pub fn daemon_alive(sock: &Path) -> bool {
     let mut lock = sock.as_os_str().to_owned();
     lock.push(".lock");

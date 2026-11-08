@@ -40,8 +40,11 @@ queued or delivered truthfully (README, "Durable delivery", item 7). An
 client looks, held so that engine-4, engine-6, engine-7 and engine-8
 senders leave it alone, until the trace shows that client is done with it
 (item 8). Every step this build takes on such an entry leaves it no more
-exposed to an older sender than before, crash or not, but it cannot stop
-older senders from following their own rules. **Upgrade precondition:**
+exposed than before to engine-4, engine-6, engine-7 and engine-8 senders,
+crash or not, but it cannot stop older senders from following their own
+rules. Engine 5 is not covered: an engine-5 sender moves `outbox-v2/`
+entries whatever their state, held ones included, out of the place their
+engine-4 client looks. That is what the upgrade precondition is for. **Upgrade precondition:**
 this build leaves `outbox-v2/` untouched until you stop every engine-5
 (`0.3.0`) and engine-6 (`0.4.0`) sender (daemons, including any on a
 custom socket, and `outbox run` without a daemon) and then run

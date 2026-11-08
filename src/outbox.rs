@@ -57,8 +57,8 @@
 //!   process that created the entry gone. Without that evidence it stays
 //!   (`outbox list`, under `retained`); no age, absence or guess counts.
 //!   A receipt an older build left beside such an entry is taken back in
-//!   steps that never leave it more exposed than before (see
-//!   `Store::convert`).
+//!   steps that never leave it more exposed than before to engine-4, -6, -7
+//!   and -8 senders (see `Store::convert`).
 //!   An engine-5 sender moves such entries whatever their state; it is
 //!   reported (`incompatibleSenders`) when its daemon is found.
 //! - Builds before engine 4 used `outbox/`, without leases; their clients
@@ -509,12 +509,14 @@ impl Store {
     /// No older sender can be kept out across a crash of this process (its
     /// locks die with it, and a sender that already opened a lock file keeps
     /// it), so the steps are ordered so that every state they pass through
-    /// is no more exposed than the one before, under each older build's
-    /// rules: holding the entry first ends what an engine-4 sender would do
-    /// (dead-letter it once expired) and leaves only what an engine-6 sender
-    /// would already have done (clean up beside the receipt); taking the
-    /// receipt back then ends that too. Each step is checked and a failure
-    /// returned; whatever is left is repaired on the next pass.
+    /// is no more exposed than the one before to engine-4, -6, -7 and -8
+    /// senders (engine 5 moves entries whatever their state, so the upgrade
+    /// precondition requires it stopped): holding the entry first ends what
+    /// an engine-4 sender would do (dead-letter it once expired) and leaves
+    /// only what an engine-6 sender would already have done (clean up beside
+    /// the receipt); taking the receipt back then ends that too. Each step
+    /// is checked and a failure returned; whatever is left is repaired on
+    /// the next pass.
     fn convert(&self, e: &Entry, how: Disposition) -> Result<(), String> {
         self.retain(e, how)?;
         util::test_fault("before-receipt-unlink");
@@ -1470,9 +1472,9 @@ pub fn run_forever(log: &dyn Fn(&str)) -> ! {
 /// state, minding only the entry lease; engine 6 (`0.4.0`) removes one that
 /// has a receipt beside it (`legacyConversionsIncomplete`). Found when a
 /// daemon of theirs is alive at a default socket (holding its socket lock,
-/// or accepting or queueing connections, see `util::daemon_alive`): where it would listen in
-/// this environment (`$XDG_RUNTIME_DIR/t3-watch/` or the state directory),
-/// and the state directory as well (a daemon started without
+/// which those daemons keep until they exit, see `util::daemon_alive`):
+/// where it would listen in this environment (`$XDG_RUNTIME_DIR/t3-watch/`
+/// or the state directory), and the state directory as well (a daemon started without
 /// `$XDG_RUNTIME_DIR`). A daemon on a custom `T3_WATCH_SOCKET`, or an
 /// `outbox run` without a daemon, is not found this way.
 pub fn incompatible_senders() -> Vec<Value> {
