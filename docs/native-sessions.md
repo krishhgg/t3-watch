@@ -78,8 +78,9 @@ costs a file read every half second and no model calls.
 | `UserPromptSubmit` | A new turn (run ordinal + 1) is running |
 | `Stop` | The turn completed |
 | `StopFailure` | The turn failed (API error) |
-| `Notification` with `permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog` or `agent_needs_input`; `PermissionRequest` | Input is needed (a pending request) |
-| `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`, `ElicitationResult` | The pending request was answered |
+| `Notification` with `permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog` or `agent_needs_input`; `PermissionRequest` | Input is needed (one more pending request, so each gets its own `pendingKey`) until the turn ends or one of the next two rows |
+| `PermissionDenied`, `ElicitationResult` | The pending request was answered |
+| `Stop`, `StopFailure`, `SessionEnd` from a subagent (`agent_id` set) | No change: not the session's own |
 | `Notification` with `idle_prompt` | Idle and waiting for a prompt: settled if no turn was seen yet |
 | `SessionEnd` | A running turn ends as `cancelled` |
 | `SessionStart`, anything else | No change |
@@ -87,6 +88,22 @@ costs a file read every half second and no model calls.
 Install the hook yourself; t3-watch never edits Claude Code settings.
 `t3-watch hook claude-code --print-settings` prints the `hooks` block to
 merge into `~/.claude/settings.json` or a project's `.claude/settings.json`.
+
+Tool events (`PostToolUse`, `PostToolUseFailure`) do not clear a pending
+request. Tool ids are deliberately not recorded, so a later tool event (a
+parallel call, an async hook arriving late) cannot be told apart from the
+one that was waiting. A wait can therefore report needs-input after a
+person has already approved, until the turn ends. It exits 5 and wakes
+the bot, which is the safe side. The installed hooks do not subscribe to
+tool events at all. The hook command quotes the binary's path for the
+shell, so a path with a space works.
+
+**Pin the turn.** Async hooks can arrive late, so for a moment after a bot
+submits a prompt the log may still show the previous turn as finished.
+A bot reusing a session reads the current `runOrdinal` before it
+submits, then waits with `--expect-min-run-ordinal <that + 1>`. An unpinned
+wait in that gap exits 0 on the old turn. For the same reason an
+`idle_prompt` with no turn seen yet settles an unpinned wait right away.
 
 ### Limits of the first increment
 

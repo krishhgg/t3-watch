@@ -20,16 +20,16 @@ tar -xzf t3-watch-<ver>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 `t3-watch --version` prints the version, the engine revision and the
-source revision, e.g. `t3-watch 0.9.0 (engine 11, rev 1a2b3c...)`; packaged
+source revision, e.g. `t3-watch 0.10.0 (engine 12, rev 1a2b3c...)`; packaged
 binaries always carry the commit they were built from.
 
 Upgrading over a running older build (`a92f977` or `fa10d88`, engine 4;
-`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0` to `0.8.0`, engines
-6 to 10): this build never talks to their daemons (sockets `daemon-e4.sock`
-to `daemon-e10.sock`, or older; on a shared `T3_WATCH_SOCKET` it refuses
+`ac91a64` and other `0.3.0` builds, engine 5; `0.4.0` to `0.9.0`, engines
+6 to 11): this build never talks to their daemons (sockets `daemon-e4.sock`
+to `daemon-e11.sock`, or older; on a shared `T3_WATCH_SOCKET` it refuses
 them, by engine and by missing capabilities). It keeps its entries in
 `outbox-v4/`, which engine-4 and engine-5 senders never read; `0.4.0` to
-`0.8.0` use the same directory with the same rules. Their daemons keep
+`0.9.0` use the same directory with the same rules. Their daemons keep
 serving their own running clients and idle out afterwards; to retire one
 sooner, run its own binary's `t3-watch stop` once its clients are done.
 Entries older builds leave in `outbox-v2/` or `outbox-v3/` are never
@@ -42,11 +42,12 @@ senders leave it alone, until the trace shows that client is done with it
 (item 8). Every step this build takes on such an entry leaves it no more
 exposed to an older sender than before, crash or not, but it cannot stop
 older senders from following their own rules. **Upgrade precondition:**
-while engine-4 clients may be running, stop every engine-5 (`0.3.0`) and
-engine-6 (`0.4.0`) sender, daemon or `outbox run`; `outbox list` and
-`status` report such daemons at default sockets under
-`incompatibleSenders`, and anything on a custom socket or run without a
-daemon has to be checked by hand. Entries in `outbox/` (before engine 4)
+this build leaves `outbox-v2/` untouched until you stop every engine-5
+(`0.3.0`) and engine-6 (`0.4.0`) sender (daemons, including any on a
+custom socket, and `outbox run` without a daemon) and then run
+`t3-watch outbox legacy-ack --senders-stopped`. Until then, and whenever
+such a daemon answers at a default socket, `outbox run --once` and
+`outbox list` exit 4 with `upgradePrecondition`, and `status` reports it. Entries in `outbox/` (before engine 4)
 move over after the 90 s inline grace. All of them count as pending until
 delivered or retained, so the daemon does not idle out with an event
 unsent.

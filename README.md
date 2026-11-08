@@ -348,7 +348,8 @@ With `--durable`, a webhook is never fire-and-forget:
    are never moved: a client of theirs that found its entry gone would
    report the event delivered, and no amount of age proves that client is
    finished (a slow progress hook can hold it back for minutes). This
-   build delivers them where they are, as their own senders would: under
+   build delivers them where they are (`outbox-v2/` only once the upgrade
+   precondition in item 8 holds), as their own senders would: under
    the entry's lease and that store's `sender.lock`, after its next attempt
    time, counting each attempt as a sender retry. An old client that gets
    back to its entry then finds it either still there with a retry recorded
@@ -408,21 +409,34 @@ With `--durable`, a webhook is never fire-and-forget:
 
    What this build cannot change is what older senders do on their own:
    an engine-5 build (`0.3.0`, never released) moves `outbox-v2/` entries
-   whatever their state, minding only the entry lease; an engine-6 build
-   (`0.4.0`) removes an entry beside a receipt while one is still there;
-   and an engine-4 build's own sender dead-letters an entry that expires
-   before this build has held it. So, while engine-4 clients may be
-   running, no engine-5 or engine-6 sender may run beside this build; that
-   is a precondition of the upgrade, not something this build can enforce.
-   `outbox list` and `status` report a running engine-5 or engine-6 daemon
-   under `incompatibleSenders`, looking where a daemon listens by default
-   (`$XDG_RUNTIME_DIR/t3-watch/`, or the state directory, which is also
-   checked). A daemon on a custom `T3_WATCH_SOCKET`, or an `outbox run`
-   without a daemon, is not found this way: check for those yourself. Stop
-   such a sender with its own binary's `t3-watch stop`. An entry engine 5
-   moved, still held to 2100, is finished as expired wherever it ends up.
-   A `sender.lock` directory left by `0.7.0` (whose fence this replaces) is
-   removed, so every build can lock the store again.
+   whatever their state, minding only the entry lease (and moves a held
+   entry, whose recorded retry ends its 90 s grace); an engine-6 build
+   (`0.4.0`) removes an entry beside a receipt; and an engine-4 build's own
+   sender dead-letters an entry that expires before this build has held it.
+   So this build **leaves `outbox-v2/` untouched** (no lock file, hold,
+   delivery, receipt or fence change) until both of these hold:
+   - an operator has run `t3-watch outbox legacy-ack --senders-stopped`,
+     stating that no engine-5 or engine-6 sender (a daemon, one on a custom
+     `T3_WATCH_SOCKET`, or an `outbox run` without a daemon) runs with
+     access to this state directory; `--revoke` withdraws it;
+   - no engine-5 or engine-6 daemon answers at a default socket
+     (`$XDG_RUNTIME_DIR/t3-watch/`, or the state directory, which is also
+     checked). One that does refuses even an acknowledged store, and
+     refuses the acknowledgement itself.
+
+   Until then `outbox run --once`, `outbox list` and `outbox drop` on such
+   an entry fail closed: exit 4 (`drop`: 2) with `upgradePrecondition`
+   saying why. `status` shows the same and counts the entries as
+   `legacyBlocked`, which do not keep the daemon up, and the daemon logs
+   the refusal once. The absence of those sockets is never taken as
+   enough: a custom-socket daemon or an `outbox run` cannot be seen from
+   here. A busy `outbox-v2/` lock is an error too, since the sender holding
+   it may be an older build's. An entry engine 5 moved, still held to
+   2100, is finished as expired wherever it ends up. A `sender.lock`
+   directory left by `0.7.0` stays up, keeping every leased older sender
+   out, until this build has held every entry that needs it and taken back
+   every receipt; each entry's hold and receipt removal happen under one
+   lease. Only then does it come down.
 
 Every attempt for an entry carries the same `X-T3-Watch-Id` and
 `Idempotency-Key`. A receiver that processed a request whose answer was lost,
@@ -443,6 +457,7 @@ t3-watch outbox list            # ids, events, destination origin, attempts, nex
 t3-watch outbox run --once      # try every entry now, Retry-After permitting (exit 4 while some remain)
 t3-watch outbox run             # the sender in the foreground, for launchd/systemd
 t3-watch outbox drop <id>
+t3-watch outbox legacy-ack --senders-stopped   # see item 8: allow work on outbox-v2/
 ```
 
 An entry holds the webhook URL, extra headers and signing secret, protected
@@ -652,7 +667,7 @@ neither counts as supported until its own acceptance checks pass.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e11.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e12.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -675,7 +690,8 @@ neither counts as supported until its own acceptance checks pass.
   wait ends too. The client also requires every capability it depends on
   (`outbox-receipts`, `outbox-legacy-drain`, `outbox-legacy-in-place`,
   `outbox-legacy-retain`, `outbox-legacy-retain-held`,
-  `outbox-legacy-checked-convert`, `native-claude-code-hooks`,
+  `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
+  `native-claude-code-hooks`,
   `suspend-aware`,
   `suspend-invalidation`) in that
   line,
@@ -683,8 +699,9 @@ neither counts as supported until its own acceptance checks pass.
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 11 (this build) does not reach engine-10 daemons
-  (`0.8.0`, socket `daemon-e10.sock`), engine-9 ones (`0.7.0`,
+  `t3-watch stop`. Engine 12 (this build) does not reach engine-11 daemons
+  (`0.9.0`, socket `daemon-e11.sock`), engine-10 ones (`0.8.0`,
+  `daemon-e10.sock`), engine-9 ones (`0.7.0`,
   `daemon-e9.sock`), engine-8 ones (`0.6.0`,
   `daemon-e8.sock`), engine-7 ones (`0.5.0`,
   `daemon-e7.sock`), engine-6 ones (`0.4.0`,
