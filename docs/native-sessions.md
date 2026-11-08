@@ -138,7 +138,11 @@ generates (`codex app-server generate-json-schema`) agree on the following.
 - `codex app-server daemon` manages a shared local app-server, and
   `codex app-server proxy [--sock PATH]` connects stdio to its control
   socket. This is the CLI's own way for a second client to reach a running
-  app-server.
+  app-server. The default socket is
+  `~/.codex/app-server-control/app-server-control.sock`.
+  `codex app-server daemon version` (read-only) found no daemon running on
+  the Mac mini, so whether a second client can attach there depends on a
+  daemon being started, which is a change this work did not make.
 - Read-only methods: `thread/read` (stored metadata and runtime `status`;
   it does not load the thread or emit `thread/started`), `thread/list`,
   `thread/loaded/list`, `thread/turns/list`, `thread/items/list`.
@@ -201,7 +205,8 @@ machine that runs the thread:
 
 - On `MacBook-Pro-724` as `krishgarg`, read-only:
   - `codex --version` and `codex app-server daemon version`;
-  - whether the app-server control socket exists;
+  - whether `~/.codex/app-server-control/app-server-control.sock` exists
+    while the desktop app has the thread open;
   - over `proxy`: `initialize`, then `thread/read` of
     `01a1b891-e945-7f70-b755-db5ece6dcaff` and `thread/loaded/list`.
   
