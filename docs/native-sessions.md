@@ -18,7 +18,7 @@ adapter is "supported" until its acceptance checks below have passed.
 | Adapter | Status |
 |---|---|
 | Claude Code (`claude-code:<session_id>`) | First increment implemented (hook ingestion and waiting). Acceptance checks 1 to 3 passed; 4 passed with a local receiver, the bot's own continuation still open. Not yet accepted. |
-| Codex (`codex://threads/<id>`) | Implemented (read-only polling of a Codex app-server). Acceptance checks 1 and 2 passed against a real codex-cli 0.166.0 app-server; 3 (the desktop app) and 4 open. Not yet accepted. |
+| Codex (`codex://threads/<id>`) | Implemented (read-only polling of a Codex app-server, plus an optional `PermissionRequest` hook log for requests missed while nothing counted). Acceptance checks 1 and 2 passed against a real codex-cli 0.166.0 app-server; 3 (the desktop app) and 4 open. Not yet accepted. |
 
 ## Rules for both adapters
 
@@ -30,7 +30,8 @@ adapter is "supported" until its acceptance checks below have passed.
   one is pending, so the owning human or client answers it.
 - **Official interfaces only.** Claude Code: documented hooks (and, if ever
   needed, the documented Agent SDK and session flags). Codex: the
-  documented app-server JSON-RPC protocol and the `codex` CLI. No
+  documented app-server JSON-RPC protocol, documented hooks and the
+  `codex` CLI. No
   undocumented APIs, no copied credentials, no reading an app's internal
   databases.
 - **Synthetic, isolated fixtures for process tests.** Tests drive these
@@ -199,7 +200,13 @@ poll), it sends:
   content, so no message text is read. With more than 50 turns, the turns
   are counted once by paging, then kept up from the newest page.
 
-The connection's `initialize` names the client `t3-watch`. Those three
+Once per connection, then once a minute, it also sends `hooks/list {cwds:
+[the thread's cwd]}`, which lists the configured hooks and their trust
+state, to learn whether the user installed `t3-watch hook codex` (see
+"Requests missed while nothing counts"). An app-server without
+`hooks/list` answers an error, read as "not installed".
+
+The connection's `initialize` names the client `t3-watch`. Those four
 methods are all it sends. It also keeps the `thread/status/changed`
 notifications the app-server sends every initialized connection, for every
 thread and without any subscription (checked with codex-cli 0.166.0: a
@@ -236,14 +243,18 @@ it, so no notification is counted twice. A bot that acknowledged request
 1 is woken for request 2 even when both reads in between said "waiting".
 
 A connection that takes the counter over (the first wait, a new process,
-or after the counting connection went away) cannot tell whether a flag
-that is still on is the request already counted or one that replaced it
-while nothing was counting. So it counts it once more: an extra wake for
-the same request, never a missed one. In practice, without the daemon each
-`--no-daemon` wait takes the counter over, so a request that is still
-open gets a new key in every new process and `--acknowledge` does not
-carry it from one such wait to the next. Bots that acknowledge requests
-should use the daemon (the default).
+or after the counting connection went away) cannot tell from the app-server
+whether a flag that is still on is the request already counted or one that
+replaced it while nothing was counting. Without the hook log it counts it
+once more: an extra wake for the same request, never a missed one. In
+practice, without the daemon each `--no-daemon` wait takes the counter
+over, so a request that is still open gets a new key in every new process
+and `--acknowledge` does not carry it from one such wait to the next. With
+the hook installed and the open request's record in the log, the log
+decides instead: a newer record is a new request, none is the same one, so
+the key carries over. User-input requests have no hook and are always
+counted again. Bots that acknowledge requests should use the daemon (the
+default).
 
 **Between waits.** When a watch ends while its turn is still running (a
 bot relayed a request and is about to wait again), the daemon keeps its
@@ -257,6 +268,67 @@ while the daemon is reading kept connections waits for that round (about
 connection to the thread does get kept, the one holding the counter stays.
 The daemon stays up meanwhile, and `t3-watch status` shows such
 connections as `codexKept`.
+
+**Requests missed while nothing counts: the hook log.** The app-server
+keeps no record of past requests, so a request that opens and closes while
+no connection counts (no wait and no daemon keeping one) leaves no trace
+there. Codex's documented `PermissionRequest` hook runs "when Codex is
+about to ask for approval", whatever is connected, and t3-watch can be
+that hook:
+
+```
+t3-watch hook codex --print-settings >> ~/.codex/config.toml   # or paste it
+```
+
+prints a block for `~/.codex/config.toml` (t3-watch never edits Codex's
+settings itself):
+
+```toml
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "/path/to/t3-watch hook codex --home /path/to/state"
+timeout = 10
+async = true
+```
+
+Codex runs a new hook only after the user reviews and trusts it (`/hooks`
+in the CLI, Settings > Hooks in the desktop app); trust is tied to the
+hook's hash, so a changed block needs trusting again. `--home` names the
+state directory (`$T3_WATCH_HOME` or the default, made absolute when the
+block is printed), so the hook records where the waits read even when
+Codex runs without the shell's environment. As an async hook it "can't
+block, approve, rewrite, or otherwise control the operation" (Codex's
+hooks documentation); it also prints nothing, always exits 0 and never
+returns a decision. For each `PermissionRequest` it appends one line to
+`<state>/native/codex/<session_id>.requests.jsonl` (0600, fsynced): the
+time, the event name, the turn id and the tool name (`Bash`,
+`apply_patch`, an MCP tool's name). The command, the tool input, the
+working directory, the transcript path and the model are never written.
+Other events are ignored.
+
+The connection that counts reads the log from the latest turn's first
+record (a byte offset kept in `<thread>.json`, so a read covers only the
+current turn) and matches each record, newest first, to a request it
+counted live: one counted after its own previous count (any time for a
+connection that has just taken the counter) and at most 60 s before the
+record lands. A record no live count matches opened while nothing
+counted:
+
+- if it is the newest record and the thread waits on an approval now, it
+  is the open request, which replaced the one counted before: it gets the
+  next number and its own `pendingKey`;
+- otherwise it opened and closed unseen. It gets the next free number and
+  is listed in `recoveredRequests` in every result for that turn
+  (`{id, kind: "approval", tool, openedAt, recoveredAt, open: false}`).
+  The wait during which it was found also reports it once as progress:
+  a `requests_recovered` event (notify class `recovered`, on by default)
+  with a line on stderr and, with a webhook, a POST. Its owner already
+  answered it, so it is never a needs-input wake.
+
+Every Codex result says which applies: `requestRecovery: "hook"` when
+`hooks/list` lists `t3-watch hook codex` for this state directory,
+enabled and trusted (or managed), and `"none"` otherwise.
 
 The run ordinal is the turn count. A bot that reuses a thread reads the
 current `runOrdinal`, starts its turn, and waits with
@@ -306,6 +378,21 @@ the questions that gated the implementation:
    missed it until the turn ended. Counting notifications, see
    `docs/acceptance-manifest.md` for the runs with no pause, and with the
    second request opening between two waits through the daemon.
+10. **The PermissionRequest hook.** In the isolated `CODEX_HOME`, with the
+    block from `--print-settings` added to its `config.toml` and trusted by
+    the key and hash `hooks/list` gave (what `/hooks` records), Codex ran
+    the hook once per approval request, through a shell (a binary path
+    with a space, quoted, worked). Its stdin carried `session_id` equal to
+    the thread id and `turn_id` equal to the turn id, with no request or
+    item id. `probe_missed.py` (run by `e2e/native/codex/run.sh`) then
+    checked, with the owner declining every request: before the hook was
+    trusted, two requests left no record; with a wait counting
+    throughout, nothing was recovered; with nothing counting while two
+    requests opened and closed, the next wait listed both and reported
+    them once as `requests_recovered`, and a later wait listed them
+    without reporting them again; with the daemon stopped after it
+    counted request 1, a wait through a new daemon recovered request 2
+    only. The log held `atMs`, `event`, `tool` and `turn`, nothing else.
 
 ### Limits
 
@@ -319,20 +406,39 @@ the questions that gated the implementation:
   poll, so they make the count exact but do not make the wake sooner.
   Turn events (`turn/completed`) reach only subscribers, which needs
   `thread/resume`, ruled out by point 3.
-- **Not covered: a request that opens and closes while nothing counts.**
-  Only the counting connection counts; other connections only read the
-  count. The app-server keeps no record of past requests, so one that is
-  opened and answered while no counting connection is open (no wait
-  running and no daemon keeping one: `--no-daemon` between waits, a
-  stopped daemon, a dropped connection, more than 15 minutes after the
-  last wait) leaves no trace. Its owner answered it, so no bot is left
-  waiting on it, but it is not reported. A request still open when a
-  connection takes the count over is reported, possibly as an extra wake
-  for one already relayed (see "Requests are numbered"). Bots that relay
-  requests should use the daemon (the default). `tests/codex.rs` states
-  both as tests
-  (`a_request_that_opens_and_closes_while_nothing_counts_is_never_seen`,
-  `a_request_replaced_while_nothing_counts_is_counted_again`).
+- **Requests that open and close while nothing counts are recovered only
+  with the hook.** Without `t3-watch hook codex` installed and trusted
+  (`requestRecovery: "none"`), one that is opened and answered while no
+  counting connection is open (`--no-daemon` between waits, a stopped
+  daemon, a dropped connection, more than 15 minutes after the last wait)
+  leaves no trace: its owner answered it, so no bot is left waiting on it,
+  but it is not reported. `tests/codex.rs` states this
+  (`without_the_hook_a_request_that_opens_and_closes_while_nothing_counts_is_not_seen`)
+  and the recovery
+  (`a_request_that_opens_and_closes_while_nothing_counts_is_recovered_from_the_hook_log`).
+- With the hook, what is still not recovered:
+  - user-input requests (`waitingOnUserInput`, the `request_user_input`
+    tool): Codex has no hook event for them;
+  - approvals Codex does not run `PermissionRequest` for. Its
+    documentation names shell commands, `apply_patch` and MCP tool calls
+    (and managed-network approvals); only shell-command escalations were
+    run here;
+  - a hook that is trusted but records nothing (its binary moved, its
+    state directory unwritable): a request that replaced the counted one
+    is then counted once more, as without the hook (an extra wake, never a
+    missed one), but one that opened and closed unseen is lost;
+  - subagent threads: Codex passes the parent's `session_id` to their
+    hooks, so their records go to the parent's log; this was not run.
+- A request that another `PermissionRequest` hook allowed or denied never
+  reached a person, but it was recorded and is reported as recovered.
+- Recovered requests take the next free number when they are found, so
+  numbers follow discovery, not opening order; `openedAt` gives the order.
+- The log grows by about 110 bytes per approval request and is not
+  pruned.
+- A request still open when a connection takes the count over is
+  reported, without the hook possibly as an extra wake for one already
+  relayed (see "Requests are numbered"). Bots that relay requests should
+  use the daemon (the default).
 - A rollback (`thread/rollback`) lowers the turn count, so the ordinal
   goes down with it.
 - `--until workstream` and `--final-marker` are T3 contracts and are
@@ -340,21 +446,27 @@ the questions that gated the implementation:
 
 ### Acceptance checks (not yet passed)
 
-1. **Passed.** Mock app-server (`tests/codex.rs`): only the three read
+1. **Passed.** Mock app-server (`tests/codex.rs`): only the four read
    methods are sent; a server request is never answered; frames are
    masked; fragmented and 64-bit-length messages; reconnect; turn paging;
    pinned waits; one `pendingKey` per request; successive requests counted
    from notifications, including one that comes and goes between two reads,
    and between two waits through the daemon; a wait that starts during a
    drain round keeps the counting connection; a batch that ends one turn
-   and starts the next; a request replaced while nothing counts (counted
-   again) and one opened and closed while nothing counts (not seen); the
-   materializing refusal retried for 30 s; unknown thread; no app-server;
-   refused T3 contracts.
+   and starts the next; without the hook, a request replaced while nothing
+   counts (counted again) and one opened and closed while nothing counts
+   (not seen); with the hook, one opened and closed while nothing counts
+   (recovered, reported once as progress and by webhook, with and without
+   the daemon), live counts matched to records that land before or after
+   them (nothing recovered), a replaced request counted once, and a
+   trusted hook that records nothing (counted again); the hook records
+   metadata only and never prints; the materializing refusal retried for
+   30 s; unknown thread; no app-server; refused T3 contracts.
 2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
    the probes above (fresh thread, needs-input with webhook, no changes,
    completion, pinned wake with webhook, unload, read after unload, two
-   requests in one turn), reproduced by `e2e/native/codex/run.sh`. The
+   requests in one turn, and requests missed while nothing counted,
+   recovered from the hook log), reproduced by `e2e/native/codex/run.sh`. The
    default socket also worked through `codex app-server daemon start` in
    an isolated `CODEX_HOME` (see `docs/acceptance-manifest.md`).
 3. **Open.** The desktop app on the MacBook: the read-only checks below,
@@ -372,7 +484,8 @@ needs, under the parent's control:
   `codex --version`, whether
   `~/.codex/app-server-control/app-server-control.sock` exists, and runs
   `t3-watch wait --no-daemon --timeout 5s codex://threads/<thread id>`,
-  which sends `initialize`, `thread/read` and `thread/turns/list` only. If
+  which sends `initialize`, `thread/read`, `thread/turns/list` and
+  `hooks/list` only. If
   no socket exists, the desktop app runs its threads in a private
   app-server. Starting `codex app-server daemon` would then be a change
   on that machine that needs the user's approval, and it would see only

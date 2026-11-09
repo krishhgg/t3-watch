@@ -253,7 +253,7 @@ t3-watch wait mcp:launch:abc123 \
 - The webhook gets `POST` with the result JSON as the body.
   `X-T3-Watch-Event` is the event (`settled`, `needs_input`, `timeout`,
   `error`, or progress: `run_failed`, `upstream_unreachable`,
-  `upstream_restored`, `heartbeat`). `X-T3-Watch-Id` and `Idempotency-Key`
+  `upstream_restored`, `requests_recovered`, `heartbeat`). `X-T3-Watch-Id` and `Idempotency-Key`
   carry the same id on every retry of one event, inline or from the outbox;
   `X-T3-Watch-Attempt` counts the attempts. With a secret,
   `X-T3-Watch-Timestamp` and `X-T3-Watch-Signature: sha256=<hex>` carry an
@@ -281,7 +281,8 @@ t3-watch wait mcp:launch:abc123 \
   After `--on-settle-timeout` (default 60 s) its whole process group is
   killed.
 - `--notify-on` takes `all` or a comma list of `settled`, `needs_input`,
-  `timeout`, `error`, `run_failed` and `upstream`. The default is everything
+  `timeout`, `error`, `run_failed`, `upstream` and `recovered` (Codex
+  requests found in the hook log). The default is everything
   but `timeout` and `error`; `all` adds those, so an expired token cannot
   leave an unattended bot waiting forever. Once the notification options
   themselves are valid, this includes errors before the wait starts: an
@@ -686,20 +687,25 @@ neither counts as supported until its own acceptance checks pass.
 - Codex: `t3-watch wait codex://threads/<id>` reads the thread from a
   Codex app-server over its Unix socket (`$T3_WATCH_CODEX_SOCKET`, default
   `$CODEX_HOME/app-server-control/app-server-control.sock`) once a
-  second, with `thread/read` and `thread/turns/list` only, and counts
-  requests from the `thread/status/changed` notifications every
-  connection receives. It never resumes the thread, because with
-  codex-cli 0.166.0 a resuming client also receives the owner's approval
-  requests. Completion, failure and
-  needs-input (`waitingOnApproval`, `waitingOnUserInput`), with the usual
-  webhooks and `--durable`. Verified against a real codex-cli 0.166.0
-  app-server with disposable threads; the desktop app is not yet checked.
+  second, with `thread/read` and `thread/turns/list` only (plus
+  `hooks/list` once a minute), and counts requests from the
+  `thread/status/changed` notifications every connection receives. It
+  never resumes the thread, because with codex-cli 0.166.0 a resuming
+  client also receives the owner's approval requests. Completion, failure
+  and needs-input (`waitingOnApproval`, `waitingOnUserInput`), with the
+  usual webhooks and `--durable`. `t3-watch hook codex` is an async
+  Codex `PermissionRequest` hook (print the block with `--print-settings`;
+  the user installs and trusts it) that logs each approval request, so a
+  request that opened and closed while nothing was watching is reported
+  as `recoveredRequests` and `requests_recovered` progress. Verified
+  against a real codex-cli 0.166.0 app-server with disposable threads;
+  the desktop app is not yet checked.
 
 ## How it works
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e17.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e18.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -725,15 +731,16 @@ neither counts as supported until its own acceptance checks pass.
   `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
   `native-claude-code-hooks`, `native-claude-code-requests`,
   `native-codex-app-server`, `native-codex-notifications`,
-  `native-codex-kept-counter`, `linux-io-hardening`, `suspend-aware`,
-  `suspend-invalidation`) in that
+  `native-codex-kept-counter`, `linux-io-hardening`,
+  `native-codex-hook-log`, `suspend-aware`, `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 17 (this build) does not reach engine-16 daemons
-  (`0.14.0`, socket `daemon-e16.sock`), engine-15 ones (`0.13.0`,
+  `t3-watch stop`. Engine 18 (this build) does not reach engine-17 daemons
+  (`0.15.0`, socket `daemon-e17.sock`), engine-16 ones (`0.14.0`,
+  `daemon-e16.sock`), engine-15 ones (`0.13.0`,
   `daemon-e15.sock`), engine-14 ones (`0.12.0`,
   `daemon-e14.sock`), engine-13 ones (`0.11.0`,
   `daemon-e13.sock`), engine-12 ones (`0.10.0`,
@@ -1152,7 +1159,8 @@ their latest runs, each gate's status and the steps that need a person.
   natively. The first native run (0.14.0, on Debian with glibc 2.41) failed
   six tests across five test binaries. 0.15.0 fixes them: three in t3-watch
   itself (the connect to a hung daemon, the Codex pong, a busy `t3`
-  binary) and three in the tests. It has not been run on Linux yet. CI
+  binary) and three in the tests; 0.15.0 passed its native run (gate T7 in
+  `docs/acceptance-manifest.md`). 0.16.0 has not been run on Linux yet. CI
   (`.github/workflows/ci.yml`) has not run, since the branch is unpushed.
 - A daemon that holds its socket but does not take a connection within
   5 s (hung, with a full backlog) makes `wait`, `status` and `stop` fail
