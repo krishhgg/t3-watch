@@ -31,6 +31,24 @@ fn transient(message: String) -> CallError {
     CallError::Transient { message, status: None }
 }
 
+/// Linux refuses to run a file that some process still has open for
+/// writing (`ETXTBSY`): T3 writing an update in place, or a child forked
+/// elsewhere that has not yet run `exec` and so still holds the descriptor
+/// of a script just written. It lasts milliseconds, so a few retries over
+/// 200 ms; anything else is returned at once.
+fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Runs `t3 thread show` and returns the parsed state plus the raw JSON
 /// (which holds the `messages` when `messages` > 0).
 pub fn show(
@@ -41,8 +59,8 @@ pub fn show(
     cancel: &Cancel,
 ) -> Result<(ThreadState, serde_json::Value), CallError> {
     let observed_at = Instant::now();
-    let mut child = Command::new(t3_bin)
-        .args(["thread", "show", "--base-dir"])
+    let mut cmd = Command::new(t3_bin);
+    cmd.args(["thread", "show", "--base-dir"])
         .arg(base_dir)
         .arg("--messages")
         .arg(messages.to_string())
@@ -52,11 +70,10 @@ pub fn show(
         .stderr(Stdio::piped())
         // Its own process group, so the watchdog can kill any helpers it
         // started that would otherwise keep our pipes open.
-        .process_group(0)
-        .spawn()
-        // A T3 update can swap the binary out from under us, and fork can
-        // fail with EAGAIN: both are worth retrying, not waking anyone for.
-        .map_err(|e| transient(format!("cannot run {}: {e}", t3_bin.display())))?;
+        .process_group(0);
+    // A T3 update can swap the binary out from under us, and fork can fail
+    // with EAGAIN: both are worth retrying, not waking anyone for.
+    let mut child = spawn_retrying(&mut cmd).map_err(|e| transient(format!("cannot run {}: {e}", t3_bin.display())))?;
 
     // A watchdog kills a hung `t3` so one stuck call cannot stall the watch.
     // It only runs while the child is unreaped, so the pid cannot be reused.
@@ -203,6 +220,39 @@ mod tests {
             "t3 outlived its cancellation"
         );
         assert_gone(&pidfile);
+    }
+
+    #[test]
+    fn a_t3_binary_still_open_for_writing_runs_once_it_is_closed() {
+        // Linux refuses to run a file some process has open for writing
+        // (ETXTBSY): T3 updating itself, or (the Linux run of 0.14.0) a child
+        // forked by another test before its exec, holding a script just
+        // written. The spawn is retried for 200 ms instead of failing.
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "t3wl-busy-{}-{}",
+            std::process::id(),
+            util::hex(&util::random_bytes(4))
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("t3");
+        let mut f = fs::File::create(&bin).unwrap();
+        f.write_all(
+            b"#!/bin/sh\necho '{\"thread\":{\"threadId\":\"t\",\"status\":\"completed\",\"latestRunId\":\"run:thread:t:ordinal:1\",\"pendingRequestCount\":0},\"messages\":[]}'\n",
+        )
+        .unwrap();
+        f.flush().unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        // Still open for writing; closed 60 ms from now.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(f);
+        });
+        let r = show(&bin, Path::new("/tmp"), "t", 0, &Cancel::new());
+        closer.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let (state, _) = r.expect("the busy binary was not retried");
+        assert_eq!(state.status.as_deref(), Some("completed"));
     }
 
     #[test]
