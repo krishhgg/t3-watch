@@ -97,9 +97,9 @@ match byte for byte.
 |---|---|---|
 | `t3-watch-1e98e73-aarch64-apple-darwin` (1,970,016 bytes) | `9cb2653abe64738b5e2833dd0464f3bfb6ca4150946cb7a5f41cd22cbff2fa71` | Every real run below |
 | `t3-watch-1e98e73-universal-apple-darwin` (arm64 + x86_64) | `94ebe7dded0534aaf8478631b3ed094d9f3cb881eea9093680fa2acafd8568a1` | arm64 only; x86_64 not run here (no Rosetta) |
-| `t3-watch-0.15.0-x86_64-unknown-linux-gnu.tar.gz` | `1d7ec1e92b6b52d6eab3afe5b509abb570fae9b83d6c7c7bfc2e74ecdfbaa9f6` (binary `87eed7df…a026`, glibc 2.17 or older) | **Not yet on Linux** |
-| `t3-watch-0.15.0-aarch64-unknown-linux-gnu.tar.gz` | `e0035ce8e1057f13107ec2d43f8bb125080fe7ab4b83cbe036ddca563e050614` (binary `ed562c82…3ea9`, glibc 2.17 or older) | **Not yet on Linux** |
-| `t3-watch-tests-0.15.0-x86_64-unknown-linux-gnu.tar.gz` | `c799e4a48e3b7cab8b2342f3216a16d21ad7b2bcfd469c51de59eab46d51842d` (12 test binaries, LTO off, plus the source) | **Not yet on Linux** |
+| `t3-watch-0.15.0-x86_64-unknown-linux-gnu.tar.gz` | `1d7ec1e92b6b52d6eab3afe5b509abb570fae9b83d6c7c7bfc2e74ecdfbaa9f6` (binary `87eed7df…a026`, glibc 2.17 or older) | **PASS on Linux x86_64** (parent-reported: `linux-run.log`, see T7) |
+| `t3-watch-0.15.0-aarch64-unknown-linux-gnu.tar.gz` | `e0035ce8e1057f13107ec2d43f8bb125080fe7ab4b83cbe036ddca563e050614` (binary `ed562c82…3ea9`, glibc 2.17 or older) | Not executed on Linux: the Linux run (T7) was on x86_64, and no aarch64 Linux host was used |
+| `t3-watch-tests-0.15.0-x86_64-unknown-linux-gnu.tar.gz` | `c799e4a48e3b7cab8b2342f3216a16d21ad7b2bcfd469c51de59eab46d51842d` (12 test binaries, LTO off, plus the source) | **PASS on Linux x86_64** (parent-reported: 286 tests in `linux-run.log`, see T7) |
 | `linux.sh`, `desktop-check.sh` | copies of `e2e/acceptance/linux.sh` and `e2e/native/codex/desktop-check.sh` | |
 
 `dist/0.15.0/superseded/` holds the real-gate runs made with a build
@@ -171,15 +171,18 @@ name in one doc. That includes the messages of `4dca907` and `17f71fb`.
 The `LICENSE-MIT` copyright line and the commit authors are kept. Its
 tip's tree is identical to `feat/t3-watch-v1`'s. It is not pushed.
 
-## Not run, and why
+## Scope notes: what ran on this host and what ran elsewhere
 
 - `/concil`: no command, skill or plugin by that name exists. The
   `council` skill's default panel includes the review provider that must
   not be retried, so neither was run.
 - **The runtime on this host** (names only, no contents read): the T3
   server runs always on. There is no t3-watch install, saved pairing,
-  webhook receiver or bot routine. So T1, T2, T3b and X6 run where the
-  parent holds the webhook URL and secret.
+  webhook receiver or bot routine. So T1, T2, T3b and X6 were not run on
+  this host. The parent ran them against its own receiver and bot
+  routine, where the webhook URL and secret are, and they pass on its
+  evidence (the rows above). T7 and X5 likewise ran on the Grok Bot box
+  and the MacBook.
 
 ## Side effects of these runs
 
