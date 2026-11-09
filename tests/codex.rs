@@ -143,6 +143,10 @@ fn b64(data: &[u8]) -> String {
 }
 
 fn frame(s: &mut UnixStream, fin: bool, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    s.write_all(&frame_bytes(fin, opcode, payload))
+}
+
+fn frame_bytes(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = vec![if fin { 0x80 } else { 0 } | opcode];
     let n = payload.len();
     if n < 126 {
@@ -155,7 +159,7 @@ fn frame(s: &mut UnixStream, fin: bool, opcode: u8, payload: &[u8]) -> std::io::
         f.extend_from_slice(&(n as u64).to_be_bytes());
     }
     f.extend_from_slice(payload);
-    s.write_all(&f)
+    f
 }
 
 fn send(s: &mut UnixStream, v: &Value, fragment: bool) -> std::io::Result<()> {
@@ -316,6 +320,21 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
             "params": { "threadId": "01a1-another-thread", "status": { "type": "active", "activeFlags": ["waitingOnApproval"] } } }),
             fragment,
         );
+        // Closing after this answer: the ping and the answer go out in one
+        // write and the connection shuts at once, so the client's pong
+        // always meets a closed peer (on Linux it did by timing alone, and
+        // the failed pong threw the answer away).
+        if st.lock().unwrap().drop_after.is_some_and(|n| requests >= n) {
+            let mut bytes = frame_bytes(true, 0x9, b"hi");
+            bytes.extend(frame_bytes(true, 0x1, reply.to_string().as_bytes()));
+            let _ = out.write_all(&bytes);
+            // Closed for good: every descriptor of it, the kept writer too.
+            drop(out);
+            st.lock().unwrap().writers.retain(|x| !Arc::ptr_eq(x, &w));
+            drop(w);
+            drop(s);
+            return;
+        }
         let _ = frame(&mut out, true, 0x9, b"hi");
         if method == "initialize" {
             let _ = send(

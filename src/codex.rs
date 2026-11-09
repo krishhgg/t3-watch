@@ -230,7 +230,12 @@ impl Ws {
                 payload.iter_mut().enumerate().for_each(|(i, b)| *b ^= m[i % 4]);
             }
             match b0 & 0x0F {
-                0x9 => self.frame(0xA, &payload)?,
+                // A pong that cannot be written means the peer is closing.
+                // What it already sent is still read; the next read reports
+                // the close.
+                0x9 => {
+                    let _ = self.frame(0xA, &payload);
+                }
                 0xA => {}
                 0x8 => return Err("the Codex app-server closed the connection".into()),
                 0x0..=0x2 => {
