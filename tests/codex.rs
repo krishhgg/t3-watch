@@ -8,6 +8,7 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ struct Codex {
     /// `thread/turns/list` answers "not supported yet" this many times
     /// first, as codex-cli 0.166.0 can while a thread materializes.
     unsupported: usize,
+    /// The refusal's message, when not codex-cli 0.166.0's.
+    unsupported_message: Option<String>,
     /// Every open connection, for the status notifications the app-server
     /// sends each initialized connection.
     writers: Vec<Arc<Mutex<UnixStream>>>,
@@ -268,7 +271,11 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
                     "id": T, "status": g.status, "preview": "PREVIEW_CANARY first message" } } }),
                 "thread/turns/list" if g.unsupported > 0 => {
                     g.unsupported -= 1;
-                    json!({ "id": id, "error": { "code": -32600, "message": "list_turns is not supported yet" } })
+                    let message = g
+                        .unsupported_message
+                        .clone()
+                        .unwrap_or("list_turns is not supported yet".into());
+                    json!({ "id": id, "error": { "code": -32600, "message": message } })
                 }
                 "thread/turns/list" if g.unmaterialized => json!({ "id": id, "error": { "code": -32600,
                     "message": format!("thread {T} is not materialized yet; thread/turns/list is unavailable \
@@ -441,12 +448,26 @@ fn waiting_on_approval_or_input_is_needs_input_with_its_own_key() {
     assert_eq!(out.status.code(), Some(5));
     let both = output_json(&out)["threads"][0]["pendingKey"].clone();
     assert_ne!(both, approval);
-    // Acknowledged: the same request does not wake again.
-    let ack = approval.as_str().unwrap().to_string();
+    // Acknowledged through the daemon, which keeps the counting connection
+    // between waits: the same request does not wake again.
     cx.set(
         json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }),
         &[("turn-1", "inProgress")],
     );
+    let daemon = |args: &[&str]| {
+        let mut all = args.to_vec();
+        all.push(&t);
+        wait(&env, &cx, &all).output().unwrap()
+    };
+    let out = daemon(&["--timeout", "5s"]);
+    assert_eq!(out.status.code(), Some(5));
+    let ack = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = daemon(&["--timeout", "1500ms", "--acknowledge", &ack]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    // A process without the daemon reads the count the daemon keeps.
     let out = run(&["--timeout", "1500ms", "--acknowledge", &ack]);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
     // Answered by its owner: running again, then completed.
@@ -622,14 +643,14 @@ fn codex_targets_are_validated_and_t3_contracts_refused() {
 #[test]
 fn successive_requests_in_one_turn_each_wake_once() {
     // A reader sees only the flag, the same for every request of a turn.
-    // Each time a watcher sees it come back on is a new request, counted in
-    // the state directory, so the count holds across processes.
+    // Each time the counting connection sees it come back on is a new
+    // request. Through the daemon, a request already relayed stays
+    // acknowledged from one wait to the next.
     let env = Env::new();
     let cx = MockCodex::start(&env);
     let t = target();
     let run = |args: &[&str]| {
-        let mut all = vec!["--no-daemon"];
-        all.extend_from_slice(args);
+        let mut all = args.to_vec();
         all.push(&t);
         wait(&env, &cx, &all).output().unwrap()
     };
@@ -640,11 +661,10 @@ fn successive_requests_in_one_turn_each_wake_once() {
     let out = run(&["--timeout", "5s"]);
     assert_eq!(out.status.code(), Some(5));
     let first = key(&out);
-    // Another process, the same request: acknowledged, it keeps waiting.
+    // The next wait, the same request: acknowledged, it keeps waiting.
     let out = run(&["--timeout", "1500ms", "--acknowledge", first.as_str().unwrap()]);
     assert_eq!(out.status.code(), Some(3));
-    // The owner answers (a watcher sees the flag go off), then a second
-    // request opens in the same turn.
+    // The owner answers, then a second request opens in the same turn.
     cx.set(busy.clone(), &[("turn-1", "inProgress")]);
     let out = run(&["--timeout", "1500ms", "--acknowledge", first.as_str().unwrap()]);
     assert_eq!(out.status.code(), Some(3));
@@ -657,7 +677,7 @@ fn successive_requests_in_one_turn_each_wake_once() {
     );
     let second = key(&out);
     assert_ne!(second, first);
-    // One watch, through the daemon, sees a third come and go by itself.
+    // One wait sees a third come and go by itself.
     let mut child = wait(
         &env,
         &cx,
@@ -697,6 +717,8 @@ fn a_request_that_opens_between_two_reads_is_still_counted() {
         .as_str()
         .unwrap()
         .to_string();
+    // A fresh count, so that this one wait starts at request 1 again.
+    fs::remove_file(env.home.join("native").join("codex").join(format!("{T}.json"))).unwrap();
     let mut child = wait(
         &env,
         &cx,
@@ -752,11 +774,11 @@ fn the_daemon_keeps_counting_requests_between_waits() {
 }
 
 #[test]
-fn with_no_connection_open_a_request_in_between_is_not_seen() {
-    // The limit, stated as a test: Codex keeps no record of past requests,
-    // so one that follows its predecessor while nothing is connected (no
-    // daemon, no wait) shares its number, and an acknowledged wait is only
-    // woken when the turn ends.
+fn a_request_replaced_while_nothing_counts_is_counted_again() {
+    // Review ordinal 16: with nothing connected, request 1 can be answered
+    // and request 2 open, and the flag says "waiting" before and after. A
+    // connection that takes the count over counts a flag still on once
+    // more: an extra wake for the same request, never a missed one.
     let env = Env::new();
     let cx = MockCodex::start(&env);
     let t = target();
@@ -774,11 +796,40 @@ fn with_no_connection_open_a_request_in_between_is_not_seen() {
     let out = wait(
         &env,
         &cx,
-        &["--no-daemon", "--timeout", "1500ms", "--acknowledge", &first, &t],
+        &["--no-daemon", "--timeout", "5s", "--acknowledge", &first, &t],
     )
     .output()
     .unwrap();
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    assert!(
+        v["threads"][0]["pendingRequestIds"].to_string().contains("approval-2"),
+        "{v}"
+    );
+}
+
+#[test]
+fn a_request_that_opens_and_closes_while_nothing_counts_is_never_seen() {
+    // The limit, stated as a test: the app-server keeps no record of past
+    // requests, so one answered before any t3-watch connection counts again
+    // leaves no trace. (It needs nobody: its owner answered it.)
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let busy = json!({ "type": "active", "activeFlags": [] });
+    cx.set(busy.clone(), &[("turn-1", "inProgress")]);
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    cx.push(json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }));
+    cx.push(busy);
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    assert!(v["threads"][0]["pendingKey"].is_null(), "{v}");
 }
 
 #[test]
@@ -800,4 +851,155 @@ fn a_thread_that_cannot_list_its_turns_yet_is_retried_not_failed() {
     assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
     assert_eq!(cx.st.lock().unwrap().unsupported, 0);
     assert_read_only(&cx);
+}
+
+/// Waits through the daemon, whose drain rounds each read every kept
+/// connection for `drain_ms` (the test hook), back to back.
+fn waits_with_drain<'a>(
+    env: &'a Env,
+    cx: &'a MockCodex,
+    drain_ms: &'a str,
+) -> impl Fn(&[&str]) -> std::process::Output + 'a {
+    move |args: &[&str]| {
+        let mut all = vec!["wait"];
+        all.extend_from_slice(args);
+        let mut c = env.cmd(&all);
+        c.env("T3_WATCH_CODEX_SOCKET", &cx.sock)
+            .env("T3_WATCH_TEST_CODEX_DRAIN_MS", drain_ms);
+        c.output().unwrap()
+    }
+}
+
+#[test]
+fn a_wait_that_starts_during_a_drain_round_keeps_the_counting_connection() {
+    // Review ordinal 16 (P1): a drain round took every kept connection out
+    // of sight, so a wait starting meanwhile opened a second one, and when
+    // it ended, that one replaced the connection holding the counter: the
+    // next request opened between waits shared its predecessor's key. Each
+    // round here reads for 3 s, back to back, so the second wait starts
+    // inside one.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let run = waits_with_drain(&env, &cx, "3000");
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    let out = run(&["--timeout", "5s", &t]);
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.wait_status("the connection kept", Duration::from_secs(10), |s| s["codexKept"] == 1);
+    // Inside a drain round: the same request, still acknowledged.
+    let out = run(&["--timeout", "8s", "--acknowledge", &first, &t]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(cx.st.lock().unwrap().connections, 1, "a second connection was opened");
+    // With nothing waiting, request 1 is answered and request 2 opens.
+    cx.push(json!({ "type": "active", "activeFlags": [] }));
+    cx.push(asks);
+    std::thread::sleep(Duration::from_millis(3500));
+    let out = run(&["--timeout", "8s", "--acknowledge", &first, &t]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "request 2 went unseen: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v = output_json(&out);
+    assert!(
+        v["threads"][0]["pendingRequestIds"].to_string().contains("approval-2"),
+        "{v}"
+    );
+    assert_read_only(&cx);
+}
+
+#[test]
+fn a_drain_batch_that_ends_one_turn_and_starts_the_next_keeps_the_connection() {
+    // Review ordinal 16 (P2): any status other than `active` in a drain
+    // batch closed the kept connection, even when the batch went on into
+    // the next turn. The newest status decides.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    let run = waits_with_drain(&env, &cx, "3000");
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    let out = run(&["--timeout", "5s", &t]);
+    assert_eq!(out.status.code(), Some(5));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.wait_status("the connection kept", Duration::from_secs(10), |s| s["codexKept"] == 1);
+    // Within one 3 s round: turn 1 ends, turn 2 starts and asks.
+    cx.push(json!({ "type": "idle" }));
+    cx.with(|c| {
+        c.turns = vec![
+            json!({ "id": "turn-1", "status": "completed" }),
+            json!({ "id": "turn-2", "status": "inProgress" }),
+        ]
+    });
+    cx.push(asks);
+    std::thread::sleep(Duration::from_millis(4000));
+    let s = env.status();
+    assert_eq!(s["codexKept"], 1, "the connection was closed at the new turn: {s}");
+    let out = run(&["--timeout", "8s", "--acknowledge", &first, &t]);
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    assert!(
+        v["threads"][0]["pendingRequestIds"]
+            .to_string()
+            .contains("turn-2-approval-1"),
+        "{v}"
+    );
+    assert_read_only(&cx);
+}
+
+#[test]
+fn a_turn_list_that_stays_unsupported_fails_after_its_retry() {
+    // Review ordinal 16 (P2): every "not supported yet" was retried until
+    // the wait's own timeout. Only codex-cli 0.166.0's materializing answer
+    // is retried, for 30 s; then the wait fails (exit 2).
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    cx.with(|c| c.unsupported = usize::MAX);
+    cx.set(
+        json!({ "type": "active", "activeFlags": [] }),
+        &[("turn-1", "inProgress")],
+    );
+    let started = std::time::Instant::now();
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "150s", &t])
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let v = output_json(&out);
+    assert_eq!(out.status.code(), Some(2), "{v}");
+    assert!(v.to_string().contains("list_turns is not supported yet"), "{v}");
+    assert!(
+        took >= Duration::from_secs(29) && took < Duration::from_secs(120),
+        "{took:?}"
+    );
+}
+
+#[test]
+fn any_other_not_supported_answer_fails_at_once() {
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    let t = target();
+    cx.with(|c| {
+        c.unsupported = usize::MAX;
+        c.unsupported_message = Some("thread/turns/list is not supported yet for remote threads".into());
+    });
+    cx.set(
+        json!({ "type": "active", "activeFlags": [] }),
+        &[("turn-1", "inProgress")],
+    );
+    let started = std::time::Instant::now();
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "60s", &t])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(started.elapsed() < Duration::from_secs(15));
 }

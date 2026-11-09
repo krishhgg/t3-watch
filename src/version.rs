@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 15;
+pub const ENGINE: u32 = 16;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -60,6 +60,11 @@ pub const CAPABILITIES: &[&str] = &[
     // lock), and the daemon keeps a watch's connection after it ended
     // mid-turn, so a request opened between two waits is a new one.
     "native-codex-notifications",
+    // The connection kept between waits stays in sight of the next wait and
+    // keeps the counter; a connection that takes the counter over counts a
+    // flag still on once more; a batch's newest status decides a turn's end;
+    // "list_turns is not supported yet" is retried for 30 s, then fails.
+    "native-codex-kept-counter",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

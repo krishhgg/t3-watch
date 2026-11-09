@@ -219,6 +219,7 @@ poll and no model calls.
 | Not active, latest turn `interrupted` or `failed` | Failed (`interrupted`, `failed`) |
 | Not active, latest turn `inProgress` | Running (the turn runs on another app-server) |
 | No turn yet (also "not materialized yet", before the first user message) | No state: the wait keeps waiting |
+| `thread/turns/list` answers "list_turns is not supported yet" (seen while a thread materializes its first message) | Retried for 30 s with the reason in `upstream.lastError`, then the wait fails (exit 2). Any other refusal fails at once |
 
 **Requests are numbered.** Nothing a reader can read tells two requests of
 one turn apart: with codex-cli 0.166.0, `thread/read`, the turn and the
@@ -227,19 +228,35 @@ pending, and a pending request's item is not persisted. The status
 notifications do show each one: between two requests the flag goes off,
 however briefly (5 ms in a test with no model latency). So `<n>` counts
 the times the flag came on in that turn, from the notifications that
-arrived since the last read, then the read itself. A notification is
-counted once: one connection per thread holds a counter lock
+arrived since the last read, then the read itself. Only one connection
+per thread counts: it holds a counter lock
 (`<state>/native/codex/<thread>.counter`) and stores the count in
-`<thread>.json`; any other connection watching the thread reads it. A
-bot that acknowledged request 1 is woken for request 2 even when both
-reads in between said "waiting".
+`<thread>.json`, and any other connection watching the thread only reads
+it, so no notification is counted twice. A bot that acknowledged request
+1 is woken for request 2 even when both reads in between said "waiting".
+
+A connection that takes the counter over (the first wait, a new process,
+or after the counting connection went away) cannot tell whether a flag
+that is still on is the request already counted or one that replaced it
+while nothing was counting. So it counts it once more: an extra wake for
+the same request, never a missed one. In practice, without the daemon each
+`--no-daemon` wait takes the counter over, so a request that is still
+open gets a new key in every new process and `--acknowledge` does not
+carry it from one such wait to the next. Bots that acknowledge requests
+should use the daemon (the default).
 
 **Between waits.** When a watch ends while its turn is still running (a
 bot relayed a request and is about to wait again), the daemon keeps its
-connection and goes on counting from its notifications, until the turn
-ends, the connection closes, or 15 minutes pass. The next wait on that
-thread takes the connection over. The daemon stays up meanwhile, and
-`t3-watch status` shows such connections as `codexKept`.
+connection, counter and all, and goes on counting from its
+notifications. It stops when the newest status says the turn is over, the
+connection closes, or 15 minutes pass. A batch that ends one turn and
+starts the next keeps it, and the new turn's requests are counted from 1.
+The next wait on that thread takes the same connection: one that arrives
+while the daemon is reading kept connections waits for that round (about
+50 ms per connection) instead of opening another one. If a second
+connection to the thread does get kept, the one holding the counter stays.
+The daemon stays up meanwhile, and `t3-watch status` shows such
+connections as `codexKept`.
 
 The run ordinal is the turn count. A bot that reuses a thread reads the
 current `runOrdinal`, starts its turn, and waits with
@@ -302,17 +319,20 @@ the questions that gated the implementation:
   poll, so they make the count exact but do not make the wake sooner.
   Turn events (`turn/completed`) reach only subscribers, which needs
   `thread/resume`, ruled out by point 3.
-- **Not covered: a request that opens while nothing is connected.** The
-  app-server keeps no record of past requests, so one that follows its
-  predecessor while no t3-watch connection is open (no wait running and
-  no daemon keeping one: `--no-daemon`, a stopped daemon, a connection
-  that dropped, or more than 15 minutes after the last wait), or during
-  the handover from one counting connection to the next, shares its
-  predecessor's number. A wait that acknowledged that one is then woken
-  only when the turn ends; the owner still sees the request in their own
-  client. Bots that relay requests should use the daemon (the default).
-  `tests/codex.rs` states this as a test
-  (`with_no_connection_open_a_request_in_between_is_not_seen`).
+- **Not covered: a request that opens and closes while nothing counts.**
+  Only the counting connection counts; other connections only read the
+  count. The app-server keeps no record of past requests, so one that is
+  opened and answered while no counting connection is open (no wait
+  running and no daemon keeping one: `--no-daemon` between waits, a
+  stopped daemon, a dropped connection, more than 15 minutes after the
+  last wait) leaves no trace. Its owner answered it, so no bot is left
+  waiting on it, but it is not reported. A request still open when a
+  connection takes the count over is reported, possibly as an extra wake
+  for one already relayed (see "Requests are numbered"). Bots that relay
+  requests should use the daemon (the default). `tests/codex.rs` states
+  both as tests
+  (`a_request_that_opens_and_closes_while_nothing_counts_is_never_seen`,
+  `a_request_replaced_while_nothing_counts_is_counted_again`).
 - A rollback (`thread/rollback`) lowers the turn count, so the ordinal
   goes down with it.
 - `--until workstream` and `--final-marker` are T3 contracts and are
@@ -325,7 +345,11 @@ the questions that gated the implementation:
    masked; fragmented and 64-bit-length messages; reconnect; turn paging;
    pinned waits; one `pendingKey` per request; successive requests counted
    from notifications, including one that comes and goes between two reads,
-   and between two waits through the daemon; unknown thread; no app-server;
+   and between two waits through the daemon; a wait that starts during a
+   drain round keeps the counting connection; a batch that ends one turn
+   and starts the next; a request replaced while nothing counts (counted
+   again) and one opened and closed while nothing counts (not seen); the
+   materializing refusal retried for 30 s; unknown thread; no app-server;
    refused T3 contracts.
 2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
    the probes above (fresh thread, needs-input with webhook, no changes,

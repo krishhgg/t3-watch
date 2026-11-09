@@ -4,7 +4,9 @@ second). A wait that acknowledged the first runs while the owner (client A)
 declines it; it must wake for the second under its own pendingKey. The
 status notifications every connection gets show the second request even
 with no pause. Then the same through the daemon, with the second request
-opening between two waits. t3-watch answers neither.
+opening between two waits, and once more with drain rounds stretched so
+that a wait starts inside one. Client A, the owner of these disposable
+threads, declines every request; t3-watch answers none.
 
 usage: probe_two_requests.py <fixture dir> <t3-watch binary>
 """
@@ -73,4 +75,33 @@ report("daemon: request 2, opened between the waits", {"exit": code, "pendingKey
        "distinct": j2 is not None and j2 != j1})
 A.w.send({"jsonrpc": "2.0", "id": q2["id"], "result": {"decision": "decline"}})
 A.until(lambda m: m.get("method") == "turn/completed" and m["params"].get("threadId") == tid2, 30)
+
+# The keeper's drain path: a separate daemon whose drain rounds read each
+# kept connection for 3 s, back to back (T3_WATCH_TEST_CODEX_DRAIN_MS), so
+# the second wait starts inside a round. It must take the kept connection
+# (and its counter), and request 2, opened while no wait runs, must reach
+# the third wait under its own key.
+ENV3 = dict(ENV, T3_WATCH_HOME=X + "/w3", T3_WATCH_TEST_CODEX_DRAIN_MS="3000")
+def watch3(*args):
+    p = subprocess.run([BIN, "wait", *args], env=ENV3, capture_output=True, text=True, timeout=60)
+    v = json.loads(p.stdout or "{}")
+    t = (v.get("threads") or [{}])[0]
+    return p.returncode, t.get("pendingKey"), t.get("pendingRequestIds")
+tid3 = A.call("thread/start", {"cwd": X + "/proj", "approvalPolicy": "on-request", "sandbox": "read-only"})["result"]["thread"]["id"]
+target3 = "codex://threads/" + tid3
+A.call("turn/start", {"threadId": tid3, "input": [{"type": "text", "text": "two checks"}]})
+p1 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"] and m["params"]["threadId"] == tid3, 30)
+code, k1, ids = watch3("--timeout", "5s", target3)
+report("keeper: request 1", {"exit": code, "ids": ids})
+code, k, ids = watch3("--timeout", "8s", "--acknowledge", k1, target3)
+st = json.loads(subprocess.run([BIN, "status"], env=ENV3, capture_output=True, text=True).stdout or "{}")
+report("keeper: a wait during a drain round, same request", {"exit": code, "ids": ids, "codexKept": st.get("codexKept")})
+A.w.send({"jsonrpc": "2.0", "id": p1["id"], "result": {"decision": "decline"}})
+p2 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"] and m["params"]["threadId"] == tid3 and m["id"] != p1["id"], 30)
+time.sleep(4.0)
+code, k2, ids = watch3("--timeout", "10s", "--acknowledge", k1, target3)
+report("keeper: request 2, opened between waits", {"exit": code, "ids": ids, "distinct": k2 is not None and k2 != k1})
+A.w.send({"jsonrpc": "2.0", "id": p2["id"], "result": {"decision": "decline"}})
+A.until(lambda m: m.get("method") == "turn/completed" and m["params"].get("threadId") == tid3, 30)
+subprocess.run([BIN, "stop"], env=ENV3, capture_output=True)
 A.close()

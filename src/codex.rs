@@ -38,6 +38,10 @@ const TURN_PAGE: u32 = 50;
 /// How long a connection is kept after its thread's last wait ended while a
 /// turn was running, so that requests opened in between are still counted.
 const LINGER: Duration = Duration::from_secs(15 * 60);
+/// How long `thread/turns/list` answering "list_turns is not supported
+/// yet" is retried (a thread materializing its first message) before it
+/// fails the wait.
+const UNSUPPORTED_RETRY: Duration = Duration::from_secs(30);
 
 pub fn valid_thread_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -368,6 +372,9 @@ pub struct Watcher {
     /// The thread was active when last read: its connection is kept for a
     /// while after this watch ends (see `park`).
     active: AtomicBool,
+    /// Since when `thread/turns/list` has answered "list_turns is not
+    /// supported yet".
+    unsupported_since: Mutex<Option<Instant>>,
 }
 
 impl Watcher {
@@ -378,6 +385,7 @@ impl Watcher {
             conn: Mutex::new(None),
             counted: Mutex::new(None),
             active: AtomicBool::new(false),
+            unsupported_since: Mutex::new(None),
         }
     }
 
@@ -411,10 +419,8 @@ impl Watcher {
         seen.push(status.clone());
         if conn.counter.is_none() {
             if let Some(lock) = take_counter(&self.thread) {
-                // Taking over from another connection, which may have
-                // counted what this one has seen so far: only the read.
                 conn.counter = Some(lock);
-                seen = vec![status.clone()];
+                fresh_count(&mut seen);
             }
         }
         self.active.store(status["type"] == "active", Ordering::Relaxed);
@@ -427,10 +433,21 @@ impl Watcher {
             // codex-cli 0.166.0 answers "not materialized yet".
             Err(CallError::Fatal(m)) if m.contains("not materialized") => json!({ "data": [] }),
             // While the first message materializes the thread, 0.166.0 can
-            // answer "list_turns is not supported yet" (1 run in 6): retried,
-            // with the reason in `upstream.lastError`, never settled on.
-            Err(CallError::Fatal(m)) if m.contains("not supported yet") => return Err(transient(m)),
-            page => page?,
+            // answer "list_turns is not supported yet" (1 run in 6): retried
+            // for `UNSUPPORTED_RETRY`, with the reason in
+            // `upstream.lastError`, then a failure. Never settled on.
+            Err(CallError::Fatal(m)) if m.contains("list_turns is not supported yet") => {
+                let since = *util::lock(&self.unsupported_since).get_or_insert_with(Instant::now);
+                if since.elapsed() < UNSUPPORTED_RETRY {
+                    return Err(transient(m));
+                }
+                return Err(CallError::Fatal(format!("{m} (for {} s)", since.elapsed().as_secs())));
+            }
+            page => {
+                let page = page?;
+                *util::lock(&self.unsupported_since) = None;
+                page
+            }
         };
         let turns: Vec<Value> = page["data"].as_array().cloned().unwrap_or_default();
         let latest = turns.first();
@@ -511,17 +528,48 @@ struct Parked {
     since: Instant,
 }
 
+/// Kept connections. A drain round reads them in place, under this lock,
+/// so a wait that starts meanwhile waits for the round and then finds its
+/// thread's connection here: none is ever out of `unpark`'s sight.
 static PARKED: Mutex<Vec<Parked>> = Mutex::new(Vec::new());
 static DRAINING: AtomicBool = AtomicBool::new(false);
+/// How many there are, readable without waiting for a drain round.
+static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Waits wanting `PARKED`: the drain lets each through before its next
+/// round, so none waits longer than one round.
+static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+fn lock_parked() -> std::sync::MutexGuard<'static, Vec<Parked>> {
+    WAITERS.fetch_add(1, Ordering::SeqCst);
+    let g = util::lock(&PARKED);
+    WAITERS.fetch_sub(1, Ordering::SeqCst);
+    g
+}
+
+/// Keeps `conn`. With one already kept for the thread, the one holding the
+/// thread's counter stays and the other is closed (the newer one when
+/// neither holds it): the count must never lose its counting connection.
 fn park(socket: PathBuf, conn: Conn) {
-    let mut parked = util::lock(&PARKED);
-    parked.retain(|p| !(p.socket == socket && p.conn.thread == conn.thread));
-    parked.push(Parked {
-        socket,
-        conn,
-        since: Instant::now(),
-    });
+    let mut parked = lock_parked();
+    match parked
+        .iter()
+        .position(|p| p.socket == socket && p.conn.thread == conn.thread)
+    {
+        Some(at) if parked[at].conn.counter.is_some() && conn.counter.is_none() => drop(conn),
+        Some(at) => {
+            parked[at] = Parked {
+                socket,
+                conn,
+                since: Instant::now(),
+            }
+        }
+        None => parked.push(Parked {
+            socket,
+            conn,
+            since: Instant::now(),
+        }),
+    }
+    KEPT.store(parked.len(), Ordering::SeqCst);
     drop(parked);
     if !DRAINING.swap(true, Ordering::SeqCst) && util::spawn_thread("t3-watch-codex", 128 * 1024, drain_parked).is_err()
     {
@@ -530,50 +578,82 @@ fn park(socket: PathBuf, conn: Conn) {
 }
 
 fn unpark(socket: &Path, thread: &str) -> Option<Conn> {
-    let mut parked = util::lock(&PARKED);
+    let mut parked = lock_parked();
     let at = parked
         .iter()
         .position(|p| p.socket == socket && p.conn.thread == thread)?;
-    Some(parked.remove(at).conn)
+    let conn = parked.remove(at).conn;
+    KEPT.store(parked.len(), Ordering::SeqCst);
+    Some(conn)
 }
 
 /// Connections kept between waits; the daemon stays up while there are any.
 pub fn lingering() -> usize {
-    util::lock(&PARKED).len()
+    KEPT.load(Ordering::SeqCst)
+}
+
+/// Test hook: with `T3_WATCH_TEST_CODEX_DRAIN_MS` set, each drain round
+/// reads each kept connection that long and rounds follow each other
+/// without a pause, so a test can start a wait in the middle of one.
+fn drain_wait() -> Option<Duration> {
+    static WAIT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("T3_WATCH_TEST_CODEX_DRAIN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+    })
 }
 
 fn drain_parked() {
     loop {
-        let batch: Vec<Parked> = std::mem::take(&mut *util::lock(&PARKED));
-        let mut keep = Vec::new();
-        for mut p in batch {
-            let open = p.conn.drain(Duration::from_millis(50)).is_ok();
-            let seen = std::mem::take(&mut p.conn.events);
-            if !seen.is_empty() && p.conn.counter.is_some() {
+        let wait = drain_wait();
+        let mut parked = util::lock(&PARKED);
+        parked.retain_mut(|p| {
+            let open = p.conn.drain(wait.unwrap_or(Duration::from_millis(50))).is_ok();
+            let mut seen = std::mem::take(&mut p.conn.events);
+            if seen.is_empty() {
+                return open && p.since.elapsed() < LINGER;
+            }
+            // Whoever counted is gone: this one counts from now on.
+            if p.conn.counter.is_none() {
+                if let Some(lock) = take_counter(&p.conn.thread) {
+                    p.conn.counter = Some(lock);
+                    fresh_count(&mut seen);
+                }
+            }
+            if p.conn.counter.is_some() {
                 record_requests(&p.conn.thread, None, &seen);
             }
-            let turn_over = seen.iter().any(|s| s["type"] != "active");
-            if open && !turn_over && p.since.elapsed() < LINGER {
-                keep.push(p);
-            }
-        }
-        let mut parked = util::lock(&PARKED);
-        // A watch may have taken or parked one meanwhile: those stand.
-        for p in keep {
-            if !parked
-                .iter()
-                .any(|q| q.socket == p.socket && q.conn.thread == p.conn.thread)
-            {
-                parked.push(p);
-            }
-        }
+            // The newest status decides: a batch can end one turn and start
+            // the next.
+            let turn_over = seen.last().is_some_and(|s| s["type"] != "active");
+            open && !turn_over && p.since.elapsed() < LINGER
+        });
+        KEPT.store(parked.len(), Ordering::SeqCst);
         if parked.is_empty() {
             DRAINING.store(false, Ordering::SeqCst);
             return;
         }
         drop(parked);
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while WAITERS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(if wait.is_some() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(200)
+        });
     }
+}
+
+/// A connection that has just taken the thread's counter cannot tell
+/// whether a flag that is still on is the request already counted or one
+/// that replaced it while nothing was counting. It counts it again: an
+/// extra wake for the same request, never a missed one.
+fn fresh_count(seen: &mut Vec<Value>) {
+    seen.insert(0, json!({ "type": "active", "activeFlags": [] }));
 }
 
 fn flags_of(status: &Value) -> Vec<&str> {
@@ -604,7 +684,7 @@ fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
     let stored = util::open_private_read(&codex_dir().join(format!("{thread}.json")))
         .ok()
         .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok())
-        .filter(|v| v["turn"] == turn);
+        .filter(|v| v["turn"] == turn || v["turn"] == "");
     let flags = flags_of(status);
     let number = |kind: &str, flag: &str| {
         if !flags.contains(&flag) {
@@ -633,17 +713,20 @@ fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
 /// codex-cli 0.166.0 nothing a reader can read changes between two requests
 /// of one turn, and a pending request's item is not persisted. Every
 /// initialized connection does receive each `thread/status/changed`, so
-/// every time a flag comes on while some t3-watch connection is open,
+/// every time a flag comes on while the counting connection is open,
 /// however briefly it was off, one more request is counted. Only the
 /// connection holding the thread's counter lock counts (`take_counter`);
 /// the count is kept in `<state>/native/codex/<thread>.json`, shared by
 /// every process watching the thread and by connections kept between
-/// waits. A request that opens while no connection is open, or during the
-/// handover from one counting connection to the next, shares its
-/// predecessor's number (docs/native-sessions.md, "Limits").
+/// waits. A connection that takes the counter over counts a flag that is
+/// still on once more (`fresh_count`). A request that opens and closes
+/// while no connection counts is never seen (docs/native-sessions.md,
+/// "Limits").
 ///
 /// `turn` is the latest turn's id, from a read; `None` (a kept connection,
-/// which reads nothing) continues the stored turn.
+/// which reads nothing) continues the stored turn, or, when `seen` ends one
+/// turn and goes on, starts a turn whose id is not known yet (`""`), which
+/// the next read names.
 fn record_requests(thread: &str, turn: Option<&str>, seen: &[Value]) -> (u64, u64) {
     let dir = codex_dir();
     let path = dir.join(format!("{thread}.json"));
@@ -654,22 +737,23 @@ fn record_requests(thread: &str, turn: Option<&str>, seen: &[Value]) -> (u64, u6
     let stored = util::open_private_read(&path)
         .ok()
         .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok());
-    let same_turn = match (turn, &stored) {
-        (None, _) => true,
-        (Some(t), Some(v)) => v["turn"] == t,
-        (Some(_), None) => false,
+    // The last status that ended a turn; what follows it is the next turn.
+    let ended = seen.iter().rposition(|s| s["type"] != "active");
+    let (same_turn, from) = match (turn, &stored) {
+        (None, _) => match ended {
+            Some(i) if i + 1 < seen.len() => (false, i + 1),
+            _ => (true, 0),
+        },
+        (Some(t), Some(v)) if v["turn"] == t || v["turn"] == "" => (true, 0),
+        (Some(_), _) => (false, ended.map_or(0, |i| i + 1)),
     };
     let mut kept = match stored {
         Some(v) if same_turn => v,
-        _ => json!({ "turn": turn.unwrap_or("none") }),
+        _ => json!({ "turn": turn.unwrap_or("") }),
     };
-    // A new turn: only what came after the last status that ended a turn
-    // belongs to it.
-    let from = if same_turn {
-        0
-    } else {
-        seen.iter().rposition(|s| s["type"] != "active").map_or(0, |i| i + 1)
-    };
+    if let Some(t) = turn {
+        kept["turn"] = json!(t);
+    }
     let before = kept.clone();
     let mut numbers = [0u64; 2];
     for (i, (kind, flag)) in [("approval", "waitingOnApproval"), ("input", "waitingOnUserInput")]

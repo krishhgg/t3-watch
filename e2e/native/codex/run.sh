@@ -44,7 +44,7 @@ for d in 3 0.5 0; do
   python3 -I "$HERE/probe_two_requests.py" "$X" "$BIN"
 done
 stop "$SERVER"; stop "$MOCK"
-for h in "$X/w" "$X/w2"; do T3_WATCH_HOME=$h "$BIN" stop > /dev/null 2>&1; done
+for h in "$X/w" "$X/w2" "$X/w3"; do T3_WATCH_HOME=$h "$BIN" stop > /dev/null 2>&1; done
 target=$(readlink "$X/cs.sock" 2>/dev/null)
 rm -rf "${X:?}"
 [ -n "$target" ] && rm -f "$target" "$target.lock"
