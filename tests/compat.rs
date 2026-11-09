@@ -337,6 +337,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         (14, "0.12.0"),
         (15, "0.13.0"),
         (16, "0.14.0"),
+        (17, "0.15.0"),
     ]
     .into_iter()
     .map(|(engine, version)| {
@@ -369,6 +370,7 @@ fn older_engine_daemons_at_their_own_default_sockets_are_never_reached() {
         "native-codex-notifications",
         "native-codex-kept-counter",
         "linux-io-hardening",
+        "native-codex-hook-log",
         "suspend-aware",
         "suspend-invalidation",
     ] {

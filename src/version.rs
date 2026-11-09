@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 17;
+pub const ENGINE: u32 = 18;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -70,6 +70,12 @@ pub const CAPABILITIES: &[&str] = &[
     // not discard the answer already read, and a `t3` binary briefly open
     // for writing (ETXTBSY) is run again rather than losing the poll.
     "linux-io-hardening",
+    // Codex approval requests are also read from the log `t3-watch hook
+    // codex` keeps as Codex's PermissionRequest hook: one that opened and
+    // closed while nothing counted is reported (`recoveredRequests`, the
+    // `requests_recovered` progress event), and one that replaced the
+    // request counted before is told apart from it.
+    "native-codex-hook-log",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",

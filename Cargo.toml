@@ -1,6 +1,6 @@
 [package]
 name = "t3-watch"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Zero-AI-token watcher for T3 Code threads: thin CLI clients multiplexed through one background daemon."
