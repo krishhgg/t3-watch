@@ -46,6 +46,8 @@ const MAX_SOCKET_PATH: usize = 103;
 const MAX_REQUEST_LINE: usize = 256 * 1024;
 const MAX_RESPONSE_LINE: usize = 16 << 20;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connect may wait for a daemon whose backlog is full.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
 /// Extra connections allowed beyond the wait limit, so `status` and `stop`
 /// still get through when every wait slot is taken.
@@ -125,7 +127,9 @@ fn take_lock(path: &Path, sock: &Path) -> io::Result<Option<File>> {
         if util::try_flock(&f)? {
             return Ok(Some(f));
         }
-        if Instant::now() >= deadline || UnixStream::connect(sock).is_ok() {
+        // Never a blocking connect: one to a hung daemon whose backlog is
+        // full would wait forever on Linux.
+        if Instant::now() >= deadline || util::listener_at(sock) {
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(20));
@@ -470,13 +474,24 @@ fn spawn_daemon() -> Result<(), String> {
 }
 
 /// Connects only to a socket that passes `check_socket`, and only to a
-/// daemon running as our uid. `Ok(None)` means nothing is listening.
+/// daemon running as our uid. `Ok(None)` means nothing is listening. A
+/// daemon that holds its socket but does not take the connection within
+/// `CONNECT_TIMEOUT` (hung, with its backlog full) is an error, not a hang:
+/// on Linux a plain blocking connect to it would wait forever.
 fn connect(sock: &Path) -> Result<Option<UnixStream>, String> {
     if !check_socket(sock)? {
         return Ok(None);
     }
-    let Ok(s) = UnixStream::connect(sock) else {
-        return Ok(None);
+    let s = match util::connect_unix(sock, CONNECT_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            return Err(format!(
+                "the daemon at {} does not accept connections (hung, or its backlog is full); \
+                 stop its process, or run `t3-watch wait --no-daemon`",
+                sock.display()
+            ))
+        }
+        Err(_) => return Ok(None),
     };
     util::check_peer(&s).map_err(|e| format!("refusing daemon at {}: {e}", sock.display()))?;
     let _ = s.set_write_timeout(Some(IO_TIMEOUT));

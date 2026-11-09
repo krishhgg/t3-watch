@@ -1229,3 +1229,83 @@ pub fn script(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// A listener that never accepts, with a backlog of one, filled by
+/// non-blocking connects: what a hung daemon looks like to a client. A
+/// blocking connect to it would wait forever on Linux (macOS refuses), so
+/// none is used. Closes everything when dropped.
+pub struct HungListener {
+    fds: Vec<i32>,
+    /// The errno of the connect that found the backlog full: ECONNREFUSED
+    /// on macOS, EAGAIN on Linux.
+    pub full_errno: i32,
+}
+
+impl HungListener {
+    pub fn bind(sock: &Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let addr = || unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (i, b) in sock.as_os_str().as_bytes().iter().enumerate() {
+                addr.sun_path[i] = *b as libc::c_char;
+            }
+            addr
+        };
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let mut fds = Vec::new();
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let a = addr();
+            assert_eq!(libc::bind(fd, &a as *const _ as *const libc::sockaddr, len), 0);
+            assert_eq!(libc::listen(fd, 1), 0);
+            fds.push(fd);
+        }
+        fs::set_permissions(sock, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut full_errno = 0;
+        for _ in 0..16 {
+            unsafe {
+                let c = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let flags = libc::fcntl(c, libc::F_GETFL);
+                libc::fcntl(c, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let a = addr();
+                if libc::connect(c, &a as *const _ as *const libc::sockaddr, len) == 0 {
+                    fds.push(c);
+                    continue;
+                }
+                full_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                libc::close(c);
+                break;
+            }
+        }
+        assert!(
+            full_errno == libc::ECONNREFUSED || full_errno == libc::EAGAIN,
+            "the backlog did not fill: errno {full_errno}"
+        );
+        HungListener { fds, full_errno }
+    }
+}
+
+impl Drop for HungListener {
+    fn drop(&mut self) {
+        for fd in &self.fds {
+            unsafe { libc::close(*fd) };
+        }
+    }
+}
+
+/// Takes `<sock>.lock` exclusively, as a running daemon holds it.
+pub fn hold_daemon_lock(sock: &Path) -> fs::File {
+    use std::os::fd::AsRawFd;
+    let mut p = sock.as_os_str().to_owned();
+    p.push(".lock");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PathBuf::from(p))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    f
+}

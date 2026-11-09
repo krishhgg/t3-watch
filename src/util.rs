@@ -590,15 +590,28 @@ pub fn daemon_alive(sock: &Path) -> bool {
 
 /// A non-blocking connect to the Unix socket at `path`: connected, or the
 /// listener is there but cannot take us yet.
-fn listener_at(path: &Path) -> bool {
+pub fn listener_at(path: &Path) -> bool {
+    match connect_once(path) {
+        Ok(_) => true,
+        Err(e) => matches!(
+            e.raw_os_error(),
+            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) | Some(libc::EALREADY)
+        ),
+    }
+}
+
+/// One non-blocking connect to the Unix socket at `path`; on success the
+/// stream is put back in blocking mode.
+fn connect_once(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: a zeroed sockaddr_un filled within its bounds, and a socket
-    // closed on every path.
+    // that is closed on every error path or handed to a UnixStream.
     unsafe {
         let mut addr: libc::sockaddr_un = std::mem::zeroed();
         if bytes.len() >= addr.sun_path.len() {
-            return false;
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
         }
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
@@ -606,15 +619,49 @@ fn listener_at(path: &Path) -> bool {
         }
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return false;
+            return Err(io::Error::last_os_error());
         }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
         let r = libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, len);
-        let err = io::Error::last_os_error().raw_os_error();
-        libc::close(fd);
-        r == 0 || matches!(err, Some(libc::EINPROGRESS) | Some(libc::EAGAIN) | Some(libc::EALREADY))
+        if r != 0 {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        Ok(std::os::unix::net::UnixStream::from_raw_fd(fd))
+    }
+}
+
+/// Connects to the Unix socket at `path` without ever blocking for long.
+/// A blocking connect to a listener whose backlog is full waits on Linux
+/// until a slot frees, which for a hung listener is never (macOS refuses at
+/// once). This tries a non-blocking connect every 20 ms while the backlog
+/// is full and gives up after `timeout` with `TimedOut`; any other error
+/// (nothing listening, refused) is returned at once.
+pub fn connect_unix(path: &Path, timeout: Duration) -> io::Result<std::os::unix::net::UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match connect_once(path) {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EAGAIN) | Some(libc::EINPROGRESS) | Some(libc::EALREADY)
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the listener does not accept connections",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
     }
 }
 

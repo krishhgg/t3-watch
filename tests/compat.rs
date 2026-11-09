@@ -1278,47 +1278,56 @@ fn a_hung_engine_5_daemon_with_a_full_backlog_is_found_by_its_lock() {
     // connect (ECONNREFUSED), so connecting proves nothing about a hung
     // daemon. Engine-5 and engine-6 daemons hold their socket lock from
     // before they bind until they exit, and the lock is what finds them.
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
+    // The backlog is filled without a blocking connect, which would wait
+    // forever on Linux (the Linux run of 0.14.0 hung here).
     let env = Env::new();
     fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
     let sock = env.home.join("daemon-e5.sock");
-    // A listener that never accepts, with a backlog of one, filled.
-    let fd = unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-        assert!(fd >= 0);
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (i, b) in sock.as_os_str().as_bytes().iter().enumerate() {
-            addr.sun_path[i] = *b as libc::c_char;
-        }
-        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-        assert_eq!(libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len), 0);
-        assert_eq!(libc::listen(fd, 1), 0);
-        fd
-    };
-    let queued: Vec<_> = (0..3).filter_map(|_| UnixStream::connect(&sock).ok()).collect();
-    if cfg!(target_os = "macos") {
-        // The backlog is full: further connects are refused, as a hung
-        // daemon's would be.
-        assert!(UnixStream::connect(&sock).is_err(), "the backlog is not full");
-    }
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(env.home.join("daemon-e5.sock.lock"))
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
+    let hung = HungListener::bind(&sock);
+    let lock = hold_daemon_lock(&sock);
     let list = output_json(&env.run(&["outbox", "list"]));
-    assert_eq!(list["incompatibleSenders"][0]["engine"], 5, "{list}");
+    assert_eq!(
+        list["incompatibleSenders"][0]["engine"], 5,
+        "errno {}: {list}",
+        hung.full_errno
+    );
     let ack = env.run(&["outbox", "legacy-ack", "--senders-stopped"]);
     assert_eq!(ack.status.code(), Some(2), "{}", both(&ack));
-    drop(queued);
-    unsafe { libc::close(fd) };
+    drop(lock);
+    drop(hung);
+}
+
+#[test]
+fn a_client_meeting_a_hung_daemon_returns_instead_of_hanging() {
+    // The Linux run of 0.14.0: a blocking connect to a daemon whose backlog
+    // is full waits until a slot frees, which for a hung daemon is never,
+    // so every new client would hang. The client now connects without
+    // blocking and gives up after 5 s with an error that names the daemon.
+    let env = Env::new();
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = env.home.join(SOCK);
+    let hung = HungListener::bind(&sock);
+    let _lock = hold_daemon_lock(&sock);
+    let started = std::time::Instant::now();
+    let out = env.run(&["status"]);
+    let status_took = started.elapsed();
+    let started = std::time::Instant::now();
+    let wait = env.run(&[
+        "wait",
+        "--timeout",
+        "30s",
+        "claude-code:00893aaf-19fa-41d2-8238-13269b9b3ca0",
+    ]);
+    let wait_took = started.elapsed();
+    assert!(status_took < Duration::from_secs(15), "status took {status_took:?}");
+    assert!(wait_took < Duration::from_secs(20), "wait took {wait_took:?}");
+    assert_eq!(wait.status.code(), Some(2), "{}", both(&wait));
+    if hung.full_errno == libc::EAGAIN {
+        // Linux: the connect is retried, then refused with a reason.
+        assert_eq!(out.status.code(), Some(2), "{}", both(&out));
+        assert!(both(&out).contains("does not accept connections"), "{}", both(&out));
+        assert!(both(&wait).contains("does not accept connections"), "{}", both(&wait));
+    }
 }
 
 #[test]
