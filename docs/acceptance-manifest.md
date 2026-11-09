@@ -1,18 +1,16 @@
-# Release acceptance matrix: 0.16.0, engine 18
+# Release acceptance matrix: 0.16.1, engine 19
 
-Build: 0.16.0, engine 18, rev `4632305883c87283dc646218654904a576cf01a6`.
-Not yet reviewed. Review ordinal 19 approved 0.15.0 as a final
-candidate, with X3b failing.
+Build: 0.16.1, engine 19, rev `13fd055668daff0e984109a159bc59a7c5620d05`.
+Review ordinal 21 approved 0.16.0 (`e32c09b`, no P0 or P1) and listed
+three findings, fixed here; this build has not been reviewed yet.
 
 **The fleet and the release are not accepted.** Code approval is not
-release acceptance, and this build has had no review yet. X3b, the Codex
-request opened and closed while nothing counts, now passes on this host
-(real app-server, isolated) through Codex's `PermissionRequest` hook, with
-the limits listed under X3b. The gates the parent ran for 0.15.0 (T1, T2,
-T3b, T7, N4, X5, X6) are pending for this build, T5 still needs a person,
-and installing and trusting the hook in the user's own Codex (X7) is the
-user's step. Nothing is pushed, deployed, installed over a shared binary,
-or wired to a production bot.
+release acceptance. X3b passes on this host (real app-server, isolated)
+through Codex's `PermissionRequest` hook, with the limits listed under
+X3b, and X7 (the hook in the user's own Codex) is parent-confirmed. The
+gates the parent ran for 0.15.0 (T1, T2, T3b, T7, N4, X5, X6) are pending
+for this build. Nothing is pushed, deployed, installed over a shared
+binary, or wired to a production bot.
 
 **Evidence kinds**
 
@@ -36,7 +34,7 @@ Times are UTC on 2026-11-09. The build host is the maintainer's Mac mini:
 macOS 27.0.1, arm64, rustc 1.99.1, zig 0.17.0, codex-cli 0.166.0, Claude
 Code 2.1.319.
 
-## X3b: what changed in 0.16.0
+## X3b: how it works
 
 The app-server keeps no record of past requests; Codex's documented
 `PermissionRequest` hook runs for every approval request, whatever is
@@ -54,22 +52,32 @@ becomes a needs-input wake: its owner answered it. `hooks/list`
 `thread/resume`, no answer, no decision. Details and limits:
 `docs/native-sessions.md`, "Requests missed while nothing counts".
 
-## Commits since the 0.15.0 matrix (`715700d`, branch `feat/t3-watch-v1`, unpushed)
+## Review ordinal 21: findings and fixes
+
+| Finding | Fix | Tests (each new behavior test fails on `e32c09b`) |
+|---|---|---|
+| P2: a replaced, truncated or deleted hook log was read again, then ignored: the old record count skipped the new lines, so later missed approvals in the turn were never reported | `78d3d74`: the cursor keeps the log's device and inode, an offset on a line it can check (the turn's first record, else the last complete line) with that line's time, and the newest record time read. The same file with the same line there is read on from the cursor; anything else is read whole, and only records newer than every one already read are new. A 0.16.0 cursor is trusted once if its bytes still fit (`7bfaa8d`) | `tests/codex.rs::a_replaced_truncated_or_deleted_hook_log_loses_and_repeats_nothing` (truncated, truncated and regrown, deleted and recreated, replaced by a copy, a half-written last line; one process per step), `a_count_stored_by_0_16_0_is_taken_over_without_reporting_its_records_again` |
+| P3: a record written more than 60 s after its live count was taken as a new request (a spurious `requests_recovered`, or an extra wake) | `78d3d74`: no time limit on matching. A count waits for its record until a request counted after it has had its record for 15 s (Codex starts a session's background hooks in order and stops each after the printed 10 s timeout), or the turn ends | `a_hook_record_that_lands_long_after_its_count_is_still_that_request` (a record two minutes late), and unit tests `a_record_that_lands_late_still_matches_its_count`, `a_count_with_no_record_is_given_up_once_a_later_record_has_settled`, `records_match_newest_first_and_never_a_count_made_after_them` |
+| P3: `open_log` left an existing log's wider mode | `78d3d74`: an existing regular file it owns is set back to 0600, as `open_lock_file` does | `util::tests::an_existing_log_with_wider_access_is_made_private`; the hook test makes a 0644 log 0600 again |
+
+## Commits since the 0.16.0 matrix (`e32c09b`, branch `feat/t3-watch-v1`, unpushed)
 
 | Commit | What |
 |---|---|
-| `f2a14db` | Codex: recover approval requests missed while nothing counted, from the `PermissionRequest` hook log |
-| `0cd9b9f` | Engine 18 (0.16.0), capability `native-codex-hook-log` |
-| `1720230` | Docs: the hook log recovery, its remaining limits, engine 18 |
-| `4632305` | The desktop check reports whether the Codex hook is installed |
-| this commit | The 0.16.0 matrix |
+| `78d3d74` | The hook log cursor survives replacement; late records still match; logs kept 0600 (review ordinal 21) |
+| `7bfaa8d` | A 0.16.0 hook cursor is taken over without reporting its records again |
+| `13fd055` | Engine 19 (0.16.1), capability `native-codex-hook-cursor` |
+| this commit | The 0.16.1 matrix |
+
+The 0.16.0 commits (`f2a14db`, `0cd9b9f`, `1720230`, `4632305`, `e32c09b`)
+added the hook log; review ordinal 21 approved them.
 
 ## Artifacts
 
-They live in the worktree's ignored `dist/0.16.0/`, with the logs in
-`dist/0.16.0/evidence/`. All are built from an exact `git archive` of
-`4632305`, and `--version` prints `t3-watch 0.16.0 (engine 18, rev
-4632305883c87283dc646218654904a576cf01a6)`.
+They live in the worktree's ignored `dist/0.16.1/`, with the logs in
+`dist/0.16.1/evidence/`. All are built from an exact `git archive` of
+`13fd055`, and `--version` prints `t3-watch 0.16.1 (engine 19, rev
+13fd055668daff0e984109a159bc59a7c5620d05)`.
 
 They are built with
 `RUSTFLAGS="--remap-path-prefix=$HOME=/build-home --remap-path-prefix=<source dir>=/build/src"`,
@@ -80,55 +88,53 @@ synthetic test strings `/Users/a` and `/Users/someone`, and no
 
 | File | SHA-256 | Executed |
 |---|---|---|
-| `t3-watch-4632305-aarch64-apple-darwin` (2,003,216 bytes) | `1da1a88f4319f290e5cb9f63de22cf120c45a6457778c11d474e966ede7aaaad` | Every real run below |
-| `t3-watch-4632305-universal-apple-darwin` (arm64 + x86_64) | `225d02c9b2256ea42ae9a16a1b2c660a16a326867fa4bc680c4f7317fb041beb` | Not run; its arm64 slice is the build above, and x86_64 is not run here (no Rosetta) |
-| `t3-watch-0.16.0-x86_64-unknown-linux-gnu.tar.gz` | `bcd184ec3270a5840a77fcfe72b48133c74887b870fc0f5e9dd9c00a56478c0a` (binary `d7a42f24…1438`, glibc 2.17 or older) | **Not yet run on Linux** (T7, the parent's box) |
-| `t3-watch-0.16.0-aarch64-unknown-linux-gnu.tar.gz` | `fc2f6f2c18e8b978099a461880edbff52f563c45a0960a80c09f2bdbbf1a17dc` (binary `e9e2a2c6…fdd2`, glibc 2.17 or older) | Not run: no aarch64 Linux host |
-| `t3-watch-tests-0.16.0-x86_64-unknown-linux-gnu.tar.gz` | `6d245bfcaef2a3a48be334b041033679d309ad8e2ff1007ad489c0aa6fdd729a` (12 test binaries, LTO off, plus the source) | **Not yet run on Linux** (T7) |
-| `linux.sh`, `desktop-check.sh` | copies of `e2e/acceptance/linux.sh` (`1dbe6485…5293`, unchanged since 0.15.0) and `e2e/native/codex/desktop-check.sh` (`c95b18ad…25ec`) | |
+| `t3-watch-13fd055-aarch64-apple-darwin` (2,003,248 bytes) | `0a039a14bd3629da12aa53d96f5d646b895a3d25289f9fd771b0bfbdd40231aa` | Every real run below |
+| `t3-watch-13fd055-universal-apple-darwin` (arm64 + x86_64) | `353684293301d0bf93024031d80acb75865834b51770f323989c09e0bd55ae84` | Not run; x86_64 is not run here (no Rosetta) |
+| `t3-watch-0.16.1-x86_64-unknown-linux-gnu.tar.gz` | `60b85c7c3392eace8e74a7f5e3b2ff6c261dc6a99f221177bc97cca207f59cf2` (binary `8c3494ed…068d`, glibc 2.17 or older) | **Not yet run on Linux** (T7, the parent's box) |
+| `t3-watch-0.16.1-aarch64-unknown-linux-gnu.tar.gz` | `0ad4b329ef4074cea523bc5708014bc69c2c1fdd5f6cedd3cd39be876815e620` (binary `1331e938…c8ec`, glibc 2.17 or older) | Not run: no aarch64 Linux host |
+| `t3-watch-tests-0.16.1-x86_64-unknown-linux-gnu.tar.gz` | `e3fdacf1a5f232d42f53bb596486fcb4fbaedb7d8d56964662c0a295c8fb86cd` (12 test binaries, LTO off, plus the source) | **Not yet run on Linux** (T7) |
+| `linux.sh`, `desktop-check.sh` | copies of `e2e/acceptance/linux.sh` (`1dbe6485…5293`) and `e2e/native/codex/desktop-check.sh` (`c95b18ad…25ec`), both unchanged since 0.16.0 | |
 
-## Build checks at `4632305`
+## Build checks at `13fd055`
 
 | Check | Toolchain | Result | When | Log |
 |---|---|---|---|---|
-| `cargo test --locked` | rustc 1.99.1 | **PASS**: 291 passed, 0 failed | 05:43:28–05:45:19 | `evidence/suite-4632305.txt` |
-| (the first run of the same) | rustc 1.99.1 | 1 failed: `adversarial::a_cancelled_local_poll_kills_its_t3_process`, "timed out waiting for the budget to drain" (3 s) | 05:39:39–05:39:52 | `evidence/suite-4632305-run1-failed.txt` |
-| `cargo +1.85.1 test --locked` (MSRV) | rustc 1.85.1 | **PASS**: 291 passed, 0 failed | ends 05:42:01 | `evidence/msrv-4632305.txt` |
-| `cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` | rustc 1.99.1 | **PASS**: clean | 05:39:52 | `evidence/lint-4632305.txt` |
+| `cargo test --locked` | rustc 1.99.1 | **PASS**: 298 passed, 0 failed | 06:29:25–06:31:17 | `evidence/suite-13fd055.txt` |
+| `cargo +1.85.1 test --locked` (MSRV) | rustc 1.85.1 | **PASS**: 298 passed, 0 failed | 06:31:27–06:33:26 | `evidence/msrv-13fd055.txt` |
+| `cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` | rustc 1.99.1 | **PASS**: clean | 06:31:17 | `evidence/lint-13fd055.txt` |
 
-The failed test is a timing flake outside this change: it waits 3 s for a
-killed local `t3` poll to give its slot back, and its code is unchanged
-since 0.15.0. It did not fail again in 30 reruns (20 alone, 10 with its
-whole test binary), in the MSRV run, or in the suite rerun. It is
-recorded, not fixed.
+The timing flake seen once with 0.16.0
+(`adversarial::a_cancelled_local_poll_kills_its_t3_process`, outside the
+hook code) did not recur in either run. It is not fixed.
 
 ## Gates
 
-The rows run on this host used the shipped arm64 binary (`1da1a88f`). The
-parent-reported results are for 0.15.0 (rev `1e98e73`); this build changes
-the engine, so they are pending for it.
+The rows run on this host used the shipped arm64 binary (`0a039a14`). The
+parent-reported results are for 0.15.0 (rev `1e98e73`) unless the row says
+otherwise; this build changes the engine, so the parent's gates are
+pending for it.
 
 | # | Gate | Kind | Status | Evidence |
 |---|---|---|---|---|
-| T1 | The correct bot woken by a real completion webhook, and continuing | real, production | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-reported) | 0.15.0: watchId `1650566df28c0743`, notificationId `5c5f52008d347700b6f8ebeec62f4206`, `/workspace/t3-watch-gates-1e98e73-03cb7361cb9947b7/FINAL-evidence.json` and `T1-RECEIVED.json` |
-| T2 | A real `needs_input` notification, and the parent's continuation | real, production | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-reported) | 0.15.0: watchId `9aa64e5f7e064c90`, `T2.RESULT`, same evidence directory |
-| T3 | Durable delivery through a controlled outage and a daemon restart | real, isolated | **PASS** | `e2e/durable.sh`. With the receiver down, the client exited 4 with the event queued. After a daemon stop and restart, the receiver came up and the event was delivered on attempt 5 with the same id (`af020927…`), 2.0 s later. `evidence/durable-4632305.txt` |
-| T3b | Durable replay to the **real** receiver, and the bot continuing | real, production | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-reported) | 0.15.0: replay id `0903158322f9d1610fd19123acd696dd`, attempt 5; `T3b-clean-real-receiver-receipt-09031583.json` |
-| T4 | Crash recovery: SIGKILL of the daemon mid-delivery | real, isolated | **PASS** | Same run: delivered on attempt 4 with the same id (`b13c2e8b…`), 1.8 s after the receiver answered again. Delivery is at least once |
-| T5 | A real host suspend and resume | real | **PENDING (person, not waived)** | Not done, and never simulated in its place: this host is shared and kept awake. `e2e/acceptance/suspend.sh` (step 1). A sleeping host sends nothing until it wakes, so never promise instant notification from sleeping hardware |
-| T6 | Live local T3, read only | real | **PASS** | 05:49:52: a completed fixture thread, directly (461 ms, watchId `60c58c88d4755960`) and through the daemon (316 ms, `e3d044fbab181957`); `--until workstream` on local exits 2. `evidence/live-local-4632305.txt` |
-| T7 | Native Linux run of the latest archives and tests | real | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-reported) | `dist/0.16.0/linux.sh` with the archives above, on the Grok Bot box. 0.15.0: `linux-run.log` in `/workspace/t3-watch-candidate-1e98e73`, 286 tests and `e2e/durable.sh` A and B |
+| T1 | The correct bot woken by a real completion webhook, and continuing | real, production | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-reported) | 0.15.0: watchId `1650566df28c0743`, notificationId `5c5f52008d347700b6f8ebeec62f4206`, `/workspace/t3-watch-gates-1e98e73-03cb7361cb9947b7/FINAL-evidence.json` and `T1-RECEIVED.json` |
+| T2 | A real `needs_input` notification, and the parent's continuation | real, production | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-reported) | 0.15.0: watchId `9aa64e5f7e064c90`, `T2.RESULT`, same evidence directory |
+| T3 | Durable delivery through a controlled outage and a daemon restart | real, isolated | **PASS** | `e2e/durable.sh`. With the receiver down, the client exited 4 with the event queued. After a daemon stop and restart, the receiver came up and the event was delivered on attempt 5 with the same id (`21cf1b47…`), 2.0 s later. `evidence/durable-13fd055.txt` |
+| T3b | Durable replay to the **real** receiver, and the bot continuing | real, production | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-reported) | 0.15.0: replay id `0903158322f9d1610fd19123acd696dd`, attempt 5; `T3b-clean-real-receiver-receipt-09031583.json` |
+| T4 | Crash recovery: SIGKILL of the daemon mid-delivery | real, isolated | **PASS** | Same run: delivered on attempt 4 with the same id (`8b49ac51…`), 1.8 s after the receiver answered again. Delivery is at least once |
+| T5 | A real host suspend and resume | real | **PASS** (parent-reported for 0.15.0, carried: the suspend path is unchanged); evidence not recorded here | Review ordinal 21 reports a real-suspend pass for 0.15.0. Its evidence (ids, path) has not reached this worktree and is not recorded here; the 0.15.0 and 0.16.0 matrices listed T5 as pending. Since `1e98e73`, `src/daemon.rs`, `tests/suspend.rs` and `e2e/acceptance/suspend.sh` are unchanged and the wait clock only gained a field (`started_ms`); `tests/suspend.rs` (8 tests) passes here. Never simulated in its place |
+| T6 | Live local T3, read only | real | **PASS** | 06:39:19: a completed fixture thread, directly (328 ms, watchId `f02040dab42053e6`) and through the daemon (307 ms, `d29faae795fe7a76`); `--until workstream` on local exits 2. `evidence/live-local-13fd055.txt` |
+| T7 | Native Linux run of the latest archives and tests | real | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-reported) | `sh dist/0.16.1/linux.sh dist/0.16.1 13fd055` on the Grok Bot box. 0.15.0: `linux-run.log` in `/workspace/t3-watch-candidate-1e98e73`, 286 tests and `e2e/durable.sh` A and B |
 | N1 | Claude Code: synthetic hook events | synthetic | **PASS** | `tests/native.rs`, 11 tests |
-| N3 | Claude Code: real interactive permission dialog | real, isolated | **PASS** | Disposable session `84a2345e-b949-4b98-8660-6c16e6c894f4`, 05:50:16. `needs_input` and its webhook arrived (tool `Bash`). The dialog was rejected with Escape and never approved, and the command did not run. Same-session reuse woke a pinned wait 1.5 s after the next prompt; a `--resume` reuse 1.0 s after the resume started. The hook log holds `at`, `event`, `type`, `tool` and `subagent` only. `evidence/claude-interactive-4632305.txt` |
-| N4 | Claude Code: same-session reuse wakes the bot, which continues | real, production | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-confirmed) | 0.15.0: correlation `cbbacb6e4f0d4d1d`, watchId `24f5cc6a72c561cd`, `RECEIVED-24f5cc6a72c561cd.json` |
-| X1 | Codex: mock app-server | synthetic | **PASS** | `tests/codex.rs`, 22 tests |
-| X2 | Codex: real app-server, disposable threads | real, isolated | **PASS** | `e2e/native/codex/run.sh`, 05:45:26–05:48:25, thread `01a1bed7-1045-7040-b3ba-75825bcd92ec`: <ul><li>needs-input and its webhook arrived 1,015 ms after the approval request;</li><li>in the watcher and control windows alike, only the app-server's own log database changed;</li><li>the owner's request stayed its own;</li><li>pinned wake 1.0 s after `turn/completed`;</li><li>unload at 60 s while polled, then a read after unload.</li></ul> `evidence/codex-run-sh-4632305.txt` |
-| X3 | Codex: two approvals in one turn | real, isolated | **PASS** | Same run, at pauses of 3 s, 0.5 s and 0 s: <ul><li>one connected wait woke for request 2 under its own key (59 to 593 ms after it opened);</li><li>through the daemon, request 2 opened between waits and got its own key;</li><li>on the keeper drain path, a wait inside a round kept the request, and the next request reached the third wait;</li><li>a second `--no-daemon` wait without the hook counted the open request again, as documented.</li></ul> |
-| X3b | Codex: a request opened and closed while nothing counts | real, isolated | **PASS** with the hook installed and trusted; limits below | Same run, `probe_missed.py`, with the printed hook block in the fixture's `CODEX_HOME` and the binary on a path with a space (quoted command): <ul><li>untrusted, the hook left no record for two requests;</li><li>with a wait counting throughout, nothing was recovered (`requestRecovery: "hook"`);</li><li>with nothing counting while two requests opened and closed, the next wait listed both in `recoveredRequests` and reported them once as `requests_recovered`; a later wait listed them without reporting them again;</li><li>with the daemon stopped after it counted request 1, a wait through a new daemon recovered request 2 only;</li><li>the log held `atMs`, `event`, `tool` and `turn` only.</li></ul> Mock: `tests/codex.rs::a_request_that_opens_and_closes_while_nothing_counts_is_recovered_from_the_hook_log` (webhook progress, with and without the daemon) and five more hook tests |
-| X4 | Codex: default socket through the official shared daemon | real, isolated | **PASS** | 05:50:02. Completion, then a pinned run 2 500 ms after `turn/completed`. The daemon was stopped and no LaunchAgent changed. `evidence/codex-daemon-socket-4632305.txt` |
-| X5 | Codex: the desktop thread on the MacBook, read only | real | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-reported) | `dist/0.16.0/desktop-check.sh` against the research thread. 0.15.0 exited 0 at run ordinal 4 (`x5-desktop-check.out`; the thread's id is withheld from this file) |
-| X6 | Codex: the bot reuses a thread and continues | real, production | **PENDING (parent) for 0.16.0**; PASS for 0.15.0 (parent-confirmed) | 0.15.0: correlation `cbbacb6e4f0d4d1d`, disposable thread `01a1be81-857d-7483-a375-daadd3d77217`, watchId `5a10216c5de0876f`, `RECEIVED-5a10216c5de0876f.json` |
-| X7 | Codex: the hook in the user's own Codex (desktop app or CLI) | real | **PENDING (person)** | The user adds the `t3-watch hook codex --print-settings` block to `~/.codex/config.toml` and trusts it; then `T3_WATCH_HOME=<that state dir> sh desktop-check.sh <t3-watch> <thread id>` shows `requestRecovery: "hook"`. t3-watch never edits Codex's settings, and trusting a hook is the user's decision, so this was not done for them |
+| N3 | Claude Code: real interactive permission dialog | real, isolated | **PASS** | Disposable session `f08112c9-44a8-478f-a1ba-51d1c1115097`, 06:39:37. `needs_input` and its webhook arrived (tool `Bash`). The dialog was rejected with Escape and never approved, and the command did not run. Same-session reuse woke a pinned wait 1.6 s after the next prompt; a `--resume` reuse 1.6 s after the resume started. The hook log holds `at`, `event`, `type`, `tool` and `subagent` only. `evidence/claude-interactive-13fd055.txt` |
+| N4 | Claude Code: same-session reuse wakes the bot, which continues | real, production | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-confirmed) | 0.15.0: correlation `cbbacb6e4f0d4d1d`, watchId `24f5cc6a72c561cd`, `RECEIVED-24f5cc6a72c561cd.json` |
+| X1 | Codex: mock app-server | synthetic | **PASS** | `tests/codex.rs`, 25 tests, and 3 matching unit tests in `src/codex.rs` |
+| X2 | Codex: real app-server, disposable threads | real, isolated | **PASS** | `e2e/native/codex/run.sh`, 06:34:51–06:37:50, thread `01a1bf04-4e12-7f53-9e46-31f4620b4183`: <ul><li>needs-input and its webhook arrived 737 ms after the approval request;</li><li>in the watcher and control windows alike, only the app-server's own log database changed;</li><li>the owner's request stayed its own;</li><li>pinned wake 1.0 s after `turn/completed`;</li><li>unload at 60 s while polled, then a read after unload.</li></ul> `evidence/codex-run-sh-13fd055.txt` |
+| X3 | Codex: two approvals in one turn | real, isolated | **PASS** | Same run, at pauses of 3 s, 0.5 s and 0 s: <ul><li>one connected wait woke for request 2 under its own key (79 to 593 ms after it opened);</li><li>through the daemon, request 2 opened between waits and got its own key;</li><li>on the keeper drain path, a wait inside a round kept the request, and the next request reached the third wait;</li><li>a second `--no-daemon` wait without the hook counted the open request again, as documented.</li></ul> |
+| X3b | Codex: a request opened and closed while nothing counts | real, isolated | **PASS** with the hook installed and trusted; limits below | Same run, `probe_missed.py`, with the printed hook block in the fixture's `CODEX_HOME` and the binary on a path with a space (quoted command): <ul><li>untrusted, the hook left no record for two requests;</li><li>with a wait counting throughout, nothing was recovered (`requestRecovery: "hook"`);</li><li>with nothing counting while two requests opened and closed, the next wait listed both in `recoveredRequests` and reported them once as `requests_recovered`; a later wait listed them without reporting them again;</li><li>with the daemon stopped after it counted request 1, a wait through a new daemon recovered request 2 only;</li><li>the log held `atMs`, `event`, `tool` and `turn` only.</li></ul> Mock: the recovery with and without the daemon, the review ordinal 21 regressions above, and six more hook tests |
+| X4 | Codex: default socket through the official shared daemon | real, isolated | **PASS** | 06:39:30. Completion, then a pinned run 2 522 ms after `turn/completed`. The daemon was stopped and no LaunchAgent changed. `evidence/codex-daemon-socket-13fd055.txt` |
+| X5 | Codex: the desktop thread on the MacBook, read only | real | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-reported) | `dist/0.16.1/desktop-check.sh` against the research thread. 0.15.0 exited 0 at run ordinal 4 (`x5-desktop-check.out`; the thread's id is withheld from this file) |
+| X6 | Codex: the bot reuses a thread and continues | real, production | **PENDING (parent) for 0.16.1**; PASS for 0.15.0 (parent-confirmed) | 0.15.0: correlation `cbbacb6e4f0d4d1d`, disposable thread `01a1be81-857d-7483-a375-daadd3d77217`, watchId `5a10216c5de0876f`, `RECEIVED-5a10216c5de0876f.json` |
+| X7 | Codex: the hook in the user's own Codex (desktop app or CLI) | real | **PASS** (parent-confirmed, with 0.16.0) | On the user's MacBook: t3-watch 0.16.0 installed at `~/.local/bin/t3-watch`, the `PermissionRequest` async hook block from `--print-settings` added to `~/.codex/config.toml` and trusted by the user, and `desktop-check.sh` reporting `requestRecovery: "hook"` against Codex app-server 0.167.0. The user did the install and trust; t3-watch edited nothing. 0.16.1 keeps the same block and log line. Whether Codex asks for trust again when the binary at that path is replaced was not checked |
 
 **X3b limits** (also in `docs/native-sessions.md`, "Limits"):
 
@@ -143,24 +149,28 @@ the engine, so they are pending for it.
 - a hook that is trusted but records nothing (a moved binary) loses
   requests that open and close unseen; a replaced open request then still
   gets the extra wake, never a missed one;
+- a count that never gets a record (an approval without the hook, or one
+  counted before the hook was installed) can take the record of one later
+  request of the same turn that opened and closed unseen, until a request
+  counted after it has had its record for 15 s or the turn ends;
+- matching relies on Codex starting a session's background hooks in order
+  and on the printed `timeout = 10`: a record more than 15 s out of order
+  is reported as recovered although its request was seen (none was seen
+  here);
+- after the log is replaced, a record not newer than the newest one
+  already read is taken as a copy (a clock step back could hide a new one);
 - subagent threads (records under the parent's `session_id`) were not run;
 - a request another hook allowed or denied is reported as recovered,
   though it never reached a person.
 
 ## Still open
 
-1. **Review of this build.** No review has seen `f2a14db`..`4632305`.
-2. **The parent's gates for 0.16.0:** T1, T2, T3b, N4 and X6 with this
-   build; T7 with `sh dist/0.16.0/linux.sh dist/0.16.0 4632305` on the Grok
-   Bot box; X5 with `dist/0.16.0/desktop-check.sh` on the MacBook.
-3. **T5, a real host suspend (a person, on a machine that may sleep).**
-   Run `sh e2e/acceptance/suspend.sh <t3-watch> <thread URL> [webhook URL]`
-   with the thread running elsewhere. Sleep the machine and wake it a few
-   minutes later. Record the printed `suspendedMs`, `elapsedAwakeMs` and
-   `elapsedWallMs`, and the system's sleep and wake lines, against the
-   webhook's arrival. Not waived, and never simulated in its place.
-4. **X7, the hook in the user's own Codex (the user).** Install and trust
-   it, then the desktop check above with `T3_WATCH_HOME` set.
+1. **Review of this build.** No review has seen `78d3d74`..`13fd055`.
+2. **The parent's gates for 0.16.1:** T1, T2, T3b, N4 and X6 with this
+   build; T7 with `sh dist/0.16.1/linux.sh dist/0.16.1 13fd055` on the
+   Grok Bot box; X5 with `dist/0.16.1/desktop-check.sh` on the MacBook.
+3. **T5's evidence.** The ids and path of the 0.15.0 real-suspend run, to
+   record them here. Until then T5 rests on the parent's report.
 
 ## History: the native Linux run of 0.14.0 (gate T7: FAIL, fixed in 0.15.0)
 
@@ -215,7 +225,7 @@ tip's tree is identical to `feat/t3-watch-v1`'s. It is not pushed.
   webhook receiver or bot routine. So T1, T2, T3b and X6 were not run on
   this host. The parent ran them for 0.15.0 against its own receiver and
   bot routine, where the webhook URL and secret are; T7 and X5 ran on the
-  Grok Bot box and the MacBook. For 0.16.0 they wait for the parent.
+  Grok Bot box and the MacBook. For 0.16.1 they wait for the parent. X7 was done on the user's MacBook by the user, and confirmed by the parent.
 - **The user's Codex** (`~/.codex`) was not read, used or changed: every
   hook check ran in a fixture `CODEX_HOME`, where the hook was trusted the
   way `/hooks` records it. Nothing was installed in the user's Codex.
