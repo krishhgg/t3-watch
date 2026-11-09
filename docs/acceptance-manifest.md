@@ -1,9 +1,9 @@
-# Release acceptance matrix: 0.13.0, engine 15
+# Release acceptance matrix: 0.14.0, engine 16
 
-This build is **ready for independent acceptance and not accepted**. The
-last code approval was review ordinal 15 of `a52bb9b` (0.12.0, engine 14).
-Everything after it, listed below, has not been reviewed. Code approval is
-not release acceptance: the gates marked BLOCKED need the parent's bot, a
+This build is **ready for independent review and not accepted**. Review
+ordinal 16 (`5cdc4b9`, 0.13.0) asked for changes, and the commits below
+make them. They have not been reviewed yet. Code approval is not release
+acceptance either: every gate marked BLOCKED needs the parent's bot, a
 person, or a machine this host cannot reach. Nothing is pushed, deployed,
 installed over a shared binary, or wired to a production bot.
 
@@ -12,175 +12,161 @@ installed over a shared binary, or wired to a production bot.
 - **synthetic**: test fixtures (mock MCP or app-server, a fake `t3` CLI, a
   loopback receiver);
 - **real, isolated**: real binaries and real Claude Code or Codex
-  processes, in disposable sessions, isolated homes and loopback receivers;
+  processes, in disposable sessions, isolated homes and loopback
+  receivers;
 - **real, production**: the parent's bot, its routine and its receipts.
 
 An exit code, or an HTTP 200 from a loopback receiver, is never counted as
-a bot's continuation.
+a bot's continuation. In the Codex runs, approvals in the disposable
+threads are declined by the probe's owner client (standing in for the
+person who owns the thread). t3-watch answers none, and the mock
+app-server tests assert that it sends no answer.
 
-Times are UTC on 2026-11-08 unless a date is given. The build host is the
+Times are UTC on 2026-11-09 unless a date is given. The build host is the
 maintainer's Mac mini: macOS 27.0.1, arm64, rustc 1.99.1, codex-cli
 0.166.0, Claude Code 2.1.319.
 
-## Commits after review ordinal 15 (branch `feat/t3-watch-v1`, unpushed)
+## Commits after review ordinal 16 (branch `feat/t3-watch-v1`, unpushed)
 
 | Commit | What |
 |---|---|
-| `a52bb9b` | 0.12.0 engine 14: code approved by review ordinal 15 (baseline) |
-| `0c31bc8` | Review ordinal 15, findings 1 and 3: the outbox-v2 exposure claims are scoped to engines 4, 6, 7 and 8 (engine 5 moves entries whatever their state). The liveness probe's lock is what finds a hung daemon; a test fills a listener's backlog and finds it by its lock |
-| `8ad6dfc` | Finding 2, engine 15 (0.13.0): Codex requests counted from `thread/status/changed` notifications (one counting connection per thread), and connections kept between waits mid-turn |
-| `08d4b24` | Fixtures for the gates that need another actor; the Codex harness refuses a busy mock port |
-| `312fc85` | A Codex thread that cannot list its turns yet (seen once in six real runs while it materializes) is retried, not failed |
-| this commit | This matrix; `linux.sh` uses the shipped source copy |
+| `5cdc4b9` | 0.13.0 engine 15, reviewed in ordinal 16 (changes required) |
+| `0fa3b58` | P3: personal identifiers removed from the tracked tree |
+| `bf58d75` | P1 and the three P2s: the Codex keeper keeps its counting connection, fresh counts recount, a batch's newest status decides a turn's end, a bounded `list_turns` retry. Engine 16 (0.14.0) |
+| `04a7f1e` | The real-server probe's connected wait starts a fresh count |
+| this commit | This matrix |
 
-The code is identical from `312fc85` on; only docs and `e2e/` change.
+The code is identical from `bf58d75` on; only docs and `e2e/` change.
 
 ## Artifacts
 
-They live in the worktree's ignored `dist/0.13.0/`, with the logs in
-`dist/0.13.0/evidence/`. All of them are built from `312fc85`, and
-`--version` prints `t3-watch 0.13.0 (engine 15, rev
-312fc8519fd332e0c904d290a0f008605aa1e92d)`. A rebuild is not claimed to
+They live in the worktree's ignored `dist/0.14.0/`, with the logs in
+`dist/0.14.0/evidence/`. All of them are built from `bf58d75`, and
+`--version` prints `t3-watch 0.14.0 (engine 16, rev
+bf58d758bb53ae0b838f79c1f78fdabe6248ddae)`. A rebuild is not claimed to
 match byte for byte.
 
 | File | SHA-256 | Built with | Executed |
 |---|---|---|---|
-| `t3-watch-312fc85-aarch64-apple-darwin` (1,970,032 bytes) | `80b73d401c6faffe18991acfc4f3970d98c5e2b6dcfdbc1845e4a129ba3c67e6` | `cargo build --release --locked` | Every real run below |
-| `t3-watch-312fc85-universal-apple-darwin` (arm64 + x86_64) | `0a3b828e4a3aeae974f89c2c41977f3baac77261bf5cd7d49911d706cc2e2778` | `lipo` of the above and an x86_64 build | arm64 only (`--version`); x86_64 not run here (no Rosetta) |
-| `t3-watch-0.13.0-x86_64-unknown-linux-gnu.tar.gz` | `a493217d5ca39ab8c866e8a815eaf517426173ccec7b6a3f4cf988a2b9587fc7` (binary `a0f6d9df…97cb`) | zig 0.17.0 cross-build, glibc 2.17 or older | **No** |
-| `t3-watch-0.13.0-aarch64-unknown-linux-gnu.tar.gz` | `53d8972e3d4d96764989986f49d43c7048d52a15f6ed711b5a1216a5fcd8267b` (binary `e4161778…45f3`) | same | **No** |
-| `t3-watch-tests-0.13.0-x86_64-unknown-linux-gnu.tar.gz` | `5c3a3c22f40946ba88722c069e814665e9beab7ac48df52908d36fad3cd73ef3` | the 12 test binaries (LTO off) and the source; `linux.sh` runs them against the archive's binary | **No** |
-| `linux.sh` | (copy of `e2e/acceptance/linux.sh`) | | |
+| `t3-watch-bf58d75-aarch64-apple-darwin` (1,970,016 bytes) | `9abbd7d12076258a41b342c5b4f9909b05b1f8505300789ef0ef5bd21e8c95f9` | `cargo build --release --locked` | Every real run below |
+| `t3-watch-bf58d75-universal-apple-darwin` (arm64 + x86_64) | `becf53ab3aca2ab95bc8742ecfa031cf89711aefd836de8138ff40655b2da1b5` | `lipo` of the above and an x86_64 build | arm64 only (`--version`); x86_64 not run here (no Rosetta) |
+| `t3-watch-0.14.0-x86_64-unknown-linux-gnu.tar.gz` | `c92ade2a7532d395366275d440c2d671435406c5e42bf412c4aa15bf5fdd3a55` (binary `fac78ac3…6903`) | zig 0.17.0 cross-build, glibc 2.17 or older | **No** |
+| `t3-watch-0.14.0-aarch64-unknown-linux-gnu.tar.gz` | `2953caa5889a3d13db294afa7322a25ea1d32f0719583d15c8f672cf9ecf15bd` (binary `5f5bd61f…58b3`) | same | **No** |
+| `t3-watch-tests-0.14.0-x86_64-unknown-linux-gnu.tar.gz` | `58359f192921650a457736af56e7717e107a0af7771c7b0a1cab2ecdaaa6575e` | the 12 test binaries (LTO off) and the source; `linux.sh` runs them against the archive's binary | **No** |
+| `linux.sh`, `desktop-check.sh` | copies of `e2e/acceptance/linux.sh` and `e2e/native/codex/desktop-check.sh` | | |
 
-## Build checks at `312fc85`
+## Build checks
 
-| Check | Toolchain | Result | When | Log |
-|---|---|---|---|---|
-| `cargo test --locked` | rustc 1.99.1 | **PASS**: 278 passed, 0 failed | 23:17:12–23:18:23 | `evidence/suite-312fc85.txt` |
-| `cargo +1.85.1 test --locked` (MSRV) | rustc 1.85.1 | **PASS**: 278 passed, 0 failed | 23:22:20–23:23:38 | `evidence/msrv-312fc85.txt` |
-| `cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` | rustc 1.99.1 | **PASS**: clean | 23:22:03 | `evidence/lint-312fc85.txt` |
+| Check | Commit | Toolchain | Result | When | Log |
+|---|---|---|---|---|---|
+| `cargo test --locked` | `bf58d75` | rustc 1.99.1 | **PASS**: 283 passed, 0 failed | 00:10:47–00:12:34 | `evidence/suite-bf58d75.txt` |
+| `cargo +1.85.1 test --locked` (MSRV) | `04a7f1e` (code = `bf58d75`) | rustc 1.85.1 | **PASS**: 283 passed, 0 failed | 00:21:03–00:23:04 | `evidence/msrv-bf58d75.txt` |
+| `cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` | `04a7f1e` (code = `bf58d75`) | rustc 1.99.1 | **PASS**: clean | 00:20:54 | `evidence/lint-bf58d75.txt` |
 
-## Review ordinal 15 findings
+## Review ordinal 16 findings
 
 | Finding | Outcome |
 |---|---|
-| 1. `live-integration.md` said every step leaves an entry no more exposed than before | It was overstated. Engine 5 moves `outbox-v2/` entries whatever their state, held ones included. The claim is now scoped to engines 4, 6, 7 and 8 in `live-integration.md`, README item 7 and the code comments (`0c31bc8`) |
-| 2. A Codex second approval could be missed for longer than 250 ms, and a brief one entirely | Confirmed, and fixed for every request that opens while a t3-watch connection is open: requests are counted from status notifications, which reach every connection without a resume. The case with nothing connected is an explicit FAIL (X3b) |
-| 3. macOS refuses a connect to a full backlog, so a queued connect proves nothing | Confirmed (backlog 1: one connect queued, then `ECONNREFUSED`). The lock decides: in the engine-5 (`9fcc2f8`) and engine-6 (`4caca1b`) sources, the daemon binds its socket lock at the start of `run()` and keeps it until return. New test: `a_hung_engine_5_daemon_with_a_full_backlog_is_found_by_its_lock` |
+| P1. A drain round took kept connections out of `PARKED`; a wait in that window opened a second connection, and `park` then replaced the counting one | Fixed (`bf58d75`). Rounds read kept connections in place under the lock, and `park` and `unpark` wait for the round; waiters are let through before the next round. `park` keeps the connection holding the counter. A kept connection without the counter takes it when it has events. Regression test `a_wait_that_starts_during_a_drain_round_keeps_the_counting_connection`: a test hook stretches rounds to 3 s back to back, so the wait starts inside one. On the old keeper code it fails 3 of 3 runs with a second connection opened; on `bf58d75` it passes |
+| P2. On a fresh counter a still-on flag is not recounted, so a replaced request is invisible | Fixed: a connection that takes the counter over counts a flag still on once more (an extra wake, never a missed one). Without the daemon each wait takes it over, so a still-open request gets a new key per `--no-daemon` process: documented, with bots told to use the daemon. A request opened and closed while nothing counts is an explicit limit (X3b). `thread/resume` is still never sent |
+| P2. Any "not supported yet" retried until `--timeout` | Fixed: only `list_turns is not supported yet` is retried, for 30 s, then the wait fails with exit 2 (test: 29 s to 120 s bound). Any other refusal fails at once |
+| P2. Any non-active status in a drain batch closed the keeper | Fixed: the batch's newest status decides. A batch that ends one turn and starts the next keeps the connection, and the new turn is counted from 1 (test: `a_drain_batch_that_ends_one_turn_and_starts_the_next_keeps_the_connection`, which fails on the old code) |
+| P3. Personal identifiers in `docs/native-sessions.md` | Fixed (`0fa3b58`) across the tracked tree: an account, two hostnames, a project path, a person's name, real thread and environment ids, and a bench file named after the host. The remaining hit is the copyright line in `LICENSE-MIT`. **Local commit messages** from earlier rounds still mention the research project and the MacBook's hostname: reword or squash them before publishing |
 
 ## Gates
 
-| # | Gate | Kind | Status | Evidence (all with the `312fc85` arm64 artifact unless noted) |
+| # | Gate | Kind | Status | Evidence (the `bf58d75` arm64 artifact unless noted) |
 |---|---|---|---|---|
-| T1 | The correct bot woken by a real completion webhook, and continuing | real, production | **BLOCKED (parent)** for 0.13.0 | Passed with engine 12 on the mini (parent-held, review ordinal 14, under 1 s; earlier watchId `c2366ae100a095fb`). Needs a rerun with this build: step 1 below |
-| T2 | A real `needs_input` notification, and the parent's continuation | real, production | **BLOCKED (parent)** | Mechanism shown by N3 and X2. Step 2 below |
-| T3 | Durable delivery through a controlled outage and a daemon restart | real, isolated | **PASS** | `e2e/durable.sh`, 23:18:41–23:19:49. The receiver was down: the client exited 4 with the event queued after 4 attempts. `t3-watch stop`; the entry was still listed with no daemon. Receiver up, daemon restarted: delivered with the same id `a2a305fd…` on attempt 5, 1.9 s later. `evidence/durable-312fc85.txt` |
+| T1 | The correct bot woken by a real completion webhook, and continuing | real, production | **BLOCKED (parent)** | Passed with engine 12 (parent-held, review ordinal 14); needs a rerun with this build (step 1) |
+| T2 | A real `needs_input` notification, and the parent's continuation | real, production | **BLOCKED (parent)** | Mechanism shown by N3 and X2 (step 2) |
+| T3 | Durable delivery through a controlled outage and a daemon restart | real, isolated | **PASS** | `e2e/durable.sh`, 00:12:52–00:14:01. With the receiver down, the client exited 4 with the event queued (4 attempts). After the daemon stop and restart, the receiver came up and the event was delivered on attempt 5 with the same id (`674e8017…`), 2.0 s later. `evidence/durable-bf58d75.txt` |
 | T3b | Durable replay to the **real** receiver, and the bot continuing | real, production | **BLOCKED (parent)** | Fixture: `e2e/acceptance/real-receiver-replay.sh` with `e2e/relay.py` (step 3) |
-| T4 | Crash recovery: SIGKILL of the daemon mid-delivery | real, isolated | **PASS** | Same run. The receiver held attempt 1 of `b5cf5a5f…` open; `kill -9` of the daemon; a client restarted a daemon. Delivered on attempt 4, same id, 1.8 s after the receiver answered again. It was delivered at least once: the receiver logged 3 unanswered attempts with that id, so receivers must deduplicate on `X-T3-Watch-Id` |
-| T5 | A real host suspend and resume, with awake and wall times | real | **BLOCKED (person)** | Not done: sleeping a shared host disrupts other work. Fixture: `e2e/acceptance/suspend.sh` (step 4). A host that sleeps sends nothing until it wakes: a completion during a sleep is reported late by the sleep, which can be hours on a laptop. Never promise instant notification from sleeping hardware |
-| T6 | Live local T3, read only | real | **PASS** | 23:19:59. The completed fixture thread `mcp:launch:7c9315ba…` through the local CLI: run 2 completed, directly (368 ms, watchId `3d0be7c6cf232ee7`) and through the daemon (315 ms, `05608fba8eee23b4`); `--until workstream` on local still exits 2. `evidence/live-local-312fc85.txt` |
-| T7 | Native Linux run of the latest archives and tests | real | **BLOCKED (no Linux host reachable from here)** | The Linux node on the tailnet refuses this host's SSH key. Archives, test package and `linux.sh` are ready (step 5). The last Linux execution is the parent's smoke of `910b684` |
+| T4 | Crash recovery: SIGKILL of the daemon mid-delivery | real, isolated | **PASS** | Same run. Attempt 1 of `2dbfbea4…` was held open, then `kill -9` of the daemon; a client restarted it. Delivered on attempt 4 with the same id, 1.8 s after the receiver answered again. Delivery is at least once: receivers deduplicate on `X-T3-Watch-Id` |
+| T5 | A real host suspend and resume, with awake and wall times | real | **BLOCKED (person)** | This host is shared and kept awake on purpose, and a VM suspend needs a macOS VM image (30 to 80 GB) against 3.5 GB free. Fixture: `e2e/acceptance/suspend.sh` (step 4). A sleeping host sends nothing until it wakes: a completion during a sleep is reported late by the sleep, which can be hours. Never promise instant notification from sleeping hardware |
+| T6 | Live local T3, read only | real | **PASS** | 00:14:09. A completed fixture thread through the local CLI: run 2 completed, directly (508 ms, watchId `c3d30eb98c1b154f`) and through the daemon (321 ms, `1a3d6df8bf36c61b`); `--until workstream` on local exits 2. `evidence/live-local-bf58d75.txt` |
+| T7 | Native Linux run of the latest archives and tests | real | **BLOCKED (no Linux host reachable)** | The tailnet's Linux node refuses this host's SSH key, and the other is offline. A local Linux VM needs a multi-GB image against 3.5 GB free (the host's rule is to keep 15 GB). Archives, test package and `linux.sh` are ready (step 5) |
 | N1 | Claude Code: synthetic hook events | synthetic | **PASS** | `tests/native.rs`, 11 tests |
-| N2 | Claude Code: real print session | real, isolated | **PASS** | Claude Code 2.1.312, earlier round (`docs/native-sessions.md`, check 2); print sessions also ran in N4 |
-| N3 | Claude Code: real interactive permission dialog | real, isolated | **PASS** | Disposable session `fee59b7e-eea0-4999-a083-b0a8087c4686`, 23:20:58–23:21:44. `needs_input` with its webhook (tool `Bash`); the dialog was rejected with Escape, never approved, and the command did not run. The hook log holds `at`, `event`, `type`, `tool` and `subagent` only, with no prompt or tool input. `evidence/claude-interactive-312fc85.txt`, `evidence/claude-hooklogs-312fc85/` |
-| N4 | Claude Code: same-session and `--resume` reuse wake pinned waits | real, isolated | **PASS (mechanism)**; the bot's continuation is **BLOCKED (parent)** | Same session, pinned to run 2 and acknowledging the relayed request: `settled` 1.03 s after the prompt. Print session `fee59b7e-…-4687`, then `--resume`: `settled` run 2, 1.04 s after the resume started |
-| X1 | Codex: mock app-server | synthetic | **PASS** | `tests/codex.rs`, 12 tests, including the three for finding 2 and the materialization retry |
-| X2 | Codex: real app-server, disposable threads | real, isolated | **PASS** | `e2e/native/codex/run.sh`, 23:18:33–23:20:41, thread `01a1bd74-d8ed-7f92-8fa7-fd0b05ce8710`: <ul><li>a fresh thread keeps waiting;</li><li>needs-input exit 5 and webhook, 671 ms after the approval request;</li><li>in the watcher and control windows alike, only the app-server's own log database changed;</li><li>the owner's request stayed its own;</li><li>completion;</li><li>pinned wake 1.0 s after `turn/completed`;</li><li>unload at 60 s while polled, then a read after unload.</li></ul> `evidence/codex-run-sh-312fc85.txt` |
-| X3 | Codex: two approvals in one turn | real, isolated | **PASS** | Same run. A wait that acknowledged request 1 woke for request 2 under its own key (`…-approval-2`) at model pauses of 3 s, 0.5 s and **0 s** (69 to 556 ms). Through the daemon, request 2 also opened **between two waits** and got its own key, at all three pauses |
-| X3b | Codex: a request that opens while nothing is connected | protocol limit | **FAIL (explicit)** | The app-server keeps no record of past requests. With no wait running and no daemon keeping a connection (`--no-daemon`, a stopped daemon, a dropped connection, more than 15 minutes), or during a handover between counting connections, such a request shares its predecessor's key, and an acknowledged wait wakes only at the turn's end. Stated as `tests/codex.rs::with_no_connection_open_a_request_in_between_is_not_seen`. Bots should use the daemon |
-| X4 | Codex: default socket through the official shared daemon | real, isolated | **PASS** | 23:27:06. `codex app-server daemon start` in an isolated `CODEX_HOME`; t3-watch with no socket override: completed run 1, pinned run 2 510 ms after `turn/completed`; daemon stopped; no LaunchAgent change. `evidence/codex-daemon-socket-312fc85.txt` |
-| X5 | Codex: the desktop thread on the MacBook, read only | real | **BLOCKED (MacBook not reachable from here)** | The MacBook on the tailnet refuses this host's SSH key. Desktop compatibility is **unverified**. Fixture: `e2e/native/codex/desktop-check.sh` with the universal binary (step 6) |
+| N3 | Claude Code: real interactive permission dialog | real, isolated | **PASS** | Disposable session `380d6aec-3587-4e45-8d52-189b72cd09f3`, 00:19:51–00:20:43. `needs_input` and its webhook arrived (tool `Bash`). The dialog was rejected with Escape and never approved, and the command did not run. The hook log holds `at`, `event`, `type`, `tool` and `subagent` only, with no prompt or tool input. `evidence/claude-interactive-bf58d75.txt` |
+| N4 | Claude Code: same-session and `--resume` reuse wake pinned waits | real, isolated | **PASS (mechanism)**; the bot's continuation is **BLOCKED (parent)** | Same session, pinned and acknowledging the relayed request: `settled` run 2, 1.04 s after the prompt. Print session `380d6aec-…-09f2` resumed: `settled` run 2, 4.1 s after the resume started |
+| X1 | Codex: mock app-server | synthetic | **PASS** | `tests/codex.rs`, 17 tests, including the five for review ordinal 16 |
+| X2 | Codex: real app-server, disposable threads | real, isolated | **PASS** | `e2e/native/codex/run.sh` at `04a7f1e`, 00:16:17–00:19:10, thread `01a1bda9-b753-7d90-bb81-17779e2432d2`: <ul><li>a fresh thread keeps waiting;</li><li>needs-input exit 5 and webhook, 913 ms after the approval request;</li><li>in the watcher and control windows alike, only the app-server's own log database changed;</li><li>the owner's request stayed its own;</li><li>completion;</li><li>pinned wake 1.0 s after `turn/completed`;</li><li>unload at 60 s while polled, then a read after unload.</li></ul> `evidence/codex-run-sh-bf58d75.txt` |
+| X3 | Codex: two approvals in one turn | real, isolated | **PASS** | Same run, at model pauses of 3 s, 0.5 s and 0 s: <ul><li>One wait, connected from request 1 on, woke for request 2 under its own key (`…-approval-2`, 47 to 579 ms after it opened).</li><li>Through the daemon, request 2 opened between two waits and got its own key.</li><li>**Keeper drain path:** with drain rounds stretched to 3 s by the test hook, the second wait started inside a round. It kept the same request (exit 3, one kept connection), and request 2, opened while no wait ran, reached the third wait as `approval-2`.</li><li>A second `--no-daemon` wait counted the still-open request 1 again (`approval-2`, as documented).</li></ul> |
+| X3b | Codex: a request opened and closed while nothing counts | protocol limit | **FAIL (explicit)** | The app-server keeps no record of past requests: one answered while no counting connection is open (`--no-daemon` between waits, a stopped daemon, a dropped connection, more than 15 minutes) leaves no trace. Its owner answered it, so nobody is left waiting, but it is not reported. Tests: `a_request_that_opens_and_closes_while_nothing_counts_is_never_seen`; and the replaced-request case, now counted again (`a_request_replaced_while_nothing_counts_is_counted_again`) |
+| X4 | Codex: default socket through the official shared daemon | real, isolated | **PASS** | 00:19:35. `codex app-server daemon start` in an isolated `CODEX_HOME`, with no socket override: completed run 1, then a pinned run 2 504 ms after `turn/completed`. The daemon was stopped, and no LaunchAgent changed. `evidence/codex-daemon-socket-bf58d75.txt` |
+| X5 | Codex: the desktop thread on the MacBook, read only | real | **BLOCKED (MacBook not reachable)** | The MacBook on the tailnet refuses this host's SSH key. Desktop compatibility is **unverified**. Fixture: `desktop-check.sh` with the universal binary (step 6) |
 | X6 | Codex: the bot reuses a thread and continues | real, production | **BLOCKED (parent)** | Step 7 |
 
 ## Not run, and why
 
-- `/concil`: no command, skill or plugin by that name exists. I checked
-  `~/.claude/commands`, `~/.claude/skills`, `~/.claude/plugins`,
-  `~/.agents/skills` and the project's `.claude`. A `council` skill
-  exists. It sends the work to three providers, and its default includes
-  GPT Sol, the review provider that must not be retried. So neither was
-  run. Independent review stays with the Cursor Grok thread.
+- `/concil`: no command, skill or plugin by that name exists. A `council`
+  skill exists, but its default panel includes the review provider that
+  must not be retried, so neither was run.
 - **The runtime on this host**, checked by names only, with no file
   contents read:
   - always on: the T3 server (a LaunchAgent);
   - not present: a t3-watch install, a running t3-watch daemon, a saved
-    machine pairing (`~/.config/t3-watch` holds only outbox directories),
-    and any webhook receiver or bot routine for t3-watch.
-  So the real receiver and its secret live with the parent, and T1, T2,
-  T3b and X6 run there.
+    machine pairing, and any webhook receiver or bot routine for t3-watch.
+  So T1, T2, T3b and X6 have to run where the parent holds the webhook URL
+  and secret.
 
 ## Steps for the parent or a person
 
-Each step uses the artifacts above and the scripts in `e2e/`, and needs
-the stated actor.
-
-1. **T1, completion (parent).** Use `t3-watch 0.13.0` on the watcher host
-   and a disposable T3 test thread. Run
-   `t3-watch wait --durable --notify-on all <thread URL>` with the bot's
-   webhook (`--webhook-url` and `--webhook-secret-env`). Record the bot's
+1. **T1, completion (parent).** Run `t3-watch 0.14.0` on the watcher host
+   with a disposable T3 test thread:
+   `t3-watch wait --durable --notify-on all <thread URL>`, with the bot's
+   webhook (`--webhook-url`, `--webhook-secret-env`). Record the bot's
    receipt and continuation with `e2e/timeline.py`
    (`docs/live-integration.md`, step 5).
 2. **T2, needs-input (parent).** The same, with a test thread told to ask
-   a question. Expect exit 5 and a `needs_input` event. Nobody answers
+   a question. Expect exit 5 and a `needs_input` event; nobody answers
    from the watcher. Record the bot relaying the question.
-3. **T3b, durable replay to the real receiver (parent).** On the watcher
-   host, run:
+3. **T3b, durable replay to the real receiver (parent).** Run:
 
    ```sh
    T3W_RELAY_TARGET=<webhook URL> T3W_SECRET=<secret> \
      sh e2e/acceptance/real-receiver-replay.sh <t3-watch> <thread URL>
    ```
 
-   The relay is a loopback process that starts down, so the outage covers
-   this watcher's path only. Make the test thread complete when the script
-   says so. Then record the bot's receipt and continuation.
+   The relay is a loopback process that starts down: an outage of this
+   watcher's path only. Complete the thread when the script says, then
+   record the bot's receipt and continuation.
 4. **T5, suspend (person, on a machine that may sleep).** Run
    `sh e2e/acceptance/suspend.sh <t3-watch> <thread URL> [webhook URL]`,
-   with the thread running on another machine. Sleep the machine and wake
-   it a few minutes later. The script prints the result's `suspendedMs`,
-   `elapsedAwakeMs` and `elapsedWallMs`, and the system's sleep and wake
-   lines, to compare with the webhook's arrival.
-5. **T7, Linux (anyone with a route to a Linux host, for example from the
-   MacBook).** Copy `dist/0.13.0/` there and run
-   `sh linux.sh <that dir> 312fc8519fd332e0c904d290a0f008605aa1e92d`. It
+   with the thread running elsewhere. Sleep the machine, then wake it a
+   few minutes later. Compare the printed `suspendedMs`, `elapsedAwakeMs`
+   and `elapsedWallMs`, and the system's sleep and wake lines, with the
+   webhook's arrival.
+5. **T7, Linux (anyone with a route to a Linux host).** Copy
+   `dist/0.14.0/` there and run
+   `sh linux.sh <that dir> bf58d758bb53ae0b838f79c1f78fdabe6248ddae`. It
    checks the hashes and `--version`, runs the 12 test binaries against
    the archive's binary, and runs `e2e/durable.sh`.
 6. **X5, the Codex desktop thread (person, on the MacBook as its user,
-   with the desktop app open).** Run
-   `sh desktop-check.sh <universal binary>`. It sends `initialize`,
-   `thread/read` and `thread/turns/list` only. It never starts a daemon,
-   resumes or prompts, and it keeps its state in a temporary home. If no
-   socket exists it reports BLOCKED. Starting `codex app-server daemon` is
-   then the user's decision.
+   with the desktop app open on the thread).** Run
+   `sh desktop-check.sh <universal binary> <thread id>`. It sends
+   `initialize`, `thread/read` and `thread/turns/list` only. It never
+   starts a daemon, resumes or prompts, and it keeps its state in a
+   temporary home. With no socket it reports BLOCKED, and starting
+   `codex app-server daemon` is then the user's decision.
 7. **N4 and X6, bot reuse (parent).** On a disposable Claude Code session
-   or Codex thread, the bot reads `runOrdinal`, waits with
-   `--expect-min-run-ordinal <that + 1>` (plus `--acknowledge` for a
-   request it already relayed) through the daemon, and continues.
+   or Codex thread, the bot reads `runOrdinal`, waits through the daemon
+   with `--expect-min-run-ordinal <that + 1>` (plus `--acknowledge` for a
+   request it already relayed), and continues.
 
 ## Before any public release
 
-- The docs name the maintainer's machines, accounts and local paths (this
-  file, `docs/native-sessions.md`, the README's live-check sections). Scrub
-  them before anything is published.
-- All BLOCKED gates above need evidence, and the work after review
-  ordinal 15 needs an independent review.
+- Reword or squash the local commit messages that name the research
+  project or the MacBook's hostname.
+- Every BLOCKED gate above needs evidence, and the commits after review
+  ordinal 16 need an independent review.
 
 ## Side effects of these runs
 
-- **Claude Code.** It recorded folder-trust answers for
-  `/private/tmp/t3wcc*/proj` in `~/.claude.json` and the test prompts in
-  `~/.claude/history.jsonl`; neither file was edited by hand. The sessions'
-  `~/.claude/projects/-private-tmp-t3wcc*-proj` and
-  `~/.claude/session-env/<id>` entries were removed.
+- **Claude Code.** It recorded folder-trust answers for the disposable
+  `/private/tmp/t3wcc*/proj` folders in `~/.claude.json` and the test
+  prompts in `~/.claude/history.jsonl`; neither file was edited by hand.
+  The sessions' `~/.claude/projects` and `~/.claude/session-env` entries
+  were removed.
 - **Codex.** Every app-server, daemon and mock started here was stopped.
-  Their fixtures, and their sockets under `/private/tmp/codex-daemon-501/`,
-  were removed. `~/.codex` was not used.
-- **A stray process.** A mock left running by an earlier probe in this
-  round answered one harness run on its port with other settings, and made
-  the owner's turn look stuck. It was found and stopped, and `run.sh` now
-  refuses to start when the port is taken. That run used a working-tree
-  build and is not counted.
-- **Superseded runs.** `dist/0.13.0/superseded/` holds the runs with the
-  `08d4b24` build. Its Codex run hit the materialization race (exit 2 at
-  needs-input), which `312fc85` fixes. They are kept for the record and
-  not counted.
+  Their fixtures and sockets were removed. `~/.codex` was not used, and
+  no real thread was read or touched.
