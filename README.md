@@ -699,7 +699,7 @@ neither counts as supported until its own acceptance checks pass.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e16.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e17.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -725,15 +725,16 @@ neither counts as supported until its own acceptance checks pass.
   `outbox-legacy-checked-convert`, `outbox-legacy-ack`,
   `native-claude-code-hooks`, `native-claude-code-requests`,
   `native-codex-app-server`, `native-codex-notifications`,
-  `native-codex-kept-counter`, `suspend-aware`,
+  `native-codex-kept-counter`, `linux-io-hardening`, `suspend-aware`,
   `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 16 (this build) does not reach engine-15 daemons
-  (`0.13.0`, socket `daemon-e15.sock`), engine-14 ones (`0.12.0`,
+  `t3-watch stop`. Engine 17 (this build) does not reach engine-16 daemons
+  (`0.14.0`, socket `daemon-e16.sock`), engine-15 ones (`0.13.0`,
+  `daemon-e15.sock`), engine-14 ones (`0.12.0`,
   `daemon-e14.sock`), engine-13 ones (`0.11.0`,
   `daemon-e13.sock`), engine-12 ones (`0.10.0`,
   `daemon-e12.sock`), engine-11 ones (`0.9.0`,
@@ -1145,11 +1146,18 @@ their latest runs, each gate's status and the steps that need a person.
   revoked, `wait` exits 2 (after rereading machines.json) and you pair again.
   Servers that do issue refresh tokens are refreshed automatically.
 - Windows is not supported (Unix sockets, `setsid`).
-- Linux is covered by CI (not yet run, since the branch is unpushed) and by
-  cross-builds on macOS with zig as the C compiler and linker: x86_64 and
-  aarch64 `-unknown-linux-gnu` binaries need glibc 2.17 at most, and clippy
-  and the test binaries build for Linux. They have not been executed on Linux
-  from this machine.
+- Linux binaries are cross-built on macOS with zig as the C compiler and
+  linker (x86_64 and aarch64 `-unknown-linux-gnu`, glibc 2.17 at most),
+  together with the test binaries, which `e2e/acceptance/linux.sh` runs
+  natively. The first native run (0.14.0, on Debian with glibc 2.41) failed
+  six tests across five test binaries. 0.15.0 fixes them: three in t3-watch
+  itself (the connect to a hung daemon, the Codex pong, a busy `t3`
+  binary) and three in the tests. It has not been run on Linux yet. CI
+  (`.github/workflows/ci.yml`) has not run, since the branch is unpushed.
+- A daemon that holds its socket but does not take a connection within
+  5 s (hung, with a full backlog) makes `wait`, `status` and `stop` fail
+  with an error naming it (exit 2), on Linux as on macOS, instead of
+  waiting for it. `t3-watch wait --no-daemon` works without it.
 - Without `--durable`, a notification still being delivered when the
   waiting process is killed is lost. With it, delivery is at least once:
   receivers must deduplicate on `X-T3-Watch-Id` / `Idempotency-Key`. After a

@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 16;
+pub const ENGINE: u32 = 17;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -65,6 +65,11 @@ pub const CAPABILITIES: &[&str] = &[
     // flag still on once more; a batch's newest status decides a turn's end;
     // "list_turns is not supported yet" is retried for 30 s, then fails.
     "native-codex-kept-counter",
+    // From the first native Linux run: a daemon never blocks connecting to a
+    // hung daemon's full backlog, a Codex pong that cannot be written does
+    // not discard the answer already read, and a `t3` binary briefly open
+    // for writing (ETXTBSY) is run again rather than losing the poll.
+    "linux-io-hardening",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",
