@@ -705,7 +705,7 @@ neither counts as supported until its own acceptance checks pass.
 
 ```
  agent A ─┐                                   ┌─ t3_thread_wait (long-poll) ─┐
- agent B ─┼─ t3-watch wait ─▶ daemon-e18.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
+ agent B ─┼─ t3-watch wait ─▶ daemon-e19.sock ▶ hub ┤   then t3_thread_read     ├─▶ relay /mcp
  agent C ─┘   (thin client,     (0600)          │  one worker per thread,     │   (one Mcp-Session-Id
                blocks in read)                  │  shared by all subscribers  │    per machine)
                                                 └─ t3 thread show every N s ──┴─▶ local t3 CLI
@@ -732,14 +732,16 @@ neither counts as supported until its own acceptance checks pass.
   `native-claude-code-hooks`, `native-claude-code-requests`,
   `native-codex-app-server`, `native-codex-notifications`,
   `native-codex-kept-counter`, `linux-io-hardening`,
-  `native-codex-hook-log`, `suspend-aware`, `suspend-invalidation`) in that
+  `native-codex-hook-log`, `native-codex-hook-cursor`, `suspend-aware`,
+  `suspend-invalidation`) in that
   line,
   so a daemon that kept an engine number but lacks a behavior is refused
   too. The daemon likewise refuses a request from another revision
   (`incompatible_client`). An old daemon idles out on its own once its
   clients and its own outbox are done; stop it sooner with its own binary's
-  `t3-watch stop`. Engine 18 (this build) does not reach engine-17 daemons
-  (`0.15.0`, socket `daemon-e17.sock`), engine-16 ones (`0.14.0`,
+  `t3-watch stop`. Engine 19 (this build) does not reach engine-18 daemons
+  (`0.16.0`, socket `daemon-e18.sock`), engine-17 ones (`0.15.0`,
+  `daemon-e17.sock`), engine-16 ones (`0.14.0`,
   `daemon-e16.sock`), engine-15 ones (`0.13.0`,
   `daemon-e15.sock`), engine-14 ones (`0.12.0`,
   `daemon-e14.sock`), engine-13 ones (`0.11.0`,
@@ -1160,7 +1162,7 @@ their latest runs, each gate's status and the steps that need a person.
   six tests across five test binaries. 0.15.0 fixes them: three in t3-watch
   itself (the connect to a hung daemon, the Codex pong, a busy `t3`
   binary) and three in the tests; 0.15.0 passed its native run (gate T7 in
-  `docs/acceptance-manifest.md`). 0.16.0 has not been run on Linux yet. CI
+  `docs/acceptance-manifest.md`). 0.16.1 has not been run on Linux yet. CI
   (`.github/workflows/ci.yml`) has not run, since the branch is unpushed.
 - A daemon that holds its socket but does not take a connection within
   5 s (hung, with a full backlog) makes `wait`, `status` and `stop` fail

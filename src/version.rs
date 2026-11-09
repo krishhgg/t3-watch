@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ENGINE: u32 = 18;
+pub const ENGINE: u32 = 19;
 pub const CAPABILITIES: &[&str] = &[
     // Outbox entries leave only with a written receipt; absence is never
     // delivery, a valid receipt is never overwritten, and one without the
@@ -76,6 +76,10 @@ pub const CAPABILITIES: &[&str] = &[
     // `requests_recovered` progress event), and one that replaced the
     // request counted before is told apart from it.
     "native-codex-hook-log",
+    // The hook log is reread without losing or repeating a record when it
+    // is replaced, truncated or deleted; a record that lands late still
+    // matches its live count; logs are kept 0600.
+    "native-codex-hook-cursor",
     // Deadlines count suspended time; stalled polls restart on resume, and
     // answers or observations from before a resume are discarded.
     "suspend-aware",
