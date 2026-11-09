@@ -982,7 +982,7 @@ mod tests {
             assert!(!out.contains(secret), "{input:?} -> {out:?}");
             assert!(out.contains("[redacted]"), "{input:?} -> {out:?}");
         }
-        let plain = "Should I merge PR #3055 into main (Recommended)? Path /Users/krish/.t3/worktrees/x";
+        let plain = "Should I merge PR #3055 into main (Recommended)? Path /Users/someone/.t3/worktrees/x";
         assert_eq!(redact_secrets(plain), plain);
         assert_eq!(safe_text("a\nb\u{0}  c — é", 100), "a b c — é");
         assert_eq!(safe_text("abcdef", 4), "abc…");

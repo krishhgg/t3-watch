@@ -892,7 +892,7 @@ plain shell hooks.
 
 ## Benchmarks
 
-All numbers below are from one run on this Mac mini, recorded in the raw
+All numbers below are from one run on the maintainer's Mac mini, recorded in the raw
 results file. Nothing is estimated. The Python baseline is
 [`bench/baseline_python_watcher.py`](bench/baseline_python_watcher.py), the
 polling watcher t3-watch replaces, copied unchanged.
@@ -924,8 +924,8 @@ exactly 1 `initialize`, 1 `t3_thread_wait` and 1 `t3_thread_read` upstream
 (plus, since turn mode reports pending delegated work, one non-blocking
 delegated-work probe).
 
-Measured on `krishs-mini.local` (Apple M6, macOS 27.0.1), rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.9.6, T3 `0.1.7-nightly.20261102.4066`, on 2026-11-06.
-Raw results: [`bench/results/krishs-mini-2026-11-06.json`](bench/results/krishs-mini-2026-11-06.json). Reproduce with `bench/run.py`.
+Measured on the maintainer's Mac mini (Apple M6, macOS 27.0.1), rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.9.6, T3 `0.1.7-nightly.20261102.4066`, on 2026-11-06.
+Raw results: [`bench/results/mac-mini-2026-11-06.json`](bench/results/mac-mini-2026-11-06.json). Reproduce with `bench/run.py`.
 
 ### Size and startup
 
@@ -969,7 +969,7 @@ Both tools poll the local `t3` CLI every 8 s (the Python watcher's default) and 
 
 Each of the 20 t3-watch clients reported 0.00 s of CPU for the whole window, which is below the 10 ms resolution of `/usr/bin/time`. All of t3-watch's CPU time is the daemon and the `t3` processes it ran. The watched thread was still `running` at the end, and every watcher timed out rather than settling, so both tools did the same job.
 
-### Checked against the live T3 server on this Mac mini (completion-contract build)
+### Checked against the live T3 server on the maintainer's Mac mini (completion-contract build)
 
 - `e2e/live.sh` (below), 37 checks, all passed on 2026-11-06 (Pacific) against T3
   `0.1.7-nightly.20261102.4066`: completion with `outcome`, stale ordinals and
@@ -996,7 +996,7 @@ Each of the 20 t3-watch clients reported 0.00 s of CPU for the whole window, whi
 See [docs/live-integration.md](docs/live-integration.md) for the supported
 plan against paired machines and real bots.
 
-### Checked against the live T3 server on this Mac mini (earlier build)
+### Checked against the live T3 server on the maintainer's Mac mini (earlier build)
 
 - Local transport, read-only `t3 thread show`: a completed thread settles in
   about 0.31 s, a stale `ordinal:1` with `--expect-min-run-ordinal 2` keeps
@@ -1134,7 +1134,7 @@ their latest runs, each gate's status and the steps that need a person.
   answers was not observed live (no child was blocked on a question while
   this was built); unknown shapes give the request id without its text.
 - The local transport costs one `t3 thread show` per watched thread per
-  interval, about 0.4 s of CPU on this Mac mini. For many local threads, the
+  interval, about 0.4 s of CPU on the maintainer's Mac mini. For many local threads, the
   local server's own MCP endpoint should give long-polling instead
   (`t3-watch auth login http://127.0.0.1:3773`). Its OAuth discovery answers
   correctly, but that login needs a browser approval and was not run end to

@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn relay_url_picks_machine_and_env() {
         let t = resolve_target(
-            "https://prod-1.t3coderelay.com/b60c6dd8/mcp%3Alaunch%3Aabc",
+            "https://prod-1.t3coderelay.com/0e1f2a3b/mcp%3Alaunch%3Aabc",
             &defaults(),
             &cfg(),
         )
@@ -1218,7 +1218,7 @@ mod tests {
         assert_eq!(t.machine, "relay");
         assert_eq!(t.transport, Transport::Mcp);
         assert_eq!(t.thread_id, "mcp:launch:abc");
-        assert_eq!(t.environment_id.as_deref(), Some("b60c6dd8"));
+        assert_eq!(t.environment_id.as_deref(), Some("0e1f2a3b"));
     }
 
     #[test]

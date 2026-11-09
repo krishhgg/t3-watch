@@ -3,7 +3,7 @@
 # docs/acceptance-manifest.md). Run it on the Mac that has the thread, as
 # its user, while the desktop app has the thread open.
 #
-#   e2e/native/codex/desktop-check.sh <t3-watch> [thread id]
+#   e2e/native/codex/desktop-check.sh <t3-watch> <thread id>
 #
 # It starts nothing and changes nothing in Codex: no daemon start, no
 # thread/resume, no prompt. t3-watch sends initialize, thread/read and
@@ -12,7 +12,7 @@
 # stops: reaching the thread then needs `codex app-server daemon start`,
 # which is a change on that Mac for its user to approve.
 set -u
-BIN=$1; TID=${2:-01a1b891-e945-7f70-b755-db5ece6dcaff}
+BIN=$1; TID=${2:?give the thread id (the part after codex://threads/)}
 CH=${CODEX_HOME:-$HOME/.codex}
 SOCK=${T3_WATCH_CODEX_SOCKET:-$CH/app-server-control/app-server-control.sock}
 echo "host $(hostname) user $(whoami) $(uname -sm); $(date -u +%FT%TZ)"

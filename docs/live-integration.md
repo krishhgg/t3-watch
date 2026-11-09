@@ -77,7 +77,7 @@ This checks completion, stale ordinals, `--after-run`, the local refusal of
 cancellation and resource accounting, signed webhooks with Authorization and
 Idempotency-Key, a webhook the receiver rejects (401, exit 4), heartbeats, a
 durable delivery that succeeds after the receiver comes back, hook output
-going to `hooks.log`, and strict OAuth discovery. Result on the Mac mini
+going to `hooks.log`, and strict OAuth discovery. Result on the maintainer's Mac mini
 (2026-11-06 Pacific, after the ordinal-3 review fixes): all 37 checks passed.
 
 `e2e/receiver.py` is an audit fixture: it answers 200 only to correctly
@@ -89,12 +89,12 @@ an event or acted on it (step 4).
 
 ```sh
 t3-watch auth oauth-start https://prod-05055d8a66f766cb.t3coderelay.com --name mini
-#   open authorizeUrl, approve as Krish, copy the URL of the page that fails to load
+#   open authorizeUrl, approve as the user, copy the URL of the page that fails to load
 t3-watch auth oauth-finish 'http://127.0.0.1:8976/callback?code=...&state=...'
 t3-watch auth list    # shows the machine, never the token
 ```
 
-Repeat for the G14 relay origin with `--name g14`. The token has
+Repeat for the second machine's relay origin with `--name <second machine>`. The token has
 `orchestration:read` only.
 
 ## 3. MCP checks against live threads (read-only)
@@ -109,13 +109,13 @@ a. A single turn, turn mode (the default). Expect exit 0, `outcome`
    t3-watch wait '<relay>/<envId>/<completed thread>' --timeout 2m --pretty
    ```
 
-b. A thread blocked on input, such as the G14 thread at ordinal 25 with two
+b. A thread blocked on input, such as a test thread with two
    questions. Expect exit 5, `event: needs_input`, `requests[]` with
    `kind: question`, `requestId`, the two questions (redacted), and a
-   `pendingKey`. Do not answer; Krish has the card.
+   `pendingKey`. Do not answer; the user has the card.
 
    ```sh
-   t3-watch wait '<g14 relay>/<g14 envId>/mcp%3Alaunch%3A67e4871ff4ee1351ebc1238952799f2667134fa348528f10ee0d9f1120f70cd3' \
+   t3-watch wait '<second relay>/<second envId>/mcp%3Alaunch%3A<thread id>' \
      --until workstream --timeout 5m --pretty
    ```
 

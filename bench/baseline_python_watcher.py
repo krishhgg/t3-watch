@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deterministic local T3 thread watcher on Mac mini / MacBook.
+Deterministic local T3 thread watcher on macOS.
 Polls local `t3 thread show --messages 0 --json` cheaply with zero AI usage
 and exits 0 once watched thread(s) leave active statuses, waking Grok Bot via
 background-Shell completion.

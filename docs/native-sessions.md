@@ -42,13 +42,13 @@ adapter is "supported" until its acceptance checks below have passed.
 
 ### The concrete Codex target
 
-`codex://threads/01a1b891-e945-7f70-b755-db5ece6dcaff` lives on
-`MacBook-Pro-724` (user `krishgarg`), in the project
-`/Users/krishgarg/Documents/socials/market-research-kit`. It is a read-only
-target: no prompts are sent to it, its files are never modified, and it is
-not used as a fixture. The Mac mini does not have that project, and nothing
-is migrated or duplicated to it. Checking it at all needs access to the
-MacBook, which the parent controls (see "Checking the desktop target on the MacBook").
+A real thread in the Codex desktop app on the maintainer's MacBook is the
+concrete target. Its id, machine, account and project are not recorded
+here. It is a read-only target: no prompt is sent to it, it is never
+resumed, its files are never modified, and it is not used as a fixture.
+Nothing is migrated or copied from it to another machine. Checking it at
+all needs access to that MacBook (see "Checking the desktop target on the
+MacBook").
 
 ## Claude Code adapter
 
@@ -133,7 +133,7 @@ Escape, which leaves the request open until the bot's next prompt.
    needs-input, answered, cancelled; the hook never blocks, never prints,
    never stores prompt text; webhook delivery, with and without the
    daemon (`tests/native.rs`).
-2. **Passed** on the Mac mini with Claude Code 2.1.312. A real Claude Code
+2. **Passed** on the maintainer's Mac mini with Claude Code 2.1.312. A real Claude Code
    process ran in an isolated temporary project, in print mode, with
    `--setting-sources local --settings <the hooks only> --tools ""
    --strict-mcp-config --no-session-persistence --session-id <uuid>`, so
@@ -146,7 +146,7 @@ Escape, which leaves the request open until the bot's next prompt.
    entry under `~/.claude/projects` for the temporary path (removed
    afterwards). It may also list that path in `~/.claude.json`, which was
    not edited.
-3. **Passed** on the Mac mini with Claude Code 2.1.319, in a disposable
+3. **Passed** on the maintainer's Mac mini with Claude Code 2.1.319, in a disposable
    interactive session on a pseudo-terminal (temporary project,
    `--setting-sources local --settings <the hooks only> --strict-mcp-config
    --model haiku --tools Bash --permission-mode manual`). The prompt asked
@@ -247,7 +247,7 @@ current `runOrdinal`, starts its turn, and waits with
 with an error (exit 2). An unreachable socket is retried until the
 timeout, with the reason in `upstream.lastError`.
 
-### Verified (codex-cli 0.166.0 on the Mac mini)
+### Verified (codex-cli 0.166.0 on the maintainer's Mac mini)
 
 These checks used disposable threads on a real `codex app-server --listen
 unix://…`, in an isolated `CODEX_HOME` whose model provider was a local mock
@@ -343,10 +343,11 @@ the questions that gated the implementation:
 The target stays read-only (see "The concrete Codex target"). Checking it
 needs, under the parent's control:
 
-- On that MacBook, as `krishgarg`: `codex --version`; whether
-  `~/.codex/app-server-control/app-server-control.sock` exists while the
-  desktop app has the thread open; then
-  `t3-watch wait --no-daemon --timeout 5s codex://threads/01a1b891-e945-7f70-b755-db5ece6dcaff`,
+- On that MacBook, as its user, with the desktop app open on the thread:
+  `sh e2e/native/codex/desktop-check.sh <t3-watch> <thread id>`. It shows
+  `codex --version`, whether
+  `~/.codex/app-server-control/app-server-control.sock` exists, and runs
+  `t3-watch wait --no-daemon --timeout 5s codex://threads/<thread id>`,
   which sends `initialize`, `thread/read` and `thread/turns/list` only. If
   no socket exists, the desktop app runs its threads in a private
   app-server. Starting `codex app-server daemon` would then be a change

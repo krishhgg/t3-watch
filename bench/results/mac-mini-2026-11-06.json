@@ -1,5 +1,5 @@
 {
-  "host": "krishs-mini.local",
+  "host": "the maintainer's Mac mini",
   "machine": "Apple M6",
   "os": "macOS 27.0.1",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",

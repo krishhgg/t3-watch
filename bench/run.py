@@ -283,7 +283,7 @@ def main():
         sys.exit("--thread must be active for the whole run (status now: %s)" % status_before)
 
     res = {
-        "host": platform.node(),
+        "host": os.environ.get("T3W_BENCH_HOST", "unnamed host"),
         "machine": run(["sysctl", "-n", "machdep.cpu.brand_string"]).stdout.strip() or platform.machine(),
         "os": ("macOS " + platform.mac_ver()[0]) if platform.mac_ver()[0] else "%s %s" % (platform.system(), platform.release()),
         "rustc": run(["rustc", "--version"]).stdout.strip(),
