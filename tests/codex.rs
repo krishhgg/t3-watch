@@ -171,6 +171,23 @@ fn hook_log(env: &Env) -> PathBuf {
         .join(format!("{T}.requests.jsonl"))
 }
 
+/// A hook log line as `t3-watch hook codex` writes it.
+fn record_line(turn: &str, at: u64) -> String {
+    json!({ "atMs": at, "event": "PermissionRequest", "tool": "Bash", "turn": turn }).to_string() + "\n"
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn append(path: &std::path::Path, text: &str) {
+    let mut f = fs::OpenOptions::new().append(true).create(true).open(path).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
 fn wait(env: &Env, cx: &MockCodex, args: &[&str]) -> std::process::Command {
     let mut all = vec!["wait"];
     all.extend_from_slice(args);
@@ -1166,6 +1183,146 @@ fn a_trusted_hook_that_records_nothing_does_not_hide_a_replaced_request() {
 }
 
 #[test]
+fn a_replaced_truncated_or_deleted_hook_log_loses_and_repeats_nothing() {
+    // Review ordinal 21: a log shorter than the saved offset was read again
+    // from its start, but the old count of records already read then
+    // skipped the new ones, so later missed requests were never reported.
+    // Each step below is a new --no-daemon process: across restarts too, a
+    // record is reported once.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    cx.install_hook(&env, "trusted");
+    let t = target();
+    let busy = json!({ "type": "active", "activeFlags": [] });
+    cx.set(busy.clone(), &[("turn-1", "inProgress")]);
+    let log = hook_log(&env);
+    // The recovered requests' numbers, and how many this wait announced.
+    let run = || {
+        let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1200ms", &t])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+        let v = output_json(&out);
+        let ids: Vec<String> = v["threads"][0]["recoveredRequests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                r["id"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("codex-turn-1-approval-")
+                    .to_string()
+            })
+            .collect();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let announced: usize = err
+            .lines()
+            .filter_map(|l| l.strip_prefix("t3-watch: progress "))
+            .map(|p| {
+                serde_json::from_str::<Value>(p).unwrap()["recovered"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        (ids.join(","), announced)
+    };
+    let unseen = || {
+        cx.push(json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }));
+        hook(&env, "turn-1");
+        cx.push(busy.clone());
+    };
+    assert_eq!(run(), (String::new(), 0));
+    // An earlier turn's record first, so this turn's records start past
+    // byte 0.
+    append(&log, &record_line("turn-0", now_ms()));
+    unseen();
+    assert_eq!(run(), ("1".into(), 1));
+    // Truncated to nothing, then the next request writes a shorter log.
+    fs::write(&log, "").unwrap();
+    assert_eq!(run(), ("1".into(), 0));
+    unseen();
+    assert_eq!(run(), ("1,2".into(), 1));
+    // Truncated and grown past the cursor before anything read it.
+    fs::write(&log, "").unwrap();
+    append(&log, &record_line("turn-0", 1));
+    append(&log, &record_line("turn-0", 2));
+    unseen();
+    assert_eq!(run(), ("1,2,3".into(), 1));
+    // Deleted, then created again by the next request's hook.
+    fs::remove_file(&log).unwrap();
+    assert_eq!(run(), ("1,2,3".into(), 0));
+    unseen();
+    assert_eq!(run(), ("1,2,3,4".into(), 1));
+    // Replaced by another file holding a record already read and a new one.
+    let mut copy = fs::read_to_string(&log).unwrap();
+    copy.push_str(&record_line("turn-1", now_ms()));
+    let tmp = log.with_extension("new");
+    fs::write(&tmp, copy).unwrap();
+    fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    fs::rename(&tmp, &log).unwrap();
+    assert_eq!(run(), ("1,2,3,4,5".into(), 1));
+    // A last line still being written is left until it is complete.
+    let line = record_line("turn-1", now_ms());
+    let (head, tail) = line.split_at(line.len() / 2);
+    append(&log, head);
+    assert_eq!(run(), ("1,2,3,4,5".into(), 0));
+    append(&log, tail);
+    assert_eq!(run(), ("1,2,3,4,5,6".into(), 1));
+    assert_eq!(run(), ("1,2,3,4,5,6".into(), 0));
+    assert_read_only(&cx);
+}
+
+#[test]
+fn a_hook_record_that_lands_long_after_its_count_is_still_that_request() {
+    // Review ordinal 21: Codex runs a session's background hooks eight at a
+    // time, so a record can land long after its request was counted. It
+    // used to be matched only within 60 s; later, it looked like a new
+    // request that had replaced the counted one: an extra wake. It is the
+    // same request, and nothing is reported as recovered.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    cx.install_hook(&env, "trusted");
+    let t = target();
+    cx.set(
+        json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }),
+        &[("turn-1", "inProgress")],
+    );
+    let out = wait(&env, &cx, &["--timeout", "5s", &t]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.wait_status("the connection kept", Duration::from_secs(5), |s| s["codexKept"] == 1);
+    // Its record, written two minutes after the count.
+    append(&hook_log(&env), &record_line("turn-1", now_ms() + 120_000));
+    let rx = MockHook::start();
+    let out = wait(
+        &env,
+        &cx,
+        &[
+            "--timeout",
+            "1500ms",
+            "--acknowledge",
+            &first,
+            "--webhook-url",
+            &rx.url,
+            &t,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    assert!(v["threads"][0]["recoveredRequests"].is_null(), "{v}");
+    assert!(rx.requests().is_empty(), "nothing was recovered");
+    assert_read_only(&cx);
+    env.run(&["stop"]);
+}
+
+#[test]
 fn the_codex_hook_records_metadata_only_and_never_decides() {
     let env = Env::new();
     hook(&env, "turn-1");
@@ -1193,6 +1350,11 @@ fn the_codex_hook_records_metadata_only_and_never_decides() {
     }
     assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
     assert!(!env.home.join("native").join("escape.requests.jsonl").exists());
+    // A log someone opened up is made private again by the next record.
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    hook(&env, "turn-1");
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
     // The block to install: async, recording into this state directory.
     let out = env.run(&["hook", "codex", "--print-settings"]);
     assert!(out.status.success());

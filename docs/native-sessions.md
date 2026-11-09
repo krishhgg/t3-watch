@@ -307,13 +307,29 @@ time, the event name, the turn id and the tool name (`Bash`,
 working directory, the transcript path and the model are never written.
 Other events are ignored.
 
-The connection that counts reads the log from the latest turn's first
-record (a byte offset kept in `<thread>.json`, so a read covers only the
-current turn) and matches each record, newest first, to a request it
-counted live: one counted after its own previous count (any time for a
-connection that has just taken the counter) and at most 60 s before the
-record lands. A record no live count matches opened while nothing
-counted:
+The connection that counts reads the log from where it stopped (a
+cursor kept in `<thread>.json`: the file's device and inode, a byte offset
+at the latest turn's first record, the time of the record there, and the
+newest record time already read), so a read covers only the current turn.
+While the log is the same file holding the same record at the cursor, the
+read goes on from there; a last line without its newline is left for the
+next read. Anything else (another file at that path, a file shorter than
+the cursor, a different record at the cursor, or no file) means the log
+was replaced, truncated or deleted: the next read takes the whole file,
+and only records newer than every one already read are new. So no record
+is lost or reported twice, also across restarts.
+
+Each new record is matched, newest first, to a request counted live whose
+request opened before the record was written: one counted after the same
+connection's previous count (any time for a connection that has just
+taken the counter). There is no time limit: Codex runs a session's
+background hooks eight at a time, so a record can land long after its
+request was counted, and it still finds its count. A count waits for its
+record until a request counted after it has had its record for 15 s; then
+it is taken to have no hook and given up. Codex starts a session's
+background hooks in order and stops each after its `timeout` (10 s in the
+printed block), so an earlier request's record has landed by then if it
+ever will. A record no live count matches opened while nothing counted:
 
 - if it is the newest record and the thread waits on an approval now, it
   is the open request, which replaced the one counted before: it gets the
@@ -428,13 +444,29 @@ the questions that gated the implementation:
     is then counted once more, as without the hook (an extra wake, never a
     missed one), but one that opened and closed unseen is lost;
   - subagent threads: Codex passes the parent's `session_id` to their
-    hooks, so their records go to the parent's log; this was not run.
+    hooks, so their records go to the parent's log; this was not run;
+  - a count that never gets a record (an approval without the hook, or
+    one counted before the hook was installed) can take the record of one
+    later request of the same turn that opened and closed unseen, until a
+    request counted after it has had its record for 15 s or the turn
+    ends. That request is then not reported.
+- Matching relies on Codex starting a session's background hooks in the
+  order it queued them, and on the printed `timeout = 10`. A record that
+  lands more than 15 s after the record of a request counted after it
+  (hooks run out of order, or a raised timeout) is reported as recovered
+  although its request was seen: a spurious `requests_recovered`, and,
+  while the thread waits, a new number for the open request (an extra
+  wake). No such ordering was seen here.
+- After the log is replaced, a record not newer than the newest one
+  already read is taken as a copy of it. A new record with an older time
+  (the clock stepped back between the two) is then not reported.
 - A request that another `PermissionRequest` hook allowed or denied never
   reached a person, but it was recorded and is reported as recovered.
 - Recovered requests take the next free number when they are found, so
   numbers follow discovery, not opening order; `openedAt` gives the order.
 - The log grows by about 110 bytes per approval request and is not
-  pruned.
+  pruned. Opening it (like every t3-watch log) sets it back to 0600 if
+  its mode was widened.
 - A request still open when a connection takes the count over is
   reported, without the hook possibly as an extra wake for one already
   relayed (see "Requests are numbered"). Bots that relay requests should
@@ -458,9 +490,13 @@ the questions that gated the implementation:
    (not seen); with the hook, one opened and closed while nothing counts
    (recovered, reported once as progress and by webhook, with and without
    the daemon), live counts matched to records that land before or after
-   them (nothing recovered), a replaced request counted once, and a
-   trusted hook that records nothing (counted again); the hook records
-   metadata only and never prints; the materializing refusal retried for
+   them (nothing recovered), a record that lands two minutes after its
+   count (the same request), a log truncated, truncated and regrown,
+   deleted and recreated, replaced by a copy, or with a last line half
+   written (each record reported once, across restarts), a replaced
+   request counted once, and a trusted hook that records nothing (counted
+   again); the hook records metadata only, never prints, and makes a
+   widened log 0600 again; the materializing refusal retried for
    30 s; unknown thread; no app-server; refused T3 contracts.
 2. **Passed.** Real codex-cli 0.166.0 app-server with disposable threads,
    the probes above (fresh thread, needs-input with webhook, no changes,

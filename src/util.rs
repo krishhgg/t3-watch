@@ -518,8 +518,10 @@ pub fn without_secrets(arg: &str) -> String {
 
 /// Opens a log file for appending without ever blocking: `O_NONBLOCK` (a
 /// FIFO without a reader fails at once instead of waiting), `O_NOFOLLOW`,
-/// created 0600, and refused unless what was opened is a regular file owned
-/// by us. Logs are best effort: an error here must only lose log lines.
+/// created 0600, refused unless what was opened is a regular file owned by
+/// us, and an existing one with group or other access set back to 0600, as
+/// `open_lock_file` does. Logs are best effort: an error here must only lose
+/// log lines.
 pub fn open_log(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         ensure_private_dir(parent)?;
@@ -536,6 +538,9 @@ pub fn open_log(path: &Path) -> io::Result<File> {
             "{} is not a regular file owned by you",
             path.display()
         )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(f)
 }
@@ -997,6 +1002,19 @@ mod tests {
         assert!(open_log(&fifo).is_err(), "a FIFO must be refused");
         assert!(started.elapsed() < Duration::from_secs(1), "opening must not block");
         assert!(open_log(&d.join("ok.log")).is_ok());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn an_existing_log_with_wider_access_is_made_private() {
+        let d = tmpdir("logmode");
+        let p = d.join("wide.log");
+        fs::write(&p, b"kept\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut f = open_log(&p).unwrap();
+        f.write_all(b"appended\n").unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "kept\nappended\n");
         fs::remove_dir_all(d).unwrap();
     }
 

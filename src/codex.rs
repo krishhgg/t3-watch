@@ -34,6 +34,7 @@ use crate::model::{RecoveredRequest, ThreadState};
 use crate::util;
 use serde_json::{json, Value};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,9 +59,14 @@ const HOOKS_RECHECK: Duration = Duration::from_secs(60);
 const MAX_HOOK_INPUT: u64 = 16 << 20;
 /// The most of a hook log read at once, from the latest turn's first record.
 const MAX_HOOK_READ: u64 = 4 << 20;
-/// A hook record lands this long after its request was counted live, at
-/// most, and is still matched to it.
-const HOOK_LAG_MS: u64 = 60_000;
+/// A live count no hook record matched is given up (it had no hook) once a
+/// request counted after it has had its record this long: Codex starts a
+/// session's background hooks in order and stops each after its `timeout`
+/// (10 s in the printed block), so an earlier request's record lands within
+/// 10 s of a later one's, or never.
+const HOOK_SETTLE_MS: u64 = 15_000;
+/// Live counts kept waiting for their record, at most.
+const MAX_UNMATCHED: usize = 256;
 /// Recovered requests kept per turn.
 const MAX_RECOVERED: usize = 100;
 
@@ -816,38 +822,201 @@ fn hook_log(home: &Path, session: &str) -> PathBuf {
         .join(format!("{session}.requests.jsonl"))
 }
 
-/// The turn's `PermissionRequest` records in the session's hook log, read
-/// from `offset`, and where the next read starts: at the turn's first
-/// record, or past every complete line when the turn has none yet (the
-/// log is append-only, so the turn's records all come later).
-fn hook_records(session: &str, turn: &str, offset: u64) -> (Vec<HookRecord>, u64) {
-    let Ok(mut f) = util::open_private_read(&hook_log(&config::state_dir(), session)) else {
-        return (Vec::new(), 0);
-    };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    // A log that is shorter than the offset was replaced: read it whole.
-    let offset = if offset > len { 0 } else { offset };
-    let mut buf = Vec::new();
-    if f.seek(SeekFrom::Start(offset)).is_err() || f.take(MAX_HOOK_READ).read_to_end(&mut buf).is_err() {
-        return (Vec::new(), offset);
-    }
-    let mut records = Vec::new();
-    let mut start = None;
-    let mut pos = 0usize;
-    // Only complete lines: the hook may be writing the last one.
-    while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
-        if let Ok(v) = serde_json::from_slice::<Value>(&buf[pos..pos + nl]) {
-            if v["event"] == "PermissionRequest" && v["turn"] == turn {
-                start.get_or_insert(offset + pos as u64);
-                records.push(HookRecord {
-                    at: v["atMs"].as_u64().unwrap_or(0),
-                    tool: v["tool"].as_str().filter(|t| t.len() <= 128).map(str::to_string),
-                });
-            }
+/// Where the counting connection is in the session's hook log, for the turn
+/// it counts (kept as `hooks` in `<thread>.json`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Cursor {
+    /// The log it read last (device, inode); `None` before the first one,
+    /// or after the log was gone.
+    file: Option<(u64, u64)>,
+    /// Stored by 0.16.0, which kept no file identity: its offset is trusted
+    /// once, if the bytes there still fit.
+    legacy: bool,
+    /// Where the next read starts: the turn's first record, or past the last
+    /// complete line when the turn has none yet.
+    offset: u64,
+    /// `atMs` of the record at `offset`, when that is the turn's first
+    /// record: the bytes there must still be that record.
+    mark: Option<u64>,
+    /// How many of the turn's records from `offset` are accounted for.
+    h: u64,
+    /// The newest `atMs` among them.
+    last_at: u64,
+}
+
+impl Cursor {
+    fn from_json(v: &Value) -> Cursor {
+        let file = match (v["file"][0].as_u64(), v["file"][1].as_u64()) {
+            (Some(dev), Some(ino)) => Some((dev, ino)),
+            _ => None,
+        };
+        Cursor {
+            file,
+            legacy: v.get("file").is_none() && v.get("offset").is_some(),
+            offset: v["offset"].as_u64().unwrap_or(0),
+            mark: v["mark"].as_u64(),
+            h: v["h"].as_u64().unwrap_or(0),
+            last_at: v["lastAt"].as_u64().unwrap_or(0),
         }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "file": self.file.map(|(dev, ino)| json!([dev, ino])),
+            "offset": self.offset,
+            "mark": self.mark,
+            "h": self.h,
+            "lastAt": self.last_at,
+        })
+    }
+
+    /// The same place in the log for the next turn, none of whose records
+    /// are accounted for yet.
+    fn next_turn(&self) -> Cursor {
+        Cursor {
+            h: 0,
+            last_at: 0,
+            ..self.clone()
+        }
+    }
+}
+
+/// What one read of the hook log found: `turn`'s `PermissionRequest`
+/// records among the complete lines of a buffer that starts at byte `base`
+/// of the log, each with its offset, and where the last complete line
+/// starts (with its `atMs`). A last line without its newline is left for
+/// the next read: the hook may be writing it.
+struct Scan {
+    records: Vec<(u64, HookRecord)>,
+    last_line: Option<(u64, Option<u64>)>,
+    end: u64,
+}
+
+fn turn_records(buf: &[u8], base: u64, turn: &str) -> Scan {
+    let mut scan = Scan {
+        records: Vec::new(),
+        last_line: None,
+        end: base,
+    };
+    let mut pos = 0usize;
+    while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
+        let v = serde_json::from_slice::<Value>(&buf[pos..pos + nl]).ok();
+        let at = v.as_ref().and_then(|v| v["atMs"].as_u64());
+        if let Some(v) = v.filter(|v| v["event"] == "PermissionRequest" && v["turn"] == turn) {
+            scan.records.push((
+                base + pos as u64,
+                HookRecord {
+                    at: at.unwrap_or(0),
+                    tool: v["tool"].as_str().filter(|t| t.len() <= 128).map(str::to_string),
+                },
+            ));
+        }
+        scan.last_line = Some((base + pos as u64, at));
         pos += nl + 1;
     }
-    (records, start.unwrap_or(offset + pos as u64))
+    scan.end = base + pos as u64;
+    scan
+}
+
+impl Scan {
+    /// The cursor after this read, on a line the next read can check: the
+    /// turn's first record, else the last complete line.
+    fn cursor(&self, id: (u64, u64), h: usize, last_at: u64) -> Cursor {
+        let (offset, mark) = match (self.records.first(), self.last_line) {
+            (Some((o, r)), _) => (*o, Some(r.at)),
+            (None, Some((o, at))) => (o, at),
+            (None, None) => (self.end, None),
+        };
+        Cursor {
+            file: Some(id),
+            legacy: false,
+            offset,
+            mark,
+            h: h as u64,
+            last_at,
+        }
+    }
+}
+
+/// The turn's records in the session's hook log that `cursor` has not
+/// accounted for, oldest first, and the cursor after them.
+///
+/// The log is append-only while it is the same file holding the same
+/// bytes at the cursor; then the read continues there. Anything else (the
+/// path now names another file, the file is shorter than the cursor, the
+/// bytes at the cursor are not the record they were, or the log is gone)
+/// means it was replaced, truncated or deleted: the next read takes the
+/// whole file, and of its records only those newer than every one already
+/// accounted for are new. So a record is neither lost nor counted twice,
+/// in this process or the next.
+fn hook_records(session: &str, turn: &str, cursor: &Cursor) -> (Vec<HookRecord>, Cursor) {
+    let Ok(mut f) = util::open_private_read(&hook_log(&config::state_dir(), session)) else {
+        // Gone, or not written yet: whatever comes next is another file.
+        let gone = Cursor {
+            last_at: cursor.last_at,
+            ..Cursor::default()
+        };
+        return (Vec::new(), gone);
+    };
+    let Ok(meta) = f.metadata() else {
+        return (Vec::new(), cursor.clone());
+    };
+    let id = (meta.dev(), meta.ino());
+    let mut read_from = |at: u64| {
+        let mut buf = Vec::new();
+        f.seek(SeekFrom::Start(at))
+            .and_then(|_| (&mut f).take(MAX_HOOK_READ).read_to_end(&mut buf))
+            .map(|_| buf)
+    };
+    let known = cursor.file == Some(id) || (cursor.legacy && cursor.file.is_none());
+    if known && cursor.offset <= meta.len() {
+        // From the byte before the cursor, to check that it ends a line.
+        let Ok(buf) = read_from(cursor.offset.saturating_sub(1)) else {
+            return (Vec::new(), cursor.clone());
+        };
+        let (boundary, rest) = match cursor.offset {
+            0 => (true, &buf[..]),
+            _ => (buf.first() == Some(&b'\n'), buf.get(1..).unwrap_or(&[])),
+        };
+        // The line at the cursor is still the record it was.
+        let same = cursor.mark.is_none_or(|mark| first_line_at(rest) == Some(mark));
+        if boundary && same {
+            let scan = turn_records(rest, cursor.offset, turn);
+            let h = (cursor.h as usize).min(scan.records.len());
+            // 0.16.0 kept no times: the accounted records give it.
+            let last_at = match cursor.legacy {
+                true => scan.records[..h]
+                    .iter()
+                    .map(|(_, r)| r.at)
+                    .fold(cursor.last_at, u64::max),
+                false => cursor.last_at,
+            };
+            let last_at = scan.records[h..].iter().map(|(_, r)| r.at).fold(last_at, u64::max);
+            let next = scan.cursor(id, scan.records.len(), last_at);
+            return (scan.records.into_iter().skip(h).map(|(_, r)| r).collect(), next);
+        }
+    }
+    // Replaced, truncated or rewritten: the whole file, and only records
+    // newer than every one already accounted for.
+    let Ok(buf) = read_from(0) else {
+        return (Vec::new(), cursor.clone());
+    };
+    let scan = turn_records(&buf, 0, turn);
+    let last_at = scan.records.iter().map(|(_, r)| r.at).fold(cursor.last_at, u64::max);
+    let next = scan.cursor(id, scan.records.len(), last_at);
+    let fresh = scan
+        .records
+        .into_iter()
+        .map(|(_, r)| r)
+        .filter(|r| r.at > cursor.last_at)
+        .collect();
+    (fresh, next)
+}
+
+/// `atMs` of the first complete line of `buf`, if it is a record.
+fn first_line_at(buf: &[u8]) -> Option<u64> {
+    let nl = buf.iter().position(|&b| b == b'\n')?;
+    serde_json::from_slice::<Value>(&buf[..nl]).ok()?["atMs"].as_u64()
 }
 
 /// The number of the open approval and user-input request in the latest
@@ -868,12 +1037,16 @@ fn hook_records(session: &str, turn: &str, offset: u64) -> (Vec<HookRecord>, u64
 /// waits.
 ///
 /// Approval requests are then reconciled with the hook log, which has one
-/// record per request whether or not anything counted it. Each record is
-/// matched, newest first, to a request counted live: one counted after the
-/// previous count of the same connection (`counted_since`; any time for a
-/// connection that has just taken the counter) and at most `HOOK_LAG_MS`
-/// before the record. A record no count matches opened while nothing
-/// counted: if it is the newest and a request is open, it is that request
+/// record per request whether or not anything counted it (`hook_records`
+/// reads only the records not yet accounted for, and survives the log being
+/// replaced, truncated or deleted). Each record is matched, newest first, to
+/// a request counted live whose request opened before the record was
+/// written: counted after the previous count of the same connection
+/// (`counted_since`; any time for a connection that has just taken the
+/// counter), however long ago (`match_records`). A count stays waiting for
+/// its record until a request counted after it has had its record for
+/// `HOOK_SETTLE_MS` (`release_hookless`) or the turn ends. A record no count
+/// matches opened while nothing counted: if it is the newest and a request is open, it is that request
 /// (it replaced the one counted before), and otherwise it opened and closed
 /// unseen and is reported as recovered, under the next number. A
 /// connection that takes the counter over counts a flag that is still on
@@ -900,7 +1073,10 @@ fn record_requests(
         .ok()
         .filter(|f| util::flock_within(f, Duration::from_secs(2)).unwrap_or(false));
     let stored = stored_requests(thread);
-    let offset = stored.as_ref().and_then(|v| v["hooks"]["offset"].as_u64()).unwrap_or(0);
+    let cursor = stored
+        .as_ref()
+        .map(|v| Cursor::from_json(&v["hooks"]))
+        .unwrap_or_default();
     // The last status that ended a turn; what follows it is the next turn.
     let ended = seen.iter().rposition(|s| s["type"] != "active");
     let (same_turn, from) = match (turn, &stored) {
@@ -914,7 +1090,7 @@ fn record_requests(
     let mut kept = match stored {
         Some(v) if same_turn => v,
         // A new turn's records come after the last one's first record.
-        _ => json!({ "turn": turn.unwrap_or(""), "hooks": { "offset": offset, "h": 0 } }),
+        _ => json!({ "turn": turn.unwrap_or(""), "hooks": cursor.next_turn().to_json() }),
     };
     if let Some(t) = turn {
         kept["turn"] = json!(t);
@@ -959,6 +1135,11 @@ fn record_requests(
         .filter_map(|e| Some((e[0].as_u64()?, e[1].as_u64()?, e[2].as_u64()?)))
         .collect();
     let mut recovered: Vec<Value> = a["recovered"].as_array().cloned().unwrap_or_default();
+    // The newest-numbered count matched so far, and its record's time.
+    let mut fifo = match (a["fifo"][0].as_u64(), a["fifo"][1].as_u64()) {
+        (Some(k), Some(at)) => Some((k, at)),
+        _ => None,
+    };
     for status in seen {
         let on = flags_of(status).contains(&"waitingOnApproval");
         if on && !open {
@@ -971,27 +1152,14 @@ fn record_requests(
     }
     let t = kept["turn"].as_str().unwrap_or("").to_string();
     if !t.is_empty() {
-        let offset = kept["hooks"]["offset"].as_u64().unwrap_or(0);
-        let (records, start) = hook_records(session, &t, offset);
-        let h = kept["hooks"]["h"].as_u64().unwrap_or(0) as usize;
-        let mut unseen = Vec::new();
-        for (i, r) in records.iter().enumerate().skip(h).rev() {
-            // A clock step can put a record a moment before its count.
-            let matches =
-                |&(at, after, _): &(u64, u64, u64)| after.saturating_sub(1_000) <= r.at && r.at <= at + HOOK_LAG_MS;
-            match unmatched.iter().rposition(matches) {
-                Some(j) => {
-                    recorded |= unmatched.remove(j).2 == k;
-                }
-                None => unseen.push(i),
-            }
-        }
-        unseen.reverse();
-        let replaced = open && unseen.last().is_some_and(|&i| i + 1 == records.len());
+        let (fresh, next) = hook_records(session, &t, &Cursor::from_json(&kept["hooks"]));
+        let (unseen, matched) = match_records(&mut unmatched, &mut fifo, &fresh);
+        recorded |= matched.contains(&k);
+        let replaced = open && unseen.last().is_some_and(|&i| i + 1 == fresh.len());
         let closed = unseen.len() - usize::from(replaced);
         for &i in &unseen[..closed] {
             n += 1;
-            recovered.push(json!({ "k": n, "atMs": records[i].at, "tool": records[i].tool, "foundMs": now }));
+            recovered.push(json!({ "k": n, "atMs": fresh[i].at, "tool": fresh[i].tool, "foundMs": now }));
         }
         if replaced {
             n += 1;
@@ -1001,14 +1169,16 @@ fn record_requests(
         if recovered.len() > MAX_RECOVERED {
             recovered.drain(..recovered.len() - MAX_RECOVERED);
         }
-        kept["hooks"] = json!({ "offset": start, "h": records.len().max(h) });
+        kept["hooks"] = next.to_json();
     }
-    // A count no record matched in time had no hook (another kind of
-    // approval, or no hook installed).
-    unmatched.retain(|&(at, _, _)| now.saturating_sub(at) <= HOOK_LAG_MS);
+    release_hookless(&mut unmatched, fifo, now);
+    if unmatched.len() > MAX_UNMATCHED {
+        unmatched.drain(..unmatched.len() - MAX_UNMATCHED);
+    }
     let unmatched: Vec<Value> = unmatched.iter().map(|&(a, b, c)| json!([a, b, c])).collect();
     kept["approval"] = json!({
-        "n": n, "open": open, "k": k, "recorded": recorded, "unmatched": unmatched, "recovered": recovered,
+        "n": n, "open": open, "k": k, "recorded": recorded, "unmatched": unmatched,
+        "fifo": fifo.map(|(k, at)| json!([k, at])), "recovered": recovered,
     });
     out.approval = if open { k } else { 0 };
     out.recovered = if t.is_empty() {
@@ -1021,6 +1191,57 @@ fn record_requests(
         let _ = util::write_private(&path, kept.to_string().as_bytes());
     }
     out
+}
+
+/// A request counted live: when (Unix ms), the time of the same
+/// connection's previous count (its request opened after that; 0 when the
+/// connection had just taken the counter), and its number.
+type Count = (u64, u64, u64);
+
+/// Matches new hook records, newest first, to requests counted live: each
+/// takes the newest count it can belong to, one whose request opened before
+/// the record was written. However late a record lands, it still finds its
+/// count. Returns the records no count matches (indices into `fresh`,
+/// oldest first) and the numbers of the counts matched, and keeps in
+/// `fifo` the newest-numbered count matched so far with its record's time.
+fn match_records(
+    unmatched: &mut Vec<Count>,
+    fifo: &mut Option<(u64, u64)>,
+    fresh: &[HookRecord],
+) -> (Vec<usize>, Vec<u64>) {
+    let mut unseen = Vec::new();
+    let mut matched = Vec::new();
+    for (i, r) in fresh.iter().enumerate().rev() {
+        // A clock step can put a record a moment before its count.
+        match unmatched
+            .iter()
+            .rposition(|&(_, after, _)| after.saturating_sub(1_000) <= r.at)
+        {
+            Some(j) => {
+                let (_, _, k) = unmatched.remove(j);
+                if fifo.is_none_or(|(f, _)| k > f) {
+                    *fifo = Some((k, r.at));
+                }
+                matched.push(k);
+            }
+            None => unseen.push(i),
+        }
+    }
+    unseen.reverse();
+    (unseen, matched)
+}
+
+/// Gives up the counts that will get no record (a request without the
+/// hook, or one counted before the hook was installed): those counted
+/// before a request whose record has been in for `HOOK_SETTLE_MS`. Codex
+/// starts a session's background hooks in order and stops each after its
+/// timeout, so an earlier request's record would have landed by then.
+fn release_hookless(unmatched: &mut Vec<Count>, fifo: Option<(u64, u64)>, now: u64) {
+    if let Some((k, at)) = fifo {
+        if now >= at.saturating_add(HOOK_SETTLE_MS) {
+            unmatched.retain(|&(_, _, n)| n > k);
+        }
+    }
 }
 
 /// `t3-watch hook codex`: records one `PermissionRequest` from `input` (the
@@ -1172,6 +1393,62 @@ mod tests {
         ] {
             assert_eq!(base64(input.as_bytes()), out);
         }
+    }
+
+    fn rec(at: u64) -> HookRecord {
+        HookRecord { at, tool: None }
+    }
+
+    #[test]
+    fn a_record_that_lands_late_still_matches_its_count() {
+        // Background hooks share eight slots per session, so a record can
+        // land long after its request was counted live.
+        let mut unmatched = vec![(1_000, 0, 1)];
+        let mut fifo = None;
+        let (unseen, matched) = match_records(&mut unmatched, &mut fifo, &[rec(1_000 + 5 * 60_000)]);
+        assert!(unseen.is_empty());
+        assert_eq!(matched, [1]);
+        assert!(unmatched.is_empty());
+        // Time alone never gives a count up: only a later request's record.
+        let mut unmatched = vec![(1_000, 0, 1)];
+        let mut fifo = None;
+        release_hookless(&mut unmatched, fifo, 1_000 + 60 * 60_000);
+        assert_eq!(unmatched.len(), 1);
+        let (unseen, _) = match_records(&mut unmatched, &mut fifo, &[rec(1_000 + 60 * 60_000)]);
+        assert!(unseen.is_empty());
+    }
+
+    #[test]
+    fn a_count_with_no_record_is_given_up_once_a_later_record_has_settled() {
+        // Request 1 has no hook (another kind of approval); request 2 does.
+        let mut unmatched = vec![(1_000, 0, 1), (5_000, 1_000, 2)];
+        let mut fifo = None;
+        let (unseen, matched) = match_records(&mut unmatched, &mut fifo, &[rec(5_010)]);
+        assert!(unseen.is_empty());
+        assert_eq!(matched, [2]);
+        assert_eq!(fifo, Some((2, 5_010)));
+        // Until then, request 1's record could still land.
+        release_hookless(&mut unmatched, fifo, 5_010 + HOOK_SETTLE_MS - 1);
+        assert_eq!(unmatched, [(1_000, 0, 1)]);
+        release_hookless(&mut unmatched, fifo, 5_010 + HOOK_SETTLE_MS);
+        assert!(unmatched.is_empty());
+        // A request that then opens and closes unseen is not hidden by it.
+        let (unseen, _) = match_records(&mut unmatched, &mut fifo, &[rec(90_000)]);
+        assert_eq!(unseen, [0]);
+    }
+
+    #[test]
+    fn records_match_newest_first_and_never_a_count_made_after_them() {
+        // A record from before the connection counted, then the record of
+        // the request it counted.
+        let mut unmatched = vec![(10_000, 8_000, 3)];
+        let (unseen, matched) = match_records(&mut unmatched, &mut None, &[rec(2_000), rec(9_000)]);
+        assert_eq!(unseen, [0]);
+        assert_eq!(matched, [3]);
+        // Written before the connection's previous count: an earlier request.
+        let mut unmatched = vec![(10_000, 8_000, 3)];
+        let (unseen, _) = match_records(&mut unmatched, &mut None, &[rec(6_000)]);
+        assert_eq!(unseen, [0]);
     }
 
     #[test]
