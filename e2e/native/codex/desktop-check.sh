@@ -6,9 +6,16 @@
 #   e2e/native/codex/desktop-check.sh <t3-watch> <thread id>
 #
 # It starts nothing and changes nothing in Codex: no daemon start, no
-# thread/resume, no prompt. t3-watch sends initialize, thread/read and
-# thread/turns/list only, and its own state goes to a temporary home that
-# is removed afterwards. If no app-server socket exists, it says so and
+# thread/resume, no prompt. t3-watch sends initialize, thread/read,
+# thread/turns/list and hooks/list only, and its own state goes to a
+# temporary home that is removed afterwards.
+#
+# With T3_WATCH_HOME set to the state directory the user's
+# `t3-watch hook codex` records into, `requestRecovery` says whether
+# Codex lists that hook as installed, enabled and trusted ("hook") or not
+# ("none"). t3-watch then reads the hook log there and keeps its count for
+# the thread there, as any wait does; it changes nothing in Codex either
+# way. Without it, a temporary home is used and the answer is "none". If no app-server socket exists, it says so and
 # stops: reaching the thread then needs `codex app-server daemon start`,
 # which is a change on that Mac for its user to approve.
 set -u
@@ -28,12 +35,14 @@ if [ ! -e "$SOCK" ]; then
 fi
 ls -l "$SOCK"
 H=$(mktemp -d /tmp/t3wdesk.XXXX)
-T3_WATCH_HOME=$H T3_WATCH_CODEX_SOCKET=$SOCK "$BIN" wait --no-daemon --timeout 5s "codex://threads/$TID" > "$H/out.json" 2> "$H/err.txt"
+WH=${T3_WATCH_HOME:-$H}
+T3_WATCH_HOME=$WH T3_WATCH_CODEX_SOCKET=$SOCK "$BIN" wait --no-daemon --timeout 5s "codex://threads/$TID" > "$H/out.json" 2> "$H/err.txt"
 CODE=$?
 python3 -I -c 'import json,sys
 v = json.load(open(sys.argv[1])); t = (v.get("threads") or [{}])[0]
 print(json.dumps({"exit": int(sys.argv[2]), "outcome": v.get("outcome"), "status": t.get("status"),
       "runOrdinal": t.get("runOrdinal"), "pendingRequestCount": t.get("pendingRequestCount"),
+      "requestRecovery": t.get("requestRecovery"), "recoveredRequests": len(t.get("recoveredRequests") or []),
       "title": t.get("title"), "lastError": t.get("lastError") or (t.get("upstream") or {}).get("lastError")}))' "$H/out.json" "$CODE"
 rm -rf "${H:?}"
 case $CODE in
