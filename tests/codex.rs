@@ -1275,6 +1275,55 @@ fn a_replaced_truncated_or_deleted_hook_log_loses_and_repeats_nothing() {
 }
 
 #[test]
+fn a_count_stored_by_0_16_0_is_taken_over_without_reporting_its_records_again() {
+    // 0.16.0 kept only an offset and a record count. Its count is trusted
+    // while the bytes at the offset still fit: what it already reported is
+    // not reported again, and the next record is.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    cx.install_hook(&env, "trusted");
+    let t = target();
+    cx.set(
+        json!({ "type": "active", "activeFlags": [] }),
+        &[("turn-1", "inProgress")],
+    );
+    hook(&env, "turn-1");
+    let at: Value = serde_json::from_str(fs::read_to_string(hook_log(&env)).unwrap().lines().next().unwrap()).unwrap();
+    let stored = json!({
+        "turn": "turn-1", "input": { "n": 0, "open": false }, "hooks": { "offset": 0, "h": 1 },
+        "approval": { "n": 1, "open": false, "k": 0, "recorded": false, "unmatched": [],
+                      "recovered": [{ "k": 1, "atMs": at["atMs"], "tool": "Bash", "foundMs": at["atMs"] }] } });
+    let state = env.home.join("native").join("codex").join(format!("{T}.json"));
+    fs::write(&state, stored.to_string()).unwrap();
+    fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    hook(&env, "turn-1");
+    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1200ms", &t])
+        .output()
+        .unwrap();
+    let v = output_json(&out);
+    let ids: Vec<&str> = v["threads"][0]["recoveredRequests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["codex-turn-1-approval-1", "codex-turn-1-approval-2"], "{v}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let announced: Vec<Value> = err
+        .lines()
+        .filter_map(|l| l.strip_prefix("t3-watch: progress "))
+        .map(|p| serde_json::from_str::<Value>(p).unwrap()["recovered"].clone())
+        .collect();
+    assert_eq!(announced.len(), 1, "{err}");
+    assert_eq!(announced[0].as_array().unwrap().len(), 1, "{err}");
+    assert_eq!(
+        announced[0][0]["id"], "codex-turn-1-approval-2",
+        "only the new one: {err}"
+    );
+    assert_read_only(&cx);
+}
+
+#[test]
 fn a_hook_record_that_lands_long_after_its_count_is_still_that_request() {
     // Review ordinal 21: Codex runs a session's background hooks eight at a
     // time, so a record can land long after its request was counted. It
