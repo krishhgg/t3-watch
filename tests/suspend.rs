@@ -526,8 +526,17 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
             assert_eq!(code, 3, "{seen}; {err}");
             assert_eq!(out["outcome"], "timeout", "{seen}");
             assert_eq!(settled_hooks(&hook), 0, "{seen}");
-            let kind = if frozen { "daemon.late" } else { "daemon.stale" };
-            assert!(trace.contains(&format!("\"kind\":\"{kind}\"")), "{what}: {trace}");
+            // Frozen: macOS restarts the stopped read and finds the answer,
+            // read too late (`daemon.late`); Linux ends that read with EINTR
+            // first, so the registration is dropped as slept through
+            // (`daemon.stale`) before the answer is read. Either way the
+            // answer is not used. The late path has its own test below.
+            let refused = if frozen {
+                trace.contains("\"kind\":\"daemon.late\"") || trace.contains("\"kind\":\"daemon.stale\"")
+            } else {
+                trace.contains("\"kind\":\"daemon.stale\"")
+            };
+            assert!(refused, "{what}: {trace}");
         } else {
             assert_eq!(code, 0, "{seen}; {err}");
             assert_eq!(out["threads"][0]["runOrdinal"], 3, "{seen}");
@@ -539,6 +548,50 @@ fn an_answer_buffered_across_a_suspend_never_completes_the_wait() {
         env.run(&["stop"]);
         let _ = daemon.wait();
     }
+}
+
+#[test]
+fn a_final_answer_read_after_the_deadline_is_not_used() {
+    // The late-answer path without a suspend or signals, so it runs the same
+    // on every OS: the daemon settles at once, a proxy holds that answer for
+    // 2 s, and the client, whose deadline was 1 s, reads it too late.
+    let mock = MockMcp::start();
+    mock.set_thread(W, "completed", 2);
+    let hook = MockHook::start();
+    let env = mcp_env(&mock);
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut daemon = env.cmd(&["daemon", "--idle-exit", "60s"]).spawn().unwrap();
+    env.wait_status("daemon", Duration::from_secs(10), |s| s["running"] == true);
+    let sdir = env.home.join("s");
+    fs::create_dir_all(&sdir).unwrap();
+    fs::set_permissions(&sdir, fs::Permissions::from_mode(0o700)).unwrap();
+    let proxy_sock = sdir.join("proxy.sock");
+    let proxy = holding_proxy(&proxy_sock, env.home.join(SOCK));
+    let child = env
+        .cmd(&[
+            "wait",
+            "--until",
+            "workstream",
+            "--timeout",
+            "1s",
+            "--webhook-url",
+            &hook.url,
+            W,
+        ])
+        .env("T3_WATCH_SOCKET", &proxy_sock)
+        .spawn()
+        .unwrap();
+    until("the daemon's answer", || proxy.held.load(Ordering::SeqCst));
+    std::thread::sleep(Duration::from_millis(2_000));
+    proxy.release.store(true, Ordering::SeqCst);
+    let (code, out, err) = finish(child, Duration::from_secs(30));
+    let trace = fs::read_to_string(env.home.join("trace.jsonl")).unwrap();
+    assert_eq!(code, 3, "{out} {err}");
+    assert_eq!(out["outcome"], "timeout", "{out}");
+    assert_eq!(settled_hooks(&hook), 0, "{out}");
+    assert!(trace.contains("\"kind\":\"daemon.late\""), "{trace}");
+    env.run(&["stop"]);
+    let _ = daemon.wait();
 }
 
 #[test]

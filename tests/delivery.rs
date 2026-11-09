@@ -716,7 +716,8 @@ fn the_timeline_judges_the_final_event_not_an_earlier_progress_one() {
     let (code, out, _) = finish(child, Duration::from_secs(30));
     assert_eq!(code, 4, "{out}");
     let tl = std::process::Command::new("python3")
-        .args(["-I", concat!(env!("CARGO_MANIFEST_DIR"), "/e2e/timeline.py")])
+        .arg("-I")
+        .arg(timeline_script(&env))
         .arg(env.home.join("trace.jsonl"))
         .output()
         .unwrap();
@@ -761,7 +762,8 @@ fn the_timeline_never_takes_a_progress_event_for_a_final_outcome_without_one() {
         let out = env.run(&args);
         assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
         let tl = std::process::Command::new("python3")
-            .args(["-I", concat!(env!("CARGO_MANIFEST_DIR"), "/e2e/timeline.py")])
+            .arg("-I")
+            .arg(timeline_script(&env))
             .arg(env.home.join("trace.jsonl"))
             .output()
             .unwrap();
@@ -797,4 +799,14 @@ fn the_timeline_never_takes_a_progress_event_for_a_final_outcome_without_one() {
                 .any(|r| r.headers.get("x-t3-watch-event").map(String::as_str) == Some("timeout")));
         }
     }
+}
+
+/// `e2e/timeline.py`, built into the test and written next to the trace:
+/// the Linux run of 0.14.0 failed because the script's path was baked in at
+/// build time (`CARGO_MANIFEST_DIR`, a macOS path) and is not there on
+/// another machine.
+fn timeline_script(env: &Env) -> std::path::PathBuf {
+    let path = env.home.join("timeline.py");
+    fs::write(&path, include_str!("../e2e/timeline.py")).unwrap();
+    path
 }
