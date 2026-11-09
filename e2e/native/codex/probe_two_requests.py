@@ -32,12 +32,18 @@ A.call("turn/start", {"threadId": tid, "input": [{"type": "text", "text": "two c
 r1 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"], 30)
 code, k1, ids1, _ = watch("--timeout", "5s", target)
 report("request 1", {"exit": code, "pendingKey": k1, "ids": ids1})
+# Without the daemon a new wait takes the count over and counts a request
+# that is still open once more (docs/native-sessions.md): a new key.
 code, k, ids, _ = watch("--timeout", "3s", "--acknowledge", k1, target)
-report("request 1 acknowledged", {"exit": code, "pendingKey": k, "ids": ids})
-# A bot's watcher waits past request 1 while the owner answers it.
+report("request 1, a second --no-daemon wait counts it again", {"exit": code, "pendingKey": k, "ids": ids,
+       "newKey": k is not None and k != k1})
+# One wait, connected from request 1 on, waits past it while the owner
+# answers it; its own state starts the count afresh, at request 1.
+ENV1 = dict(ENV, T3_WATCH_HOME=X + "/w2b")
 bg = subprocess.Popen([BIN, "wait", "--no-daemon", "--timeout", "40s", "--acknowledge", k1, target],
-                      env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                      env=ENV1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 time.sleep(1.5)
+report("the connected wait is still waiting on request 1", bg.poll() is None)
 A.w.send({"jsonrpc": "2.0", "id": r1["id"], "result": {"decision": "decline"}})
 r2 = A.until(lambda m: "method" in m and "id" in m and "requestApproval" in m["method"] and m["id"] != r1["id"], 30)
 report("A got request 2", r2 is not None)
