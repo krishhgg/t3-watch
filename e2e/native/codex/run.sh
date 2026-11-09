@@ -6,14 +6,15 @@
 #
 #   e2e/native/codex/run.sh <fixture dir, short: /tmp/...> <t3-watch binary>
 #
-# Prints the probes' JSON lines. Stops what it started and removes the
-# fixture dir at the end (CODEX_HOME there holds about 100 MB).
+# MOCK_PORT picks another port for the mock (default 18801). Prints the
+# probes' JSON lines. Stops what it started and removes the fixture dir at
+# the end (CODEX_HOME there holds about 100 MB).
 set -u
-X=$1; BIN=$2
+X=$1; BIN=$2; PORT=${MOCK_PORT:-18801}
 HERE=$(cd "$(dirname "$0")" && pwd)
 case "$X" in /tmp/*|/private/tmp/*) ;; *) echo "use a fixture dir under /tmp (socket paths are short)" >&2; exit 2 ;; esac
 rm -rf "${X:?}"; mkdir -p "$X/home" "$X/proj"
-cp "$HERE/mock-provider.toml" "$X/home/config.toml"
+sed "s/127.0.0.1:18801/127.0.0.1:$PORT/" "$HERE/mock-provider.toml" > "$X/home/config.toml"
 # The app-server does not always exit on its first SIGTERM.
 stop() {
   kill "$1" 2>/dev/null
@@ -25,11 +26,11 @@ mock() {
   [ -n "${MOCK:-}" ] && stop "$MOCK"
   MOCK_CALLS=$1 MOCK_DELAY=$2 MOCK_TOOL_CALL="touch escalated" \
   MOCK_TOOL_ARGS='{"sandbox_permissions":"require_escalated","justification":"probe"}' \
-    python3 -I "$HERE/mock_responses.py" 18801 "$X/mock.log" > "$X/mock.out" 2>&1 & MOCK=$!
+    python3 -I "$HERE/mock_responses.py" "$PORT" "$X/mock.log" > "$X/mock.out" 2>&1 & MOCK=$!
   sleep 0.5
   # Another mock on the port would answer instead, with other settings.
   if ! kill -0 "$MOCK" 2>/dev/null; then
-    echo "the mock provider did not start (is port 18801 taken?):" >&2; cat "$X/mock.out" >&2; exit 2
+    echo "the mock provider did not start (is port $PORT taken?):" >&2; cat "$X/mock.out" >&2; exit 2
   fi
 }
 echo "== $("$BIN" --version); $(codex --version); $(date -u +%FT%TZ)"
@@ -43,8 +44,12 @@ for d in 3 0.5 0; do
   mock 2 "$d"
   python3 -I "$HERE/probe_two_requests.py" "$X" "$BIN"
 done
+# Last: it installs the hook in this CODEX_HOME, for its own state dir.
+echo "== probe_missed.py (gate X3b)"
+mock 2 0
+python3 -I "$HERE/probe_missed.py" "$X" "$BIN"
 stop "$SERVER"; stop "$MOCK"
-for h in "$X/w" "$X/w2" "$X/w2b" "$X/w3"; do T3_WATCH_HOME=$h "$BIN" stop > /dev/null 2>&1; done
+for h in "$X/w" "$X/w2" "$X/w2b" "$X/w3" "$X/wh"; do T3_WATCH_HOME=$h "$BIN" stop > /dev/null 2>&1; done
 target=$(readlink "$X/cs.sock" 2>/dev/null)
 rm -rf "${X:?}"
 [ -n "$target" ] && rm -f "$target" "$target.lock"

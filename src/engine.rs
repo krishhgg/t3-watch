@@ -670,12 +670,18 @@ fn workstream_proof(thread_id: &str, w: &WaitReply, s: &ThreadState, seen_before
 struct WaitClock {
     sw: util::Stopwatch,
     fresh: Instant,
+    /// When the wait started (Unix ms): it reports requests recovered after.
+    started_ms: u64,
 }
 
 impl WaitClock {
     fn start() -> Self {
         let sw = util::Stopwatch::start();
-        WaitClock { sw, fresh: sw.awake }
+        WaitClock {
+            sw,
+            fresh: sw.awake,
+            started_ms: util::now_ms(),
+        }
     }
 }
 
@@ -763,6 +769,7 @@ struct Reported {
     failed_runs: HashSet<(usize, String)>,
     failed: Vec<Value>,
     unreachable: HashSet<usize>,
+    recovered: HashSet<(usize, String)>,
 }
 
 impl Hub {
@@ -1079,7 +1086,8 @@ impl Hub {
 
     /// Emits progress for this snapshot: with `--follow`, each newly failed
     /// run (the wait goes on for a later one); with `--notify-unreachable`,
-    /// the start and end of an upstream outage.
+    /// the start and end of an upstream outage; and requests that opened and
+    /// closed unseen, found in a durable record during this wait.
     fn report_progress(
         &self,
         snaps: &[Snap],
@@ -1090,6 +1098,26 @@ impl Hub {
     ) {
         for (i, snap) in snaps.iter().enumerate() {
             let t = &req.targets[i];
+            if let Some(Observation::State(s)) = &snap.last {
+                let new: Vec<Value> = s
+                    .recovered
+                    .iter()
+                    .filter(|x| x.found_ms >= clock.started_ms && x.opened_ms > 0)
+                    .filter(|x| r.recovered.insert((i, x.id.clone())))
+                    .map(|x| x.to_json())
+                    .collect();
+                if !new.is_empty() {
+                    progress(json!({
+                        "event": "requests_recovered",
+                        "progress": true,
+                        "via": self.label,
+                        "threads": [self.thread_json(snap, t, req, clock)],
+                        "recovered": new,
+                        "note": "these requests opened and closed while no t3-watch connection counted; the Codex \
+                                 PermissionRequest hook log recorded them. Their owner answered them: nothing waits on them",
+                    }));
+                }
+            }
             if req.predicate.follow {
                 if let Some(Observation::State(s)) = &snap.last {
                     if s.observed_at >= clock.fresh && s.outcome(&req.predicate) == ThreadOutcome::Failed {

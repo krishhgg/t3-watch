@@ -53,6 +53,8 @@ USAGE
   t3-watch auth list | default <NAME> | logout <NAME>
   t3-watch hook claude-code [--print-settings]
                                           record a Claude Code hook event (experimental)
+  t3-watch hook codex [--home DIR] [--print-settings]
+                                          record a Codex approval request (experimental)
 
 THREAD is a thread id, a T3 thread URL (https://<relay>/<envId>/<threadId>),
 or a t3-thread://v2/<envId>/<threadId> link. URLs pick the saved machine
@@ -106,8 +108,8 @@ NOTIFICATIONS (sent by this process; the daemon only sends queued ones)
       --on-settle-arg <ARG>        pass ARG to PROG (repeatable)
       --on-settle-timeout <DUR>    kill PROG after DUR (default 60s)
       --notify-on <CLASSES|all>    comma list of settled, needs_input, timeout, error,
-                                   run_failed, upstream (default: all but timeout
-                                   and error)
+                                   run_failed, upstream, recovered (default: all
+                                   but timeout and error)
 
 AUTH OPTIONS
       --name <NAME>                machine name (default from the host)
@@ -706,12 +708,26 @@ fn cmd_wait(raw: &[String]) -> ! {
     // A daemon reconnect re-registers the wait, which may report the same
     // failed run again; pass each one on once.
     let mut failed_seen = std::collections::HashSet::new();
+    let mut recovered_seen = std::collections::HashSet::new();
     let mut on_progress = |mut p: Value| {
         if p["event"] == "run_failed" {
             let key = p["threads"][0]["latestRunId"].to_string();
             if !failed_seen.insert(key) {
                 return;
             }
+        }
+        if p["event"] == "requests_recovered" {
+            let thread = p["threads"][0]["threadId"].to_string();
+            let mut new = Vec::new();
+            for r in p["recovered"].as_array().cloned().unwrap_or_default() {
+                if recovered_seen.insert((thread.clone(), r["id"].to_string())) {
+                    new.push(r);
+                }
+            }
+            if new.is_empty() {
+                return;
+            }
+            p["recovered"] = Value::Array(new);
         }
         p["watchId"] = json!(watch_id);
         p["eventSeq"] = json!(next_seq());
@@ -1014,11 +1030,58 @@ fn cmd_outbox(raw: &[String]) -> ! {
     }
 }
 
-/// `t3-watch hook claude-code`: an async Claude Code command hook. It never
-/// prints and always exits 0, so it cannot change the session; a failure to
-/// record goes to stderr, which Claude Code shows at most as a notice.
+/// `t3-watch hook claude-code` and `t3-watch hook codex`: async command
+/// hooks. They never print and always exit 0, so they cannot change the
+/// session or decide a request; a failure to record goes to stderr, which
+/// Claude Code and Codex show at most as a notice.
 fn cmd_hook(raw: &[String]) -> ! {
     match raw.first().map(String::as_str) {
+        Some("codex") => {
+            let mut home = None;
+            let mut print = false;
+            let mut it = raw[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--print-settings" => print = true,
+                    "--home" => home = it.next().map(PathBuf::from),
+                    other => {
+                        if print {
+                            usage_error(&format!("hook codex: unexpected {other:?}"));
+                        }
+                        util::warn(&format!("t3-watch hook: unexpected argument {other:?}"));
+                        exit(0)
+                    }
+                }
+            }
+            let home = match home {
+                Some(h) if h.is_absolute() => h,
+                Some(_) => {
+                    if print {
+                        usage_error("hook codex: --home takes an absolute directory");
+                    }
+                    util::warn("t3-watch hook: --home takes an absolute directory");
+                    exit(0)
+                }
+                None => match config::absolute(&config::state_dir()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        util::warn(&format!("t3-watch hook: {e}"));
+                        exit(if print { 2 } else { 0 })
+                    }
+                },
+            };
+            if print {
+                let bin = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "t3-watch".into());
+                print!("{}", codex::codex_hook_settings(&bin, &home));
+                exit(0)
+            }
+            if let Err(e) = codex::record_codex_hook(std::io::stdin().lock(), &home) {
+                util::warn(&format!("t3-watch hook: {e}"));
+            }
+            exit(0)
+        }
         Some("claude-code") if raw.get(1).map(String::as_str) == Some("--print-settings") => {
             let bin = std::env::current_exe()
                 .map(|p| p.display().to_string())
@@ -1032,7 +1095,7 @@ fn cmd_hook(raw: &[String]) -> ! {
             }
             exit(0)
         }
-        _ => usage_error("hook takes: claude-code [--print-settings]"),
+        _ => usage_error("hook takes: claude-code [--print-settings] | codex [--home DIR] [--print-settings]"),
     }
 }
 

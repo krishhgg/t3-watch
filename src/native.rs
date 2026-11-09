@@ -61,7 +61,7 @@ fn token(v: &Value, key: &str) -> Option<String> {
 
 /// A tool's name (`Bash`, `mcp__server__tool`): metadata, recorded so a
 /// denial closes that tool's request. Never its input.
-fn tool_name(v: &Value) -> Option<String> {
+pub(crate) fn tool_name(v: &Value) -> Option<String> {
     v.get("tool_name")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty() && t.len() <= 128)
@@ -129,7 +129,7 @@ pub fn claude_settings(bin: &str) -> Value {
 }
 
 /// `s` as one word for the POSIX shell that runs command hooks.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'='))

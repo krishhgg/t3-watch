@@ -4,8 +4,9 @@
 //! `codex app-server --listen unix://…`, such as the shared daemon's
 //! control socket.
 //!
-//! Only `initialize`, `thread/read` and `thread/turns/list` are sent, the
-//! latter with `itemsView: "notLoaded"` so that no message text is read.
+//! Only `initialize`, `thread/read`, `thread/turns/list` and `hooks/list`
+//! are sent, `thread/turns/list` with `itemsView: "notLoaded"` so that no
+//! message text is read.
 //! The app-server also sends every initialized connection each thread's
 //! `thread/status/changed` notifications, without any subscription; they
 //! are what tells one request from the next (see `record_requests`).
@@ -16,14 +17,23 @@
 //! changed nothing on disk and delivered no request. The runtime status
 //! (`active` with `waitingOnApproval` or `waitingOnUserInput`) comes from
 //! the app-server that runs the thread, so the socket must be that one's.
+//!
+//! The app-server keeps no record of past requests. Codex's documented
+//! `PermissionRequest` hook does: `t3-watch hook codex`, installed by the
+//! user as an async hook (`--print-settings`), appends one line per approval
+//! request (time, turn id, tool name) to
+//! `<state>/native/codex/<session>.requests.jsonl`. An async hook cannot
+//! approve, deny or change anything. The counting connection reconciles
+//! that log with what it saw live (see `record_requests`), so a request that
+//! opened and closed while nothing counted is still reported.
 
 use crate::cancel::Cancel;
 use crate::config;
 use crate::mcp::CallError;
-use crate::model::ThreadState;
+use crate::model::{RecoveredRequest, ThreadState};
 use crate::util;
 use serde_json::{json, Value};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +52,17 @@ const LINGER: Duration = Duration::from_secs(15 * 60);
 /// yet" is retried (a thread materializing its first message) before it
 /// fails the wait.
 const UNSUPPORTED_RETRY: Duration = Duration::from_secs(30);
+/// How long a `hooks/list` answer is used before it is asked again.
+const HOOKS_RECHECK: Duration = Duration::from_secs(60);
+/// The most of a hook's stdin read (an `apply_patch` input can be large).
+const MAX_HOOK_INPUT: u64 = 16 << 20;
+/// The most of a hook log read at once, from the latest turn's first record.
+const MAX_HOOK_READ: u64 = 4 << 20;
+/// A hook record lands this long after its request was counted live, at
+/// most, and is still matched to it.
+const HOOK_LAG_MS: u64 = 60_000;
+/// Recovered requests kept per turn.
+const MAX_RECOVERED: usize = 100;
 
 pub fn valid_thread_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -263,6 +284,16 @@ struct Conn {
     /// The thread's counter lock, when this connection is the one that
     /// counts its requests (see `record_requests`).
     counter: Option<std::fs::File>,
+    /// When this connection, holding the counter, last counted (Unix ms):
+    /// a request it counts next opened after that. `None` before its first
+    /// count, when a request still open may have opened at any time.
+    counted_at: Option<u64>,
+    /// The session whose hook log holds the thread's requests (`sessionId`
+    /// from `thread/read`; the thread id for a thread of its own).
+    session: String,
+    /// Whether `hooks/list` lists a trusted, enabled `t3-watch hook codex`
+    /// for this state directory, and when it was asked.
+    hooks: Option<(bool, Instant)>,
 }
 
 fn transient(message: String) -> CallError {
@@ -278,6 +309,9 @@ impl Conn {
             thread: thread.to_string(),
             events: Vec::new(),
             counter: None,
+            counted_at: None,
+            session: thread.to_string(),
+            hooks: None,
         };
         c.call(
             "initialize",
@@ -288,6 +322,30 @@ impl Conn {
         c.ws.send(&json!({ "jsonrpc": "2.0", "method": "initialized" }))
             .map_err(transient)?;
         Ok(c)
+    }
+
+    /// Whether the user installed and trusted `t3-watch hook codex` for this
+    /// state directory, as `hooks/list` (read-only) lists the hooks for the
+    /// thread's working directory. An app-server without `hooks/list`
+    /// answers an error: no hook.
+    fn hooks_active(&mut self, cwd: Option<&str>, cancel: &Cancel) -> Result<bool, CallError> {
+        if let Some((active, at)) = self.hooks {
+            if at.elapsed() < HOOKS_RECHECK {
+                return Ok(active);
+            }
+        }
+        let cwds: Vec<&str> = cwd.into_iter().collect();
+        let active = match self.call("hooks/list", json!({ "cwds": cwds }), cancel) {
+            Ok(v) => {
+                let home = config::state_dir();
+                let real = config::absolute(&home).unwrap_or_else(|_| home.clone());
+                our_hook_listed(&v, &[home.display().to_string(), real.display().to_string()])
+            }
+            Err(CallError::Fatal(_) | CallError::NotFound(_)) => false,
+            Err(e) => return Err(e),
+        };
+        self.hooks = Some((active, Instant::now()));
+        Ok(active)
     }
 
     /// Keeps a status notification of the watched thread. Any other
@@ -418,14 +476,18 @@ impl Watcher {
     fn read(&self, conn: &mut Conn, cancel: &Cancel, observed_at: Instant) -> Result<ThreadState, CallError> {
         let thread = conn.call("thread/read", json!({ "threadId": self.thread }), cancel)?;
         let status = thread["thread"]["status"].clone();
+        if let Some(s) = thread["thread"]["sessionId"].as_str().filter(|s| valid_thread_id(s)) {
+            conn.session = s.to_string();
+        }
         // Notifications that arrived before this read's answer, in order;
         // the read itself is the latest.
         let mut seen = std::mem::take(&mut conn.events);
         seen.push(status.clone());
+        let hooks = conn.hooks_active(thread["thread"]["cwd"].as_str(), cancel)?;
         if conn.counter.is_none() {
             if let Some(lock) = take_counter(&self.thread) {
                 conn.counter = Some(lock);
-                fresh_count(&mut seen);
+                conn.counted_at = None;
             }
         }
         self.active.store(status["type"] == "active", Ordering::Relaxed);
@@ -467,12 +529,16 @@ impl Watcher {
         };
         let turn = latest.and_then(|t| t["id"].as_str()).filter(|t| valid_thread_id(t));
         let turn = turn.unwrap_or("none");
-        let numbers = if conn.counter.is_some() {
-            record_requests(&self.thread, Some(turn), &seen)
+        let mut requests = if conn.counter.is_some() {
+            let now = util::now_ms();
+            let r = record_requests(&self.thread, &conn.session, Some(turn), &seen, conn.counted_at, hooks);
+            conn.counted_at = Some(now);
+            r
         } else {
             read_requests(&self.thread, turn, &status)
         };
-        Ok(state_of(&self.thread, &status, latest, ordinal, numbers, observed_at))
+        requests.recovery = Some(if hooks { "hook" } else { "none" });
+        Ok(state_of(&self.thread, &status, latest, ordinal, requests, observed_at))
     }
 
     /// The latest turn's ordinal when there are more turns than one page:
@@ -616,7 +682,7 @@ fn drain_parked() {
         let mut parked = util::lock(&PARKED);
         parked.retain_mut(|p| {
             let open = p.conn.drain(wait.unwrap_or(Duration::from_millis(50))).is_ok();
-            let mut seen = std::mem::take(&mut p.conn.events);
+            let seen = std::mem::take(&mut p.conn.events);
             if seen.is_empty() {
                 return open && p.since.elapsed() < LINGER;
             }
@@ -624,11 +690,14 @@ fn drain_parked() {
             if p.conn.counter.is_none() {
                 if let Some(lock) = take_counter(&p.conn.thread) {
                     p.conn.counter = Some(lock);
-                    fresh_count(&mut seen);
+                    p.conn.counted_at = None;
                 }
             }
             if p.conn.counter.is_some() {
-                record_requests(&p.conn.thread, None, &seen);
+                let now = util::now_ms();
+                let hooks = p.conn.hooks.is_some_and(|(active, _)| active);
+                record_requests(&p.conn.thread, &p.conn.session, None, &seen, p.conn.counted_at, hooks);
+                p.conn.counted_at = Some(now);
             }
             // The newest status decides: a batch can end one turn and start
             // the next.
@@ -653,14 +722,6 @@ fn drain_parked() {
     }
 }
 
-/// A connection that has just taken the thread's counter cannot tell
-/// whether a flag that is still on is the request already counted or one
-/// that replaced it while nothing was counting. It counts it again: an
-/// extra wake for the same request, never a missed one.
-fn fresh_count(seen: &mut Vec<Value>) {
-    seen.insert(0, json!({ "type": "active", "activeFlags": [] }));
-}
-
 fn flags_of(status: &Value) -> Vec<&str> {
     status["activeFlags"]
         .as_array()
@@ -682,14 +743,46 @@ fn take_counter(thread: &str) -> Option<std::fs::File> {
     util::try_flock(&f).ok()?.then_some(f)
 }
 
+/// What a read tells about the latest turn's requests.
+#[derive(Default)]
+struct Requests {
+    /// The open approval and user-input request's number in the turn,
+    /// counted from 1 (0: none open).
+    approval: u64,
+    input: u64,
+    /// The turn's approval requests that opened and closed while no
+    /// connection counted, found in the hook log.
+    recovered: Vec<RecoveredRequest>,
+    /// `hook` when the hook log is installed for this state directory.
+    recovery: Option<&'static str>,
+}
+
+fn stored_requests(thread: &str) -> Option<Value> {
+    util::open_private_read(&codex_dir().join(format!("{thread}.json")))
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 20)).ok())
+}
+
+fn recovered_of(kept: &Value, turn: &str) -> Vec<RecoveredRequest> {
+    kept["approval"]["recovered"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| RecoveredRequest {
+            id: format!("codex-{turn}-approval-{}", r["k"].as_u64().unwrap_or(0)),
+            kind: "approval",
+            tool: r["tool"].as_str().map(str::to_string),
+            opened_ms: r["atMs"].as_u64().unwrap_or(0),
+            found_ms: r["foundMs"].as_u64().unwrap_or(0),
+        })
+        .collect()
+}
+
 /// The request numbers as the counting connection last stored them, for a
 /// connection that does not count: a flag that is on but not yet counted
 /// as open is the next request.
-fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
-    let stored = util::open_private_read(&codex_dir().join(format!("{thread}.json")))
-        .ok()
-        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok())
-        .filter(|v| v["turn"] == turn || v["turn"] == "");
+fn read_requests(thread: &str, turn: &str, status: &Value) -> Requests {
+    let stored = stored_requests(thread).filter(|v| v["turn"] == turn || v["turn"] == "");
     let flags = flags_of(status);
     let number = |kind: &str, flag: &str| {
         if !flags.contains(&flag) {
@@ -698,20 +791,69 @@ fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
         let k = stored.as_ref().map_or(&Value::Null, |v| &v[kind]);
         let n = k["n"].as_u64().unwrap_or(0);
         if k["open"] == true {
-            n.max(1)
+            k["k"].as_u64().unwrap_or(n).max(1)
         } else {
             n + 1
         }
     };
-    (
-        number("approval", "waitingOnApproval"),
-        number("input", "waitingOnUserInput"),
-    )
+    Requests {
+        approval: number("approval", "waitingOnApproval"),
+        input: number("input", "waitingOnUserInput"),
+        recovered: stored.as_ref().map(|v| recovered_of(v, turn)).unwrap_or_default(),
+        recovery: None,
+    }
+}
+
+/// One line of the hook log for the turn being counted.
+struct HookRecord {
+    at: u64,
+    tool: Option<String>,
+}
+
+fn hook_log(home: &Path, session: &str) -> PathBuf {
+    home.join("native")
+        .join("codex")
+        .join(format!("{session}.requests.jsonl"))
+}
+
+/// The turn's `PermissionRequest` records in the session's hook log, read
+/// from `offset`, and where the next read starts: at the turn's first
+/// record, or past every complete line when the turn has none yet (the
+/// log is append-only, so the turn's records all come later).
+fn hook_records(session: &str, turn: &str, offset: u64) -> (Vec<HookRecord>, u64) {
+    let Ok(mut f) = util::open_private_read(&hook_log(&config::state_dir(), session)) else {
+        return (Vec::new(), 0);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // A log that is shorter than the offset was replaced: read it whole.
+    let offset = if offset > len { 0 } else { offset };
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(offset)).is_err() || f.take(MAX_HOOK_READ).read_to_end(&mut buf).is_err() {
+        return (Vec::new(), offset);
+    }
+    let mut records = Vec::new();
+    let mut start = None;
+    let mut pos = 0usize;
+    // Only complete lines: the hook may be writing the last one.
+    while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
+        if let Ok(v) = serde_json::from_slice::<Value>(&buf[pos..pos + nl]) {
+            if v["event"] == "PermissionRequest" && v["turn"] == turn {
+                start.get_or_insert(offset + pos as u64);
+                records.push(HookRecord {
+                    at: v["atMs"].as_u64().unwrap_or(0),
+                    tool: v["tool"].as_str().filter(|t| t.len() <= 128).map(str::to_string),
+                });
+            }
+        }
+        pos += nl + 1;
+    }
+    (records, start.unwrap_or(offset + pos as u64))
 }
 
 /// The number of the open approval and user-input request in the latest
 /// turn, counted from 1 (0: none open), after the statuses in `seen` (in
-/// the order they were observed; the last is the newest).
+/// the order they were observed; the last is the newest), and the turn's
+/// recovered requests.
 ///
 /// The app-server tells a reader only that the thread waits
 /// (`waitingOnApproval`, `waitingOnUserInput`), not on which request: with
@@ -723,25 +865,42 @@ fn read_requests(thread: &str, turn: &str, status: &Value) -> (u64, u64) {
 /// connection holding the thread's counter lock counts (`take_counter`);
 /// the count is kept in `<state>/native/codex/<thread>.json`, shared by
 /// every process watching the thread and by connections kept between
-/// waits. A connection that takes the counter over counts a flag that is
-/// still on once more (`fresh_count`). A request that opens and closes
-/// while no connection counts is never seen (docs/native-sessions.md,
-/// "Limits").
+/// waits.
+///
+/// Approval requests are then reconciled with the hook log, which has one
+/// record per request whether or not anything counted it. Each record is
+/// matched, newest first, to a request counted live: one counted after the
+/// previous count of the same connection (`counted_since`; any time for a
+/// connection that has just taken the counter) and at most `HOOK_LAG_MS`
+/// before the record. A record no count matches opened while nothing
+/// counted: if it is the newest and a request is open, it is that request
+/// (it replaced the one counted before), and otherwise it opened and closed
+/// unseen and is reported as recovered, under the next number. A
+/// connection that takes the counter over counts a flag that is still on
+/// once more, unless the hook is installed and the open request's record is
+/// in the log. Without the hook, a request that opens and closes while
+/// nothing counts is not seen (docs/native-sessions.md, "Limits").
 ///
 /// `turn` is the latest turn's id, from a read; `None` (a kept connection,
 /// which reads nothing) continues the stored turn, or, when `seen` ends one
 /// turn and goes on, starts a turn whose id is not known yet (`""`), which
 /// the next read names.
-fn record_requests(thread: &str, turn: Option<&str>, seen: &[Value]) -> (u64, u64) {
+fn record_requests(
+    thread: &str,
+    session: &str,
+    turn: Option<&str>,
+    seen: &[Value],
+    counted_since: Option<u64>,
+    hooks: bool,
+) -> Requests {
     let dir = codex_dir();
     let path = dir.join(format!("{thread}.json"));
     let _lock = util::ensure_private_dir(&dir)
         .and_then(|_| util::open_lock_file(&dir.join(format!("{thread}.lock"))))
         .ok()
         .filter(|f| util::flock_within(f, Duration::from_secs(2)).unwrap_or(false));
-    let stored = util::open_private_read(&path)
-        .ok()
-        .and_then(|f| serde_json::from_reader::<_, Value>(f.take(1 << 16)).ok());
+    let stored = stored_requests(thread);
+    let offset = stored.as_ref().and_then(|v| v["hooks"]["offset"].as_u64()).unwrap_or(0);
     // The last status that ended a turn; what follows it is the next turn.
     let ended = seen.iter().rposition(|s| s["type"] != "active");
     let (same_turn, from) = match (turn, &stored) {
@@ -754,34 +913,189 @@ fn record_requests(thread: &str, turn: Option<&str>, seen: &[Value]) -> (u64, u6
     };
     let mut kept = match stored {
         Some(v) if same_turn => v,
-        _ => json!({ "turn": turn.unwrap_or("") }),
+        // A new turn's records come after the last one's first record.
+        _ => json!({ "turn": turn.unwrap_or(""), "hooks": { "offset": offset, "h": 0 } }),
     };
     if let Some(t) = turn {
         kept["turn"] = json!(t);
     }
     let before = kept.clone();
-    let mut numbers = [0u64; 2];
-    for (i, (kind, flag)) in [("approval", "waitingOnApproval"), ("input", "waitingOnUserInput")]
-        .into_iter()
-        .enumerate()
-    {
-        let mut n = kept[kind]["n"].as_u64().unwrap_or(0);
-        let mut open = kept[kind]["open"] == true;
-        for status in &seen[from.min(seen.len())..] {
-            let on = flags_of(status).contains(&flag);
-            if on && !open {
-                n += 1;
-            }
-            open = on;
+    let now = util::now_ms();
+    let seen = &seen[from.min(seen.len())..];
+    let mut out = Requests::default();
+
+    // A connection that has just taken the counter (`counted_since` is
+    // `None`) cannot tell whether a flag that is still on is the request
+    // counted before or one that replaced it while nothing counted. It
+    // counts it again: an extra wake for the same request, never a missed
+    // one. For an approval whose hook record is in, the hook log tells
+    // instead (below).
+    let fresh = counted_since.is_none();
+    let mut n = kept["input"]["n"].as_u64().unwrap_or(0);
+    let mut open = kept["input"]["open"] == true && !fresh;
+    for status in seen {
+        let on = flags_of(status).contains(&"waitingOnUserInput");
+        if on && !open {
+            n += 1;
         }
-        kept[kind] = json!({ "n": n, "open": open });
-        numbers[i] = if open { n } else { 0 };
+        open = on;
     }
+    kept["input"] = json!({ "n": n, "open": open });
+    out.input = if open { n } else { 0 };
+
+    let a = &kept["approval"];
+    let mut n = a["n"].as_u64().unwrap_or(0);
+    // The open request's number: the newest, unless one was recovered later.
+    let mut k = a["k"].as_u64().unwrap_or(n);
+    // Its hook record is in the log, so the hook works for it.
+    let mut recorded = a["recorded"] == true;
+    let mut open = a["open"] == true && !(fresh && !(hooks && recorded));
+    // Requests counted live whose hook record has not been matched yet:
+    // [counted at, opened after (Unix ms), number].
+    let mut unmatched: Vec<(u64, u64, u64)> = a["unmatched"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e[0].as_u64()?, e[1].as_u64()?, e[2].as_u64()?)))
+        .collect();
+    let mut recovered: Vec<Value> = a["recovered"].as_array().cloned().unwrap_or_default();
+    for status in seen {
+        let on = flags_of(status).contains(&"waitingOnApproval");
+        if on && !open {
+            n += 1;
+            k = n;
+            recorded = false;
+            unmatched.push((now, counted_since.unwrap_or(0), n));
+        }
+        open = on;
+    }
+    let t = kept["turn"].as_str().unwrap_or("").to_string();
+    if !t.is_empty() {
+        let offset = kept["hooks"]["offset"].as_u64().unwrap_or(0);
+        let (records, start) = hook_records(session, &t, offset);
+        let h = kept["hooks"]["h"].as_u64().unwrap_or(0) as usize;
+        let mut unseen = Vec::new();
+        for (i, r) in records.iter().enumerate().skip(h).rev() {
+            // A clock step can put a record a moment before its count.
+            let matches =
+                |&(at, after, _): &(u64, u64, u64)| after.saturating_sub(1_000) <= r.at && r.at <= at + HOOK_LAG_MS;
+            match unmatched.iter().rposition(matches) {
+                Some(j) => {
+                    recorded |= unmatched.remove(j).2 == k;
+                }
+                None => unseen.push(i),
+            }
+        }
+        unseen.reverse();
+        let replaced = open && unseen.last().is_some_and(|&i| i + 1 == records.len());
+        let closed = unseen.len() - usize::from(replaced);
+        for &i in &unseen[..closed] {
+            n += 1;
+            recovered.push(json!({ "k": n, "atMs": records[i].at, "tool": records[i].tool, "foundMs": now }));
+        }
+        if replaced {
+            n += 1;
+            k = n;
+            recorded = true;
+        }
+        if recovered.len() > MAX_RECOVERED {
+            recovered.drain(..recovered.len() - MAX_RECOVERED);
+        }
+        kept["hooks"] = json!({ "offset": start, "h": records.len().max(h) });
+    }
+    // A count no record matched in time had no hook (another kind of
+    // approval, or no hook installed).
+    unmatched.retain(|&(at, _, _)| now.saturating_sub(at) <= HOOK_LAG_MS);
+    let unmatched: Vec<Value> = unmatched.iter().map(|&(a, b, c)| json!([a, b, c])).collect();
+    kept["approval"] = json!({
+        "n": n, "open": open, "k": k, "recorded": recorded, "unmatched": unmatched, "recovered": recovered,
+    });
+    out.approval = if open { k } else { 0 };
+    out.recovered = if t.is_empty() {
+        Vec::new()
+    } else {
+        recovered_of(&kept, &t)
+    };
     if kept != before {
         // Best effort: without the file, a later process counts afresh.
         let _ = util::write_private(&path, kept.to_string().as_bytes());
     }
-    (numbers[0], numbers[1])
+    out
+}
+
+/// `t3-watch hook codex`: records one `PermissionRequest` from `input` (the
+/// hook's stdin) in `home`'s hook log: the time, the turn id and the tool
+/// name, never the command, its input or a path. Any other event is
+/// ignored. An error is for the caller to log; the hook still succeeds.
+pub fn record_codex_hook(input: impl Read, home: &Path) -> Result<(), String> {
+    let mut raw = Vec::new();
+    input
+        .take(MAX_HOOK_INPUT)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("cannot read the hook input: {e}"))?;
+    let v: Value = serde_json::from_slice(&raw).map_err(|_| "the hook input is not JSON".to_string())?;
+    if v["hook_event_name"] != "PermissionRequest" {
+        return Ok(());
+    }
+    let id = |key: &str| v[key].as_str().filter(|s| valid_thread_id(s));
+    let session = id("session_id").ok_or("the hook input has no valid session_id")?;
+    let turn = id("turn_id").ok_or("the hook input has no valid turn_id")?;
+    let mut line = json!({
+        "atMs": util::now_ms(),
+        "event": "PermissionRequest",
+        "turn": turn,
+        "tool": crate::native::tool_name(&v),
+    })
+    .to_string();
+    line.push('\n');
+    let path = hook_log(home, session);
+    let mut f = util::open_log(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .and_then(|_| f.sync_data())
+        .map_err(|e| format!("cannot record the hook event: {e}"))
+}
+
+/// The hook block for the user to add to `~/.codex/config.toml`, running
+/// `bin` as an async `PermissionRequest` hook that records into `home`.
+pub fn codex_hook_settings(bin: &str, home: &Path) -> String {
+    let command = format!(
+        "{} hook codex --home {}",
+        crate::native::shell_quote(bin),
+        crate::native::shell_quote(&home.display().to_string())
+    );
+    format!(
+        "# t3-watch: records each Codex approval request (its time, turn id and\n\
+         # tool name; never the command or its input) so that a wait reports a\n\
+         # request that opened and closed while nothing was watching. It runs\n\
+         # async: it cannot approve, deny or change anything. Codex runs it once\n\
+         # you review and trust it (/hooks in the CLI, Settings > Hooks in the app).\n\
+         [[hooks.PermissionRequest]]\n\
+         [[hooks.PermissionRequest.hooks]]\n\
+         type = \"command\"\n\
+         command = {}\n\
+         timeout = 10\n\
+         async = true\n",
+        serde_json::to_string(&command).unwrap_or_default()
+    )
+}
+
+/// `hooks/list` lists `t3-watch hook codex` recording into this state
+/// directory (as given, or resolved), enabled and trusted (or managed), for
+/// `PermissionRequest`.
+fn our_hook_listed(v: &Value, homes: &[String]) -> bool {
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|e| e["hooks"].as_array().into_iter().flatten())
+        .any(|h| {
+            h["eventName"] == "permissionRequest"
+                && h["enabled"] == true
+                && matches!(h["trustStatus"].as_str(), Some("trusted" | "managed"))
+                && h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("hook codex") && homes.iter().any(|h| c.contains(h.as_str())))
+        })
 }
 
 /// The thread state the engine reads, from the thread's runtime status and
@@ -792,9 +1106,15 @@ fn state_of(
     status: &Value,
     latest: Option<&Value>,
     ordinal: u64,
-    (approval, input): (u64, u64),
+    requests: Requests,
     observed_at: Instant,
 ) -> ThreadState {
+    let Requests {
+        approval,
+        input,
+        recovered,
+        recovery,
+    } = requests;
     let tid = codex_thread_id(thread);
     let kind = status["type"].as_str().unwrap_or("");
     let turn_status = latest.and_then(|t| t["status"].as_str());
@@ -832,6 +1152,8 @@ fn state_of(
     }
     let mut s = ThreadState::from_thread_json(&json!({ "thread": t }), &tid, observed_at);
     s.pending_ids = pending;
+    s.recovered = recovered;
+    s.request_recovery = recovery;
     s
 }
 
@@ -856,10 +1178,11 @@ mod tests {
     fn states_come_from_the_runtime_status_and_the_latest_turn() {
         let t = |status: Value, turn: Option<Value>, n| {
             let flags = flags_of(&status);
-            let numbers = (
-                u64::from(flags.contains(&"waitingOnApproval")),
-                u64::from(flags.contains(&"waitingOnUserInput")),
-            );
+            let numbers = Requests {
+                approval: u64::from(flags.contains(&"waitingOnApproval")),
+                input: u64::from(flags.contains(&"waitingOnUserInput")),
+                ..Requests::default()
+            };
             state_of("01a1", &status, turn.as_ref(), n, numbers, Instant::now())
         };
         let busy = t(

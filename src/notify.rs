@@ -32,15 +32,25 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Notification classes for `--notify-on`. Final results are `settled`
 /// (completed or failed), `needs_input`, `timeout` and `error`; progress is
-/// `run_failed` (`--follow`) and `upstream` (`--notify-unreachable`).
-pub const CLASSES: &[&str] = &["settled", "needs_input", "timeout", "error", "run_failed", "upstream"];
+/// `run_failed` (`--follow`), `upstream` (`--notify-unreachable`) and
+/// `recovered` (Codex requests found in the hook log).
+pub const CLASSES: &[&str] = &[
+    "settled",
+    "needs_input",
+    "timeout",
+    "error",
+    "run_failed",
+    "upstream",
+    "recovered",
+];
 /// Without `--notify-on`: everything except timeout and error.
-const DEFAULT_CLASSES: &[&str] = &["settled", "needs_input", "run_failed", "upstream"];
+const DEFAULT_CLASSES: &[&str] = &["settled", "needs_input", "run_failed", "upstream", "recovered"];
 
 /// The `--notify-on` class an event belongs to.
 fn class_of(event: &str) -> &str {
     match event {
         "upstream_unreachable" | "upstream_restored" => "upstream",
+        "requests_recovered" => "recovered",
         other => other,
     }
 }
@@ -813,6 +823,7 @@ mod tests {
         let n = Notify::from_args(&a).unwrap();
         assert!(n.applies_to("settled") && n.applies_to("needs_input") && n.applies_to("run_failed"));
         assert!(n.applies_to("upstream_unreachable") && !n.applies_to("timeout") && !n.applies_to("error"));
+        assert!(n.applies_to("requests_recovered"));
         a.notify_on = Some("all".into());
         let n = Notify::from_args(&a).unwrap();
         assert!(n.applies_to("timeout") && n.applies_to("error") && n.applies_to("settled"));

@@ -186,6 +186,33 @@ impl PendingRequest {
     }
 }
 
+/// A request that opened and closed while no watcher saw it, recovered
+/// later from a durable record (the Codex `PermissionRequest` hook log). Its
+/// owner already answered it: nothing waits on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredRequest {
+    pub id: String,
+    pub kind: &'static str,
+    pub tool: Option<String>,
+    /// When the hook recorded it (Unix ms).
+    pub opened_ms: u64,
+    /// When a watcher found it in the record (Unix ms).
+    pub found_ms: u64,
+}
+
+impl RecoveredRequest {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "kind": self.kind,
+            "tool": self.tool,
+            "openedAt": crate::util::rfc3339_ms(self.opened_ms),
+            "recoveredAt": crate::util::rfc3339_ms(self.found_ms),
+            "open": false,
+        })
+    }
+}
+
 /// One observation of a thread, from either backend.
 #[derive(Debug, Clone)]
 pub struct ThreadState {
@@ -239,6 +266,12 @@ pub struct ThreadState {
     pub observed_wall_ms: u64,
     /// T3's `completedAt` for the latest run, when the read listed it.
     pub run_completed_at: Option<String>,
+    /// Requests of the latest run that opened and closed unseen, recovered
+    /// from a durable record.
+    pub recovered: Vec<RecoveredRequest>,
+    /// How requests missed while nothing watched are recovered, when the
+    /// backend says: `hook` (the Codex hook log) or `none`.
+    pub request_recovery: Option<&'static str>,
 }
 
 impl ThreadState {
@@ -287,6 +320,8 @@ impl ThreadState {
             observed_at,
             observed_wall_ms: crate::util::now_ms().saturating_sub(observed_at.elapsed().as_millis() as u64),
             run_completed_at,
+            recovered: Vec::new(),
+            request_recovery: None,
         }
     }
 
@@ -499,6 +534,15 @@ impl ThreadState {
             if !self.pending_ids.is_empty() {
                 m.insert("pendingRequestIds".into(), json!(self.pending_ids));
             }
+        }
+        if !self.recovered.is_empty() {
+            m.insert(
+                "recoveredRequests".into(),
+                Value::Array(self.recovered.iter().map(RecoveredRequest::to_json).collect()),
+            );
+        }
+        if let Some(r) = self.request_recovery {
+            m.insert("requestRecovery".into(), json!(r));
         }
         if let Some(l) = &self.link {
             m.insert("link".into(), json!(l));

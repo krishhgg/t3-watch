@@ -2,7 +2,9 @@
 //! the thread from a Codex app-server over its WebSocket-on-Unix-socket
 //! transport. The app-server here is a mock that speaks the documented
 //! protocol; it records every method a client sends, so the tests can show
-//! that t3-watch only reads and never answers a server request.
+//! that t3-watch only reads and never answers a server request. Approval
+//! requests are also recorded by `t3-watch hook codex`, run here as Codex
+//! runs a `PermissionRequest` hook.
 
 mod common;
 
@@ -12,12 +14,19 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const T: &str = "01a1ba73-b8d4-7aa3-b523-643d92150f60";
-const READS: &[&str] = &["initialize", "initialized", "thread/read", "thread/turns/list"];
+const READS: &[&str] = &[
+    "initialize",
+    "initialized",
+    "thread/read",
+    "thread/turns/list",
+    "hooks/list",
+];
 
 fn target() -> String {
     format!("codex://threads/{T}")
@@ -55,6 +64,8 @@ struct Codex {
     /// Every open connection, for the status notifications the app-server
     /// sends each initialized connection.
     writers: Vec<Arc<Mutex<UnixStream>>>,
+    /// What `hooks/list` lists; `None`: an app-server without it.
+    hooks: Option<Value>,
 }
 
 struct MockCodex {
@@ -113,6 +124,51 @@ impl MockCodex {
     fn methods(&self) -> Vec<String> {
         self.st.lock().unwrap().calls.iter().map(|(m, _)| m.clone()).collect()
     }
+
+    /// `hooks/list` lists `t3-watch hook codex` for this state directory,
+    /// as Codex does once the user installed and trusted it.
+    fn install_hook(&self, env: &Env, trust: &str) {
+        let command = format!("'{BIN}' hook codex --home {}", env.home.display());
+        self.with(|c| {
+            c.hooks = Some(json!([{
+                "key": "/u/.codex/config.toml:permission_request:0:0", "eventName": "permissionRequest",
+                "handlerType": "command", "command": command, "async": true, "enabled": true,
+                "trustStatus": trust, "isManaged": false, "source": "user" }]))
+        });
+    }
+}
+
+/// Runs `t3-watch hook codex` with `input` on stdin, as Codex runs a hook.
+fn run_hook(env: &Env, input: &[u8]) -> std::process::Output {
+    let mut c = env.cmd(&["hook", "codex", "--home", env.home.to_str().unwrap()]);
+    c.stdin(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Codex is about to ask for an approval in `turn`: its `PermissionRequest`
+/// hook runs.
+fn hook(env: &Env, turn: &str) {
+    let input = json!({
+        "session_id": T, "turn_id": turn, "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash", "tool_input": { "command": "echo TOOL_INPUT_CANARY", "description": "DESCRIPTION_CANARY" },
+        "cwd": "/tmp/CWD_CANARY", "transcript_path": "/tmp/TRANSCRIPT_CANARY.jsonl",
+        "model": "MODEL_CANARY", "permission_mode": "default" });
+    let out = run_hook(env, input.to_string().as_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "a hook that prints could decide the request: {out:?}"
+    );
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn hook_log(env: &Env) -> PathBuf {
+    env.home
+        .join("native")
+        .join("codex")
+        .join(format!("{T}.requests.jsonl"))
 }
 
 fn wait(env: &Env, cx: &MockCodex, args: &[&str]) -> std::process::Command {
@@ -272,7 +328,10 @@ fn serve(mut s: UnixStream, st: Arc<Mutex<Codex>>) {
                 "thread/read" if g.missing => json!({ "id": id, "error": {
                     "code": -32600, "message": format!("thread not found: {}", m["params"]["threadId"]) } }),
                 "thread/read" => json!({ "id": id, "result": { "thread": {
-                    "id": T, "status": g.status, "preview": "PREVIEW_CANARY first message" } } }),
+                    "id": T, "sessionId": T, "cwd": "/tmp/mock-project", "status": g.status,
+                    "preview": "PREVIEW_CANARY first message" } } }),
+                "hooks/list" if g.hooks.is_some() => json!({ "id": id, "result": { "data": [{
+                    "cwd": m["params"]["cwds"][0], "hooks": g.hooks, "errors": [], "warnings": [] }] } }),
                 "thread/turns/list" if g.unsupported > 0 => {
                     g.unsupported -= 1;
                     let message = g
@@ -521,8 +580,9 @@ fn waiting_on_approval_or_input_is_needs_input_with_its_own_key() {
 fn a_dropped_connection_is_reopened_and_a_turn_finished_meanwhile_is_seen() {
     let env = Env::new();
     let cx = MockCodex::start(&env);
-    // Every connection serves one poll (initialize, read, list), then closes.
-    cx.with(|c| c.drop_after = Some(3));
+    // Every connection serves one poll (initialize, read, hooks/list,
+    // list), then closes.
+    cx.with(|c| c.drop_after = Some(4));
     cx.set(
         json!({ "type": "active", "activeFlags": [] }),
         &[("turn-1", "inProgress")],
@@ -828,27 +888,327 @@ fn a_request_replaced_while_nothing_counts_is_counted_again() {
 }
 
 #[test]
-fn a_request_that_opens_and_closes_while_nothing_counts_is_never_seen() {
-    // The limit, stated as a test: the app-server keeps no record of past
-    // requests, so one answered before any t3-watch connection counts again
-    // leaves no trace. (It needs nobody: its owner answered it.)
+fn without_the_hook_a_request_that_opens_and_closes_while_nothing_counts_is_not_seen() {
+    // The app-server keeps no record of past requests, so without the hook
+    // (an app-server without `hooks/list`, or the hook listed but not
+    // trusted, so Codex never runs it) a request answered before any
+    // t3-watch connection counts again leaves no trace. The result says so.
+    for trust in [None, Some("untrusted")] {
+        let env = Env::new();
+        let cx = MockCodex::start(&env);
+        if let Some(trust) = trust {
+            cx.install_hook(&env, trust);
+        }
+        let t = target();
+        let busy = json!({ "type": "active", "activeFlags": [] });
+        cx.set(busy.clone(), &[("turn-1", "inProgress")]);
+        let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        cx.push(json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }));
+        cx.push(busy);
+        let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+        let v = output_json(&out);
+        let th = &v["threads"][0];
+        assert!(th["pendingKey"].is_null(), "{v}");
+        assert!(th["recoveredRequests"].is_null(), "{v}");
+        assert_eq!(th["requestRecovery"], "none", "{v}");
+        assert_read_only(&cx);
+    }
+}
+
+#[test]
+fn a_request_that_opens_and_closes_while_nothing_counts_is_recovered_from_the_hook_log() {
+    // X3b (docs/acceptance-manifest.md): the app-server keeps no record of
+    // past requests; Codex's PermissionRequest hook does. A request that
+    // opens and closes while no connection counts (no wait, no daemon) is
+    // found in the hook log by the next connection that counts: reported
+    // once as `requests_recovered` progress, then in every result of the
+    // turn. The next request is numbered after it. Without the daemon, and
+    // with the daemon stopped between the waits.
+    for daemon in [false, true] {
+        let env = Env::new();
+        let cx = MockCodex::start(&env);
+        cx.install_hook(&env, "trusted");
+        let t = target();
+        let run = |extra: &[&str]| {
+            let mut all: Vec<&str> = if daemon { vec![] } else { vec!["--no-daemon"] };
+            all.extend_from_slice(extra);
+            all.push(&t);
+            wait(&env, &cx, &all).output().unwrap()
+        };
+        let busy = json!({ "type": "active", "activeFlags": [] });
+        let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+        cx.set(busy.clone(), &[("turn-1", "inProgress")]);
+        let out = run(&["--timeout", "1500ms"]);
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(output_json(&out)["threads"][0]["requestRecovery"], "hook");
+        if daemon {
+            assert!(env.run(&["stop"]).status.success());
+        }
+        // Nothing counts: the request opens (its hook runs) and its owner
+        // answers it.
+        cx.push(asks.clone());
+        hook(&env, "turn-1");
+        cx.push(busy.clone());
+        let rx = MockHook::start();
+        let out = run(&["--timeout", "2s", "--webhook-url", &rx.url]);
+        assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+        let v = output_json(&out);
+        let th = &v["threads"][0];
+        assert!(th["pendingKey"].is_null(), "nothing waits on it: {v}");
+        let rec = th["recoveredRequests"].as_array().expect("recovered");
+        assert_eq!(rec.len(), 1, "{v}");
+        assert_eq!(rec[0]["id"], "codex-turn-1-approval-1");
+        assert_eq!(rec[0]["kind"], "approval");
+        assert_eq!(rec[0]["open"], false);
+        assert_eq!(rec[0]["tool"], "Bash");
+        assert!(rec[0]["openedAt"].as_str().unwrap() <= rec[0]["recoveredAt"].as_str().unwrap());
+        let sent = rx.requests();
+        assert_eq!(sent.len(), 1, "daemon={daemon}");
+        assert_eq!(sent[0].headers["x-t3-watch-event"], "requests_recovered");
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["progress"], true);
+        assert_eq!(body["recovered"][0]["id"], "codex-turn-1-approval-1");
+        // A later wait lists it again, without announcing it again.
+        let rx = MockHook::start();
+        let out = run(&["--timeout", "1500ms", "--webhook-url", &rx.url]);
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(
+            output_json(&out)["threads"][0]["recoveredRequests"][0]["id"],
+            "codex-turn-1-approval-1"
+        );
+        assert!(rx.requests().is_empty());
+        // The next request, seen live, is number 2.
+        cx.set(asks, &[("turn-1", "inProgress")]);
+        hook(&env, "turn-1");
+        let out = run(&["--timeout", "5s"]);
+        assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+        let v = output_json(&out);
+        assert!(
+            v["threads"][0]["pendingRequestIds"]
+                .to_string()
+                .contains("turn-1-approval-2"),
+            "{v}"
+        );
+        assert_eq!(
+            v["threads"][0]["recoveredRequests"].as_array().map(Vec::len),
+            Some(1),
+            "{v}"
+        );
+        // The log holds metadata only.
+        let log = fs::read_to_string(hook_log(&env)).unwrap();
+        for canary in [
+            "TOOL_INPUT_CANARY",
+            "DESCRIPTION_CANARY",
+            "CWD_CANARY",
+            "TRANSCRIPT_CANARY",
+            "MODEL_CANARY",
+        ] {
+            assert!(!log.contains(canary), "{log}");
+        }
+        assert!(!out.stdout.windows(6).any(|w| w == b"CANARY"));
+        assert_read_only(&cx);
+        if daemon {
+            env.run(&["stop"]);
+        }
+    }
+}
+
+#[test]
+fn requests_counted_live_are_matched_to_their_hook_records_not_recovered() {
+    // While a connection counts, every hook record is one of the requests it
+    // counted, whether the record lands before the count or after it.
     let env = Env::new();
     let cx = MockCodex::start(&env);
+    cx.install_hook(&env, "trusted");
     let t = target();
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
     let busy = json!({ "type": "active", "activeFlags": [] });
+    let key = |out: &std::process::Output| {
+        output_json(out)["threads"][0]["pendingKey"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    hook(&env, "turn-1");
+    let out = wait(&env, &cx, &["--timeout", "5s", &t]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let first = key(&out);
+    env.wait_status("the connection kept", Duration::from_secs(5), |s| s["codexKept"] == 1);
+    // The second request is counted live by the kept connection; its hook
+    // record lands only after a wait reported it.
     cx.set(busy.clone(), &[("turn-1", "inProgress")]);
-    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
+    std::thread::sleep(Duration::from_millis(400));
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    std::thread::sleep(Duration::from_millis(400));
+    let out = wait(&env, &cx, &["--timeout", "5s", "--acknowledge", &first, &t])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(3));
-    cx.push(json!({ "type": "active", "activeFlags": ["waitingOnApproval"] }));
-    cx.push(busy);
-    let out = wait(&env, &cx, &["--no-daemon", "--timeout", "1500ms", &t])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
     let v = output_json(&out);
-    assert!(v["threads"][0]["pendingKey"].is_null(), "{v}");
+    assert!(
+        v["threads"][0]["pendingRequestIds"]
+            .to_string()
+            .contains("turn-1-approval-2"),
+        "{v}"
+    );
+    let second = key(&out);
+    hook(&env, "turn-1");
+    let out = wait(&env, &cx, &["--timeout", "1500ms", "--acknowledge", &second, &t])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the late record is request 2, not a new one"
+    );
+    let v = output_json(&out);
+    assert!(v["threads"][0]["recoveredRequests"].is_null(), "{v}");
+    cx.set(json!({ "type": "idle" }), &[("turn-1", "completed")]);
+    let out = wait(&env, &cx, &["--timeout", "5s", &t]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = output_json(&out);
+    assert!(v["threads"][0]["recoveredRequests"].is_null(), "{v}");
+    assert_eq!(fs::read_to_string(hook_log(&env)).unwrap().lines().count(), 2);
+    assert_read_only(&cx);
+    env.run(&["stop"]);
+}
+
+#[test]
+fn with_the_hook_a_request_replaced_while_nothing_counts_is_counted_once() {
+    // Without the hook, a connection that takes the count over while the
+    // flag is on counts it once more (an extra wake). With it, the hook log
+    // tells: a new record is a new request, no new record the same one.
+    let env = Env::new();
+    let cx = MockCodex::start(&env);
+    cx.install_hook(&env, "trusted");
+    let t = target();
+    let asks = json!({ "type": "active", "activeFlags": ["waitingOnApproval"] });
+    cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+    hook(&env, "turn-1");
+    let run = |extra: &[&str]| {
+        let mut all = vec!["--no-daemon"];
+        all.extend_from_slice(extra);
+        all.push(&t);
+        wait(&env, &cx, &all).output().unwrap()
+    };
+    let out = run(&["--timeout", "5s"]);
+    assert_eq!(out.status.code(), Some(5));
+    let first = output_json(&out)["threads"][0]["pendingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The same request, from a new connection: acknowledged, no new wake.
+    let out = run(&["--timeout", "1500ms", "--acknowledge", &first]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    // Request 1 is answered and request 2 opens while nothing counts.
+    cx.push(json!({ "type": "active", "activeFlags": [] }));
+    cx.push(asks);
+    hook(&env, "turn-1");
+    let out = run(&["--timeout", "5s", "--acknowledge", &first]);
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = output_json(&out);
+    let th = &v["threads"][0];
+    assert!(th["pendingRequestIds"].to_string().contains("turn-1-approval-2"), "{v}");
+    assert!(th["recoveredRequests"].is_null(), "it is open, not recovered: {v}");
+    let second = th["pendingKey"].as_str().unwrap().to_string();
+    let out = run(&["--timeout", "1500ms", "--acknowledge", &second]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_read_only(&cx);
+}
+
+#[test]
+fn a_trusted_hook_that_records_nothing_does_not_hide_a_replaced_request() {
+    // The hook is listed and trusted but records nothing (its binary was
+    // moved, say), and user-input requests have no hook at all. A request
+    // replaced while nothing counts is then counted once more, as without
+    // the hook: an extra wake, never a missed one.
+    for flag in ["waitingOnApproval", "waitingOnUserInput"] {
+        let env = Env::new();
+        let cx = MockCodex::start(&env);
+        cx.install_hook(&env, "trusted");
+        let t = target();
+        let asks = json!({ "type": "active", "activeFlags": [flag] });
+        cx.set(asks.clone(), &[("turn-1", "inProgress")]);
+        let out = wait(&env, &cx, &["--no-daemon", "--timeout", "5s", &t])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(5));
+        let first = output_json(&out)["threads"][0]["pendingKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        cx.push(json!({ "type": "active", "activeFlags": [] }));
+        cx.push(asks);
+        let out = wait(
+            &env,
+            &cx,
+            &["--no-daemon", "--timeout", "5s", "--acknowledge", &first, &t],
+        )
+        .output()
+        .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let ids = output_json(&out)["threads"][0]["pendingRequestIds"].to_string();
+        assert!(ids.contains("-2\""), "{flag}: {ids}");
+        assert_read_only(&cx);
+    }
+}
+
+#[test]
+fn the_codex_hook_records_metadata_only_and_never_decides() {
+    let env = Env::new();
+    hook(&env, "turn-1");
+    let path = hook_log(&env);
+    assert_eq!(mode(&path), 0o600);
+    let log = fs::read_to_string(&path).unwrap();
+    let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 1);
+    let mut keys: Vec<&String> = lines[0].as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["atMs", "event", "tool", "turn"]);
+    assert_eq!(lines[0]["turn"], "turn-1");
+    assert!(!log.contains("CANARY"), "{log}");
+    // Other events and bad input: nothing recorded, nothing printed, and
+    // the hook still succeeds.
+    for input in [
+        json!({ "hook_event_name": "PreToolUse", "session_id": T, "turn_id": "turn-1" }).to_string(),
+        "not json".to_string(),
+        json!({ "hook_event_name": "PermissionRequest", "session_id": "../escape", "turn_id": "t" }).to_string(),
+        json!({ "hook_event_name": "PermissionRequest", "session_id": T }).to_string(),
+    ] {
+        let out = run_hook(&env, input.as_bytes());
+        assert_eq!(out.status.code(), Some(0), "{input}");
+        assert!(out.stdout.is_empty(), "{input}");
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+    assert!(!env.home.join("native").join("escape.requests.jsonl").exists());
+    // The block to install: async, recording into this state directory.
+    let out = env.run(&["hook", "codex", "--print-settings"]);
+    assert!(out.status.success());
+    let block = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        block.contains("[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]"),
+        "{block}"
+    );
+    assert!(
+        block.contains("type = \"command\"") && block.contains("async = true"),
+        "{block}"
+    );
+    let name = env.home.file_name().unwrap().to_str().unwrap();
+    assert!(block.contains("hook codex --home ") && block.contains(name), "{block}");
+    let out = env.run(&["hook", "codex", "--home", "relative/dir", "--print-settings"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
