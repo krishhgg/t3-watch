@@ -35,7 +35,8 @@ sooner, run its own binary's `t3-watch stop` once its clients are done.
 Entries older builds leave in `outbox-v2/` or `outbox-v3/` are never
 moved: this build's daemon delivers them in place, under their leases and
 sender lock, so a client of theirs that is still running reports its event
-queued or delivered truthfully (README, "Durable delivery", item 7). An
+queued or delivered truthfully ([notifications.md](notifications.md),
+"Durable delivery", item 7). An
 `outbox-v2/` entry that expires or is dropped stays where its engine-4
 client looks, held so that engine-4, engine-6, engine-7 and engine-8
 senders leave it alone, until the trace shows that client is done with it
