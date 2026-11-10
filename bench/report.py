@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Renders a bench/run.py result file as the Markdown tables in README.md."""
+"""Renders a bench/run.py result file as the Markdown tables in docs/benchmarks.md."""
 
 import json
 import sys
